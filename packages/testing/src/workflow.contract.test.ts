@@ -491,6 +491,8 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
   const invalidGraphs = [
     {
       name: "cycle",
+      code: "dependency_graph.cycle.detected",
+      path: "$.initiativeGraph.edges",
       graph: {
         ...graphBase,
         edges: [
@@ -501,6 +503,8 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
     },
     {
       name: "missing-node",
+      code: "dependency_graph.edge.reference_missing",
+      path: "$.initiativeGraph.edges[0].to",
       graph: {
         ...graphBase,
         edges: [
@@ -515,6 +519,8 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
     },
     {
       name: "unsafe-resource",
+      code: "dependency_graph.graph.invalid",
+      path: "$.initiativeGraph.nodes[0].resources.files[0]",
       graph: {
         ...graphBase,
         nodes: [
@@ -530,7 +536,7 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
     },
   ] as const;
 
-  for (const { name, graph } of invalidGraphs) {
+  for (const { name, graph, code, path } of invalidGraphs) {
     const request = {
       contractVersion: 1 as const,
       taskId: state.projection.id,
@@ -544,8 +550,8 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
     assert.equal(invalid.ok, false, name);
     if (!invalid.ok) {
       assert.strictEqual(invalid.state, state);
-      assert.equal(invalid.diagnostics[0]?.code, "workflow.graph.invalid");
-      assert.equal(invalid.diagnostics[0]?.path, "$.initiativeGraph");
+      assert.equal(invalid.diagnostics[0]?.code, code);
+      assert.equal(invalid.diagnostics[0]?.path, path);
     }
   }
   assert.deepEqual(state, snapshot);

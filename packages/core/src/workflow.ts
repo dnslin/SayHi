@@ -1,10 +1,21 @@
 import { createHash } from "node:crypto";
 
 import {
-  DOMAIN_VALIDATION_CONTRACT_VERSION,
+  DEPENDENCY_GRAPH_CONTRACT_VERSION,
+  validateDependencyGraph as validateDependencyGraphContract,
+  type DependencyGraphDiagnostic,
+  type DependencyGraphDiagnosticCode,
+} from "./dependency-graph.js";
+
+import { isRepositoryRelativePath } from "./repository-path.js";
+import {
   DURABLE_RECORD_SCHEMA_VERSION,
+  isIdentifier,
   validateDomainValue,
 } from "./validation.js";
+
+export { isRepositoryRelativePath } from "./repository-path.js";
+export { isIdentifier } from "./validation.js";
 
 export const WORKFLOW_CONTRACT_VERSION = 1 as const;
 
@@ -229,7 +240,7 @@ export interface TransitionWorkflowRequest {
   readonly event: WorkflowEventMetadata;
 }
 
-export type WorkflowDiagnosticCode =
+export type WorkflowDiagnosticCode = DependencyGraphDiagnosticCode
   | "workflow.request.invalid"
   | "workflow.contract_version.unsupported"
   | "workflow.task.mismatch"
@@ -508,10 +519,18 @@ export function transitionWorkflow(
     state.events,
     request.to,
     request.blockers,
-    request.initiativeGraph,
   );
   if (invariantDiagnostic !== null) {
     return transitionFailure(state, invariantDiagnostic);
+  }
+  const initiativeGraph = validateInitiativeGraphTransition(
+    state.projection,
+    state.events,
+    request.to,
+    request.initiativeGraph,
+  );
+  if (isWorkflowDiagnostic(initiativeGraph)) {
+    return transitionFailure(state, initiativeGraph);
   }
 
   const tail = state.events[state.events.length - 1]!;
@@ -529,10 +548,7 @@ export function transitionWorkflow(
     outcome: "accepted" as const,
     gates: copyGateAcceptances(request.gates),
     blockers: blockersAfterTransition(state.projection, request),
-    initiativeGraph:
-      request.initiativeGraph === undefined
-        ? null
-        : copyDependencyGraph(request.initiativeGraph),
+    initiativeGraph,
     reason: request.event.reason,
     idempotencyKey: request.event.idempotencyKey,
     occurredAt: request.event.occurredAt,
@@ -680,13 +696,24 @@ export function replayWorkflowEvents(
       acceptedEvents,
       sourceEvent.to,
       sourceEvent.blockers,
-      sourceEvent.initiativeGraph,
     );
     if (invariantDiagnostic !== null) {
       return replayFailure({ ...invariantDiagnostic, path: `$[${index}]` });
     }
+    const initiativeGraph = validateInitiativeGraphTransition(
+      projection,
+      acceptedEvents,
+      sourceEvent.to,
+      sourceEvent.initiativeGraph,
+    );
+    if (isWorkflowDiagnostic(initiativeGraph)) {
+      return replayFailure({
+        ...initiativeGraph,
+        path: `$[${index}]${initiativeGraph.path.slice(1)}`,
+      });
+    }
 
-    const event = copyTransitionEvent(sourceEvent);
+    const event = copyTransitionEvent(sourceEvent, initiativeGraph);
     projection = projectTransitionEvent(projection, event);
     acceptedEvents.push(event);
   }
@@ -866,16 +893,6 @@ function validateTaskPaths(
   return null;
 }
 
-export function isRepositoryRelativePath(value: unknown): value is string {
-  return (
-    typeof value === "string" &&
-    value.length > 0 &&
-    !value.startsWith("/") &&
-    !value.includes("\\") &&
-    !/^[A-Za-z]:\//u.test(value) &&
-    !value.split("/").includes("..")
-  );
-}
 
 function validateTransitionRequest(
   state: WorkflowState,
@@ -936,7 +953,6 @@ function validateTransitionInvariants(
   events: readonly WorkflowEvent[],
   to: WorkflowPosition,
   blockers: readonly string[] | undefined,
-  initiativeGraph: DependencyGraph | null | undefined,
 ): WorkflowDiagnostic | null {
   const preservesPosition =
     to.lifecycle === "blocked" ||
@@ -963,33 +979,6 @@ function validateTransitionInvariants(
       "Blocker reasons may be supplied only when entering blocked.",
     );
   }
-  const entersInitiativeIntegrate =
-    projection.route === "initiative" &&
-    projection.phase === "plan" &&
-    to.phase === "integrate";
-  if (entersInitiativeIntegrate) {
-    if (initiativeGraph === null || initiativeGraph === undefined) {
-      return diagnostic(
-        "workflow.gate.unmet",
-        "$.initiativeGraph",
-        "Initiative cannot leave Plan without a validated Dependency Graph snapshot.",
-        "Provide the current graph snapshot with the Initiative readiness Gate.",
-      );
-    }
-    const graphDiagnostic = validateDependencyGraph(
-      initiativeGraph,
-      projection,
-      events,
-    );
-    if (graphDiagnostic !== null) {
-      return graphDiagnostic;
-    }
-  } else if (initiativeGraph !== null && initiativeGraph !== undefined) {
-    return invalidRequest(
-      "$.initiativeGraph",
-      "Dependency Graph snapshots may be supplied only when Initiative enters Integrate.",
-    );
-  }
   if (
     projection.lifecycle === "active" &&
     projection.phase === "review" &&
@@ -1007,150 +996,92 @@ function validateTransitionInvariants(
   return null;
 }
 
-function validateDependencyGraph(
+function validateInitiativeGraphTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+  initiativeGraph: DependencyGraph | null | undefined,
+): DependencyGraph | WorkflowDiagnostic | null {
+  const entersInitiativeIntegrate =
+    projection.route === "initiative" &&
+    projection.phase === "plan" &&
+    to.phase === "integrate";
+  if (!entersInitiativeIntegrate) {
+    return initiativeGraph === null || initiativeGraph === undefined
+      ? null
+      : invalidRequest(
+          "$.initiativeGraph",
+          "Dependency Graph snapshots may be supplied only when Initiative enters Integrate.",
+        );
+  }
+  if (initiativeGraph === null || initiativeGraph === undefined) {
+    return diagnostic(
+      "workflow.gate.unmet",
+      "$.initiativeGraph",
+      "Initiative cannot leave Plan without a validated Dependency Graph snapshot.",
+      "Provide the current graph snapshot with the Initiative readiness Gate.",
+    );
+  }
+  return validateInitiativeGraphSnapshot(initiativeGraph, projection, events);
+}
+
+function validateInitiativeGraphSnapshot(
   graph: DependencyGraph,
   projection: TaskProjection,
   events: readonly WorkflowEvent[],
-): WorkflowDiagnostic | null {
-  if (!isDependencyGraphRecord(graph)) {
-    return graphFailure("Dependency Graph record or Resource Claims are malformed.");
+): DependencyGraph | WorkflowDiagnostic {
+  const validation = validateDependencyGraphContract({
+    contractVersion: DEPENDENCY_GRAPH_CONTRACT_VERSION,
+    graph,
+  });
+  if (!validation.ok) {
+    return dependencyGraphWorkflowDiagnostic(validation.diagnostics[0]!);
   }
-  if (
-    graph.id !== projection.initiativeGraphId ||
-    graph.initiativeTaskId !== projection.id
-  ) {
+  if (validation.graph.id !== projection.initiativeGraphId) {
     return graphFailure(
-      "Dependency Graph identity does not match the Initiative Projection.",
+      "$.initiativeGraph.id",
+      "Dependency Graph id does not match the Initiative Projection.",
     );
   }
-  if (!events.some((event) => event.eventId === graph.updatedByEvent)) {
+  if (validation.graph.initiativeTaskId !== projection.id) {
     return graphFailure(
+      "$.initiativeGraph.initiativeTaskId",
+      "Dependency Graph Initiative Task id does not match the Projection.",
+    );
+  }
+  if (!events.some((event) => event.eventId === validation.graph.updatedByEvent)) {
+    return graphFailure(
+      "$.initiativeGraph.updatedByEvent",
       "Dependency Graph is not bound to an accepted Event in this Task history.",
     );
   }
-  if (graph.nodes.length === 0) {
-    return graphFailure("Dependency Graph must contain at least one Build node.");
-  }
-
-  const nodeIds = new Set<string>();
-  for (const node of graph.nodes) {
-    if (node.taskId === projection.id || nodeIds.has(node.taskId)) {
-      return graphFailure(
-        "Dependency Graph node ids must be unique Build Task ids.",
-      );
-    }
-    nodeIds.add(node.taskId);
-  }
-  for (const edge of graph.edges) {
-    if (
-      edge.from === edge.to ||
-      !nodeIds.has(edge.from) ||
-      !nodeIds.has(edge.to)
-    ) {
-      return graphFailure(
-        "Dependency Graph edges must connect two distinct declared nodes.",
-      );
-    }
-  }
-  if (hasDirectedCycle(graph.nodes, graph.edges)) {
-    return graphFailure("Dependency Graph must be acyclic.");
-  }
-  return null;
+  return validation.graph;
 }
 
-function isDependencyGraphRecord(value: unknown): value is DependencyGraph {
-  if (!isUnknownRecord(value)) {
-    return false;
-  }
-  return (
-    value.schemaVersion === DURABLE_RECORD_SCHEMA_VERSION &&
-    isIdentifier(value.id) &&
-    isIdentifier(value.initiativeTaskId) &&
-    Number.isSafeInteger(value.version) &&
-    (value.version as number) >= 1 &&
-    Array.isArray(value.nodes) &&
-    value.nodes.every(isDependencyGraphNode) &&
-    Array.isArray(value.edges) &&
-    value.edges.every(isDependencyGraphEdge) &&
-    isIdentifier(value.updatedByEvent)
-  );
+function isWorkflowDiagnostic(
+  value: DependencyGraph | WorkflowDiagnostic | null,
+): value is WorkflowDiagnostic {
+  return value !== null && Object.hasOwn(value, "code");
 }
 
-function isDependencyGraphNode(value: unknown): value is DependencyGraphNode {
-  if (!isUnknownRecord(value) || !isUnknownRecord(value.resources)) {
-    return false;
-  }
-  const resources = value.resources;
-  return (
-    isIdentifier(value.taskId) &&
-    Number.isSafeInteger(value.priority) &&
-    isStringArray(resources.files) &&
-    resources.files.every(isRepositoryRelativePath) &&
-    isStringArray(resources.apis) &&
-    isStringArray(resources.schemas) &&
-    isStringArray(resources.locks) &&
-    resources.locks.every(isRepositoryRelativePath)
-  );
+function dependencyGraphWorkflowDiagnostic(
+  value: DependencyGraphDiagnostic,
+): WorkflowDiagnostic {
+  const graphPath = "$.graph";
+  const suffix = value.path.startsWith(graphPath)
+    ? value.path.slice(graphPath.length)
+    : "";
+  return Object.freeze({
+    ...value,
+    path: `$.initiativeGraph${suffix}`,
+  });
 }
 
-function isDependencyGraphEdge(value: unknown): value is DependencyGraphEdge {
-  return (
-    isUnknownRecord(value) &&
-    isIdentifier(value.from) &&
-    isIdentifier(value.to) &&
-    isDependencyGraphEdgeType(value.type) &&
-    typeof value.reason === "string" &&
-    value.reason.trim().length > 0
-  );
-}
 
-function isDependencyGraphEdgeType(
-  value: unknown,
-): value is DependencyGraphEdgeType {
-  return (
-    value === "blocks" ||
-    value === "informs" ||
-    value === "validates" ||
-    value === "supersedes"
-  );
-}
-
-function hasDirectedCycle(
-  nodes: readonly DependencyGraphNode[],
-  edges: readonly DependencyGraphEdge[],
-): boolean {
-  const outgoing = new Map<string, string[]>();
-  const indegree = new Map<string, number>();
-  for (const node of nodes) {
-    outgoing.set(node.taskId, []);
-    indegree.set(node.taskId, 0);
-  }
-  for (const edge of edges) {
-    outgoing.get(edge.from)!.push(edge.to);
-    indegree.set(edge.to, indegree.get(edge.to)! + 1);
-  }
-  const ready = nodes
-    .map((node) => node.taskId)
-    .filter((taskId) => indegree.get(taskId) === 0);
-  let visited = 0;
-  for (let index = 0; index < ready.length; index += 1) {
-    const taskId = ready[index]!;
-    visited += 1;
-    for (const dependent of outgoing.get(taskId)!) {
-      const remaining = indegree.get(dependent)! - 1;
-      indegree.set(dependent, remaining);
-      if (remaining === 0) {
-        ready.push(dependent);
-      }
-    }
-  }
-  return visited !== nodes.length;
-}
-
-function graphFailure(message: string): WorkflowDiagnostic {
+function graphFailure(path: string, message: string): WorkflowDiagnostic {
   return diagnostic(
     "workflow.graph.invalid",
-    "$.initiativeGraph",
+    path,
     message,
     "Provide the current schema-valid, acyclic graph bound to this Initiative.",
   );
@@ -1229,9 +1160,7 @@ function validateReplayEvent(
     !isWorkflowPosition(event.to) ||
     !Array.isArray(event.gates) ||
     !event.gates.every(isGateAcceptance) ||
-    !isStringArray(event.blockers) ||
-    (event.initiativeGraph !== null &&
-      !isDependencyGraphRecord(event.initiativeGraph))
+    !isStringArray(event.blockers)
   ) {
     return diagnostic(
       "workflow.event.invalid",
@@ -1570,6 +1499,7 @@ function copyCreatedEvent(event: TaskCreatedEvent): TaskCreatedEvent {
 
 function copyTransitionEvent(
   event: WorkflowTransitionedEvent,
+  initiativeGraph: DependencyGraph | null,
 ): WorkflowTransitionedEvent {
   return Object.freeze({
     ...event,
@@ -1578,32 +1508,10 @@ function copyTransitionEvent(
     actor: copyActor(event.actor),
     gates: copyGateAcceptances(event.gates),
     blockers: copyStrings(event.blockers),
-    initiativeGraph:
-      event.initiativeGraph === null
-        ? null
-        : copyDependencyGraph(event.initiativeGraph),
+    initiativeGraph,
   });
 }
 
-function copyDependencyGraph(graph: DependencyGraph): DependencyGraph {
-  return Object.freeze({
-    ...graph,
-    nodes: Object.freeze(
-      graph.nodes.map((node) =>
-        Object.freeze({
-          ...node,
-          resources: Object.freeze({
-            files: copyStrings(node.resources.files),
-            apis: copyStrings(node.resources.apis),
-            schemas: copyStrings(node.resources.schemas),
-            locks: copyStrings(node.resources.locks),
-          }),
-        }),
-      ),
-    ),
-    edges: Object.freeze(graph.edges.map((edge) => Object.freeze({ ...edge }))),
-  });
-}
 
 function copyGateAcceptances(
   gates: readonly GateAcceptance[],
@@ -1742,13 +1650,6 @@ export function stableJson(value: unknown): string {
     .join(",")}}`;
 }
 
-export function isIdentifier(value: unknown): value is string {
-  return validateDomainValue({
-    contractVersion: DOMAIN_VALIDATION_CONTRACT_VERSION,
-    kind: "identifier",
-    value,
-  }).ok;
-}
 
 function isTimestamp(value: unknown): value is string {
   return validateDomainValue({
