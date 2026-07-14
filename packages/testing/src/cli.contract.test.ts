@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   readCliBootstrapContract,
   validateCliDomainValue,
+  validateCliDependencyGraph,
 } from "@dnslin/sayhi-cli";
 import { coreContract } from "@dnslin/sayhi-core";
 
@@ -33,5 +34,39 @@ test("CLI exposes the same domain validation result as Core", () => {
   assert.deepEqual(
     validateCliDomainValue(invalidRequest),
     coreContract.validateDomainValue(invalidRequest),
+  );
+});
+
+test("CLI exposes the same Dependency Graph validation result as Core", () => {
+  const validRequest = {
+    contractVersion: 1,
+    graph: {
+      schemaVersion: 1,
+      id: "GRAPH-CLI",
+      initiativeTaskId: "TASK-CLI",
+      version: 1,
+      nodes: [
+        {
+          taskId: "TASK-CLI-NODE",
+          priority: 1,
+          resources: { files: [], apis: [], schemas: [], locks: [] },
+        },
+      ],
+      edges: [],
+      updatedByEvent: "EVENT-CLI",
+    },
+  };
+  const invalidRequest = {
+    ...validRequest,
+    graph: { ...validRequest.graph, schemaVersion: 2 },
+  };
+
+  assert.deepEqual(
+    validateCliDependencyGraph(validRequest),
+    coreContract.validateDependencyGraph(validRequest),
+  );
+  assert.deepEqual(
+    validateCliDependencyGraph(invalidRequest),
+    coreContract.validateDependencyGraph(invalidRequest),
   );
 });

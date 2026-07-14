@@ -254,8 +254,12 @@ function validateReadableDomainValue(request: unknown): DomainValidationResult {
   }
 }
 
+export function isIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
 function validateIdentifier(value: unknown): DomainValidationResult {
-  if (typeof value !== "string" || value.length === 0) {
+  if (!isIdentifier(value)) {
     return failure(
       "validation.identifier.invalid",
       "$.value",

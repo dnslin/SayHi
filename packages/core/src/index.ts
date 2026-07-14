@@ -1,3 +1,4 @@
+import { validateDependencyGraph } from "./dependency-graph.js";
 import {
   authorizePhaseExecution,
   bindPhaseExecution,
@@ -29,6 +30,19 @@ export type {
   ValidationDiagnosticCode,
   Version,
 } from "./validation.js";
+
+export {
+  DEPENDENCY_GRAPH_CONTRACT_VERSION,
+  validateDependencyGraph,
+} from "./dependency-graph.js";
+export type {
+  DependencyGraphDiagnostic,
+  DependencyGraphDiagnosticCode,
+  DependencyGraphValidationFailure,
+  DependencyGraphValidationRequest,
+  DependencyGraphValidationResult,
+  DependencyGraphValidationSuccess,
+} from "./dependency-graph.js";
 
 export {
   PHASE_EXECUTION_CONTRACT_VERSION,
@@ -116,6 +130,7 @@ export interface BootstrapContract {
 export interface CoreContract {
   readBootstrapContract(): BootstrapContract;
   readonly validateDomainValue: typeof validateDomainValue;
+  readonly validateDependencyGraph: typeof validateDependencyGraph;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -132,6 +147,7 @@ const bootstrapContract: BootstrapContract = Object.freeze({
 export const coreContract: CoreContract = Object.freeze({
   readBootstrapContract: () => bootstrapContract,
   validateDomainValue,
+  validateDependencyGraph,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
