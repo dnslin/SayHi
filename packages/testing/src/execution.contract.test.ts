@@ -1008,3 +1008,119 @@ test("Core fails closed for an unknown runtime capability kind", () => {
     },
   );
 });
+
+test("Core returns a structured failure for a malformed binding request", () => {
+  for (const request of [null, undefined, 42, "invalid"]) {
+    assert.deepEqual(coreContract.bindPhaseExecution(request as never), {
+      ok: false,
+      contractVersion: 1,
+      diagnostics: [
+        {
+          code: "execution.request_invalid",
+          path: "$",
+          message: "Phase execution binding request must be a readable object.",
+          remediation:
+            "Provide contractVersion, dispatch, Manifest, current Context, Agent contract, and Skill materials.",
+        },
+      ],
+    });
+  }
+});
+
+test("Core returns structured failures for malformed authorization inputs", () => {
+  const bound = coreContract.bindPhaseExecution({
+    contractVersion: 1,
+    dispatch,
+    manifest,
+    currentContext,
+    agentContract,
+    skills,
+  });
+  assert.equal(bound.ok, true);
+  if (!bound.ok) {
+    assert.fail("Expected the fixture to produce a Phase execution binding.");
+  }
+
+  const validRequest = {
+    contractVersion: 1,
+    binding: bound.binding,
+    manifest,
+    currentContext,
+    agentContract,
+    skills,
+    capability: { kind: "tool", name: "edit" },
+  } as const;
+  const cases = [
+    {
+      request: null,
+      diagnostic: {
+        code: "execution.request_invalid",
+        path: "$",
+        message:
+          "Phase execution authorization request must be a readable object.",
+        remediation:
+          "Provide contractVersion, binding, current execution materials, and one capability.",
+      },
+    },
+    {
+      request: { ...validRequest, binding: null },
+      diagnostic: {
+        code: "execution.request_invalid",
+        path: "$.binding",
+        message:
+          "Phase execution authorization binding must be a readable object.",
+        remediation: "Use a binding returned by bindPhaseExecution.",
+      },
+    },
+    {
+      request: { ...validRequest, capability: null },
+      diagnostic: {
+        code: "execution.request_invalid",
+        path: "$.capability",
+        message: "Phase execution capability must be a readable object.",
+        remediation:
+          "Request a tool, network, spawn, repository, or Skill capability.",
+      },
+    },
+  ] as const;
+
+  for (const authorizationCase of cases) {
+    assert.deepEqual(
+      coreContract.authorizePhaseExecution(authorizationCase.request as never),
+      {
+        ok: false,
+        contractVersion: 1,
+        diagnostics: [authorizationCase.diagnostic],
+      },
+    );
+  }
+});
+
+test("Core fails closed when binding input cannot be read safely", () => {
+  const cyclicManifest: unknown[] = [];
+  cyclicManifest.push(cyclicManifest);
+
+  assert.deepEqual(
+    coreContract.bindPhaseExecution({
+      contractVersion: 1,
+      dispatch,
+      manifest: cyclicManifest as never,
+      currentContext,
+      agentContract,
+      skills,
+    }),
+    {
+      ok: false,
+      contractVersion: 1,
+      diagnostics: [
+        {
+          code: "execution.request_invalid",
+          path: "$",
+          message: "Phase execution binding request could not be read safely.",
+          remediation:
+            "Provide plain contract data without accessors, cycles, or unreadable values.",
+        },
+      ],
+    },
+  );
+});

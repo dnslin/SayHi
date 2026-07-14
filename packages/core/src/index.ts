@@ -54,6 +54,7 @@ export type {
   PhaseAgentRole,
   PhaseCapability,
   PhaseExecutionBinding,
+  PhaseExecutionMaterials,
   PhaseExecutionDiagnostic,
   PhaseExecutionAuthorization,
   PhaseExecutionFailure,

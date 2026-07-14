@@ -110,13 +110,16 @@ export interface SkillMaterial {
   readonly content: string | Uint8Array;
 }
 
-export interface BindPhaseExecutionRequest {
-  readonly contractVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
-  readonly dispatch: PhaseExecutionDispatch;
+export interface PhaseExecutionMaterials {
   readonly manifest: readonly ContextManifestEntry[];
   readonly currentContext: readonly CurrentContextContent[];
   readonly agentContract: PhaseAgentContract;
   readonly skills: readonly SkillMaterial[];
+}
+
+export interface BindPhaseExecutionRequest extends PhaseExecutionMaterials {
+  readonly contractVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
+  readonly dispatch: PhaseExecutionDispatch;
 }
 
 export interface BoundSkillIdentity {
@@ -144,13 +147,9 @@ export type PhaseCapability =
   | Readonly<{ kind: "repository"; access: RepositoryOperation }>
   | Readonly<{ kind: "skill"; name: string }>;
 
-export interface AuthorizePhaseExecutionRequest {
+export interface AuthorizePhaseExecutionRequest extends PhaseExecutionMaterials {
   readonly contractVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
   readonly binding: PhaseExecutionBinding;
-  readonly manifest: readonly ContextManifestEntry[];
-  readonly currentContext: readonly CurrentContextContent[];
-  readonly agentContract: PhaseAgentContract;
-  readonly skills: readonly SkillMaterial[];
   readonly capability: PhaseCapability;
 }
 
@@ -190,11 +189,7 @@ export type BindPhaseExecutionResult =
       contractVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
       binding: PhaseExecutionBinding;
     }>
-  | Readonly<{
-      ok: false;
-      contractVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
-      diagnostics: readonly PhaseExecutionDiagnostic[];
-    }>;
+  | PhaseExecutionFailure;
 
 export type AuthorizePhaseExecutionResult =
   | Readonly<{
@@ -205,6 +200,29 @@ export type AuthorizePhaseExecutionResult =
   | PhaseExecutionFailure;
 
 export function bindPhaseExecution(
+  request: BindPhaseExecutionRequest,
+): BindPhaseExecutionResult {
+  try {
+    if (!isUnknownRecord(request)) {
+      return failure(
+        "execution.request_invalid",
+        "$",
+        "Phase execution binding request must be a readable object.",
+        "Provide contractVersion, dispatch, Manifest, current Context, Agent contract, and Skill materials.",
+      );
+    }
+    return bindReadablePhaseExecution(request);
+  } catch {
+    return failure(
+      "execution.request_invalid",
+      "$",
+      "Phase execution binding request could not be read safely.",
+      "Provide plain contract data without accessors, cycles, or unreadable values.",
+    );
+  }
+}
+
+function bindReadablePhaseExecution(
   request: BindPhaseExecutionRequest,
 ): BindPhaseExecutionResult {
   if (request.contractVersion !== PHASE_EXECUTION_CONTRACT_VERSION) {
@@ -252,6 +270,45 @@ export function bindPhaseExecution(
 }
 
 export function authorizePhaseExecution(
+  request: AuthorizePhaseExecutionRequest,
+): AuthorizePhaseExecutionResult {
+  try {
+    if (!isUnknownRecord(request)) {
+      return failure(
+        "execution.request_invalid",
+        "$",
+        "Phase execution authorization request must be a readable object.",
+        "Provide contractVersion, binding, current execution materials, and one capability.",
+      );
+    }
+    if (!isUnknownRecord(request.binding)) {
+      return failure(
+        "execution.request_invalid",
+        "$.binding",
+        "Phase execution authorization binding must be a readable object.",
+        "Use a binding returned by bindPhaseExecution.",
+      );
+    }
+    if (!isUnknownRecord(request.capability)) {
+      return failure(
+        "execution.request_invalid",
+        "$.capability",
+        "Phase execution capability must be a readable object.",
+        "Request a tool, network, spawn, repository, or Skill capability.",
+      );
+    }
+    return authorizeReadablePhaseExecution(request);
+  } catch {
+    return failure(
+      "execution.request_invalid",
+      "$",
+      "Phase execution authorization request could not be read safely.",
+      "Provide plain contract data without accessors, cycles, or unreadable values.",
+    );
+  }
+}
+
+function authorizeReadablePhaseExecution(
   request: AuthorizePhaseExecutionRequest,
 ): AuthorizePhaseExecutionResult {
   const binding = request.binding;
@@ -383,7 +440,7 @@ function validateDispatch(
 function validateContextBinding(
   request: BindPhaseExecutionRequest,
 ): PhaseExecutionFailure | null {
-  if (identifyContract(request.manifest) !== request.dispatch.contextManifestIdentity) {
+  if (hashCanonicalContract(request.manifest) !== request.dispatch.contextManifestIdentity) {
     return failure(
       "execution.context_invalid",
       "$.dispatch.contextManifestIdentity",
@@ -690,7 +747,7 @@ function validateAgentBinding(
       "Use prompt-body-only overrides.",
     );
   }
-  if (identifyContract(contract) !== request.dispatch.agentContractIdentity) {
+  if (hashCanonicalContract(contract) !== request.dispatch.agentContractIdentity) {
     return failure(
       "execution.agent_invalid",
       "$.dispatch.agentContractIdentity",
@@ -902,7 +959,7 @@ function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
 }
 
 
-function identifyContract(value: unknown): ContractIdentity {
+function hashCanonicalContract(value: unknown): ContractIdentity {
   const digest = createHash("sha256").update(stableJson(value)).digest("hex");
   return `sha256:${digest}`;
 }
