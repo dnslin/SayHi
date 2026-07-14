@@ -4,7 +4,14 @@ import test from "node:test";
 import { coreContract } from "@dnslin/sayhi-core";
 
 const SHA256_A = `sha256:${"a".repeat(64)}`;
-const SHA256_B = `sha256:${"b".repeat(64)}`;
+const CONTENT_HASH_A = {
+  algorithm: "sha256-lf-v1",
+  digest: "a".repeat(64),
+} as const;
+const CONTENT_HASH_B = {
+  algorithm: "sha256-bytes-v1",
+  digest: "b".repeat(64),
+} as const;
 
 test("Core round-trips every versioned knowledge, External Reference, Skill, and managed-file record", () => {
   const cases = [
@@ -53,7 +60,15 @@ test("Core round-trips every versioned knowledge, External Reference, Skill, and
           {
             name: "tdd",
             path: "tdd",
-            files: [{ path: "SKILL.md", sha256: "2".repeat(64) }],
+            files: [
+              {
+                path: "SKILL.md",
+                sha256: {
+                  algorithm: "sha256-bytes-v1",
+                  digest: "2".repeat(64),
+                },
+              },
+            ],
             upstream: {
               repository: "https://github.com/mattpocock/skills",
               commit: "3".repeat(40),
@@ -71,7 +86,7 @@ test("Core round-trips every versioned knowledge, External Reference, Skill, and
         schemaVersion: 1,
         path: ".sayhi/agents/implementation.md",
         ownershipClass: "engine-owned",
-        installedBaseIdentity: SHA256_B,
+        installedBaseIdentity: CONTENT_HASH_B,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
       },
@@ -111,7 +126,7 @@ test("Core enforces all managed-file ownership and installed-base identity rules
       schemaVersion: 1,
       path: ".sayhi/agents/customizable.md",
       ownershipClass: "managed-customizable",
-      installedBaseIdentity: SHA256_A,
+      installedBaseIdentity: CONTENT_HASH_A,
       generatedSourceVersion: "1.0.0",
       markerIds: ["sayhi-agent-body"],
     },
@@ -145,7 +160,7 @@ test("Core enforces all managed-file ownership and installed-base identity rules
       "$.record.installedBaseIdentity",
     ],
     [
-      { ...base, ownershipClass: "user-owned", installedBaseIdentity: SHA256_A },
+      { ...base, ownershipClass: "user-owned", installedBaseIdentity: CONTENT_HASH_A },
       "record_contract.ownership.invalid",
       "$.record.installedBaseIdentity",
     ],
@@ -153,7 +168,7 @@ test("Core enforces all managed-file ownership and installed-base identity rules
       {
         ...base,
         ownershipClass: "managed-customizable",
-        installedBaseIdentity: SHA256_A,
+        installedBaseIdentity: CONTENT_HASH_A,
       },
       "record_contract.ownership.invalid",
       "$.record",
@@ -250,7 +265,15 @@ test("Core rejects malformed records and duplicate immutable Skill identities", 
   const lockedSkill = {
     name: "tdd",
     path: "tdd",
-    files: [{ path: "SKILL.md", sha256: "2".repeat(64) }],
+    files: [
+      {
+        path: "SKILL.md",
+        sha256: {
+          algorithm: "sha256-bytes-v1",
+          digest: "2".repeat(64),
+        },
+      },
+    ],
     upstream: {
       repository: "https://github.com/mattpocock/skills",
       commit: "3".repeat(40),
@@ -309,7 +332,10 @@ test("Core rejects malformed records and duplicate immutable Skill identities", 
           {
             ...lockedSkill,
             path: "another-tdd",
-            files: lockedSkill.files.map((file) => ({ ...file })),
+            files: lockedSkill.files.map((file) => ({
+              ...file,
+              sha256: { ...file.sha256 },
+            })),
             upstream: { ...lockedSkill.upstream },
           },
         ],
@@ -397,4 +423,87 @@ test("Core does not execute accessors while validating contract records", () => 
   if (!result.ok) {
     assert.equal(result.diagnostics[0]?.code, "record_contract.request.invalid");
   }
+});
+
+test("Core requires algorithm-specific descriptors for Skill file content identities", () => {
+  const byteIdentity = {
+    algorithm: "sha256-bytes-v1",
+    digest: "b".repeat(64),
+  };
+  const validRequest = {
+    contractVersion: 1,
+    kind: "skillLock",
+    record: {
+      schemaVersion: 1,
+      registry: {
+        repository: "https://github.com/dnslin/skills",
+        commit: "1".repeat(40),
+      },
+      skills: [
+        {
+          name: "tdd",
+          path: "tdd",
+          files: [{ path: "SKILL.md", sha256: byteIdentity }],
+          upstream: {
+            repository: "https://github.com/mattpocock/skills",
+            commit: "2".repeat(40),
+            path: "skills/engineering/tdd",
+            license: "MIT",
+          },
+          sidecarIdentity: SHA256_A,
+        },
+      ],
+    },
+  } as const;
+
+  assert.equal(coreContract.validateContractRecord(validRequest).ok, true);
+  assert.equal(
+    coreContract.validateContractRecord({
+      ...validRequest,
+      record: {
+        ...validRequest.record,
+        skills: [
+          {
+            ...validRequest.record.skills[0],
+            files: [{ path: "SKILL.md", sha256: "b".repeat(64) }],
+          },
+        ],
+      },
+    }).ok,
+    false,
+  );
+});
+
+test("Core requires algorithm-specific descriptors for managed-file content identities", () => {
+  const validRequest = {
+    contractVersion: 1,
+    kind: "managedFile",
+    record: {
+      schemaVersion: 1,
+      path: ".sayhi/agents/implementation.md",
+      ownershipClass: "engine-owned",
+      installedBaseIdentity: {
+        algorithm: "sha256-lf-v1",
+        digest: "a".repeat(64),
+      },
+      incomingUpdateIdentity: {
+        algorithm: "sha256-bytes-v1",
+        digest: "b".repeat(64),
+      },
+      generatedSourceVersion: "1.0.0",
+      markerIds: [],
+    },
+  } as const;
+
+  assert.equal(coreContract.validateContractRecord(validRequest).ok, true);
+  assert.equal(
+    coreContract.validateContractRecord({
+      ...validRequest,
+      record: {
+        ...validRequest.record,
+        installedBaseIdentity: SHA256_A,
+      },
+    }).ok,
+    false,
+  );
 });

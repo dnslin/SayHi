@@ -70,6 +70,8 @@ export type {
   DependencyGraphValidationSuccess,
 } from "./dependency-graph.js";
 
+export type { ContractIdentity } from "./identity.js";
+
 export {
   PHASE_EXECUTION_CONTRACT_VERSION,
   bindPhaseExecution,
@@ -88,7 +90,6 @@ export type {
   ContextManifestEntry,
   ContextSource,
   ContextTrustTier,
-  ContractIdentity,
   CurrentContextContent,
   PhaseAgentContract,
   PhaseAgentRole,

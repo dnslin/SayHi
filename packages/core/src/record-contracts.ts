@@ -1,4 +1,8 @@
-import { createHash } from "node:crypto";
+import {
+  hashCanonicalJson,
+  isContractIdentity,
+  type ContractIdentity,
+} from "./identity.js";
 
 import { isRepositoryRelativePath } from "./repository-path.js";
 import {
@@ -7,8 +11,6 @@ import {
   validateDomainValue,
   type ContentHash,
 } from "./validation.js";
-import { stableJson } from "./workflow.js";
-import type { ContractIdentity } from "./execution.js";
 
 export const RECORD_CONTRACT_VERSION = 1 as const;
 
@@ -59,7 +61,7 @@ export type ExternalReferenceRecord = Readonly<Record<string, unknown>> & {
 
 export interface SkillLockFile {
   readonly path: string;
-  readonly sha256: string;
+  readonly sha256: ContentHash;
 }
 
 export interface SkillUpstreamIdentity {
@@ -90,10 +92,10 @@ export type ManagedFileRecord = Readonly<Record<string, unknown>> & {
   readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
   readonly path: string;
   readonly ownershipClass: ManagedFileOwnershipClass;
-  readonly installedBaseIdentity?: ContractIdentity;
+  readonly installedBaseIdentity?: ContentHash;
   readonly generatedSourceVersion: string;
   readonly markerIds: readonly string[];
-  readonly incomingUpdateIdentity?: ContractIdentity;
+  readonly incomingUpdateIdentity?: ContentHash;
   readonly localOverrideSource?: string;
 };
 
@@ -159,7 +161,6 @@ type JsonData =
   | { readonly [key: string]: JsonData };
 
 const INVALID_JSON = Symbol("invalid-json");
-const SHA256_PATTERN = /^[0-9a-f]{64}$/iu;
 const FULL_GIT_COMMIT_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu;
 
 export function validateContractRecord(
@@ -227,7 +228,7 @@ function validateReadableRequest(
     return recordFailure;
   }
 
-  const identity = hashRecord(request.record);
+  const identity = hashCanonicalJson(request.record);
   if (Object.hasOwn(request, "expectedIdentity")) {
     if (!isContractIdentity(request.expectedIdentity)) {
       return failure(
@@ -436,8 +437,11 @@ function validateLockedSkill(
     if (!isRecord(file) || !isRepositoryRelativePath(file.path)) {
       return invalidSkillLock(`${filePath}.path`, "Locked file path must be repository-relative.");
     }
-    if (typeof file.sha256 !== "string" || !SHA256_PATTERN.test(file.sha256)) {
-      return invalidSkillLock(`${filePath}.sha256`, "Locked file sha256 must be a SHA-256 digest.");
+    if (!isContentHash(file.sha256)) {
+      return invalidSkillLock(
+        `${filePath}.sha256`,
+        "Locked file sha256 must be an algorithm-specific content identity.",
+      );
     }
     if (filePaths.has(file.path)) {
       return invalidSkillLock(`${filePath}.path`, "Locked file path must be unique within a Skill.");
@@ -506,11 +510,11 @@ function validateManagedFile(
   }
   if (
     Object.hasOwn(record, "incomingUpdateIdentity") &&
-    !isContractIdentity(record.incomingUpdateIdentity)
+    !isContentHash(record.incomingUpdateIdentity)
   ) {
     return invalidManagedFile(
       "$.record.incomingUpdateIdentity",
-      "incomingUpdateIdentity must be a SHA-256 identity.",
+      "incomingUpdateIdentity must be an algorithm-specific content identity.",
     );
   }
   if (
@@ -534,12 +538,12 @@ function validateManagedFile(
     }
     return null;
   }
-  if (!isContractIdentity(record.installedBaseIdentity)) {
+  if (!isContentHash(record.installedBaseIdentity)) {
     return failure(
       "record_contract.identity.invalid",
       "$.record.installedBaseIdentity",
-      "This ownership class requires an exact installed base identity.",
-      "Record the installed content as sha256:<64 hexadecimal characters>.",
+      "This ownership class requires an exact installed base content identity.",
+      "Record the installed content with its SHA-256 algorithm and digest.",
     );
   }
   if (
@@ -695,9 +699,6 @@ function isContentHash(value: unknown): value is ContentHash {
   }).ok;
 }
 
-function isContractIdentity(value: unknown): value is ContractIdentity {
-  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/iu.test(value);
-}
 
 function isCredentialFreeUri(value: unknown): value is string {
   if (!isNonEmptyString(value)) {
@@ -711,10 +712,6 @@ function isCredentialFreeUri(value: unknown): value is string {
   }
 }
 
-function hashRecord(record: UnknownRecord): ContractIdentity {
-  const digest = createHash("sha256").update(stableJson(record)).digest("hex");
-  return `sha256:${digest}`;
-}
 
 function copyJsonData(
   value: unknown,

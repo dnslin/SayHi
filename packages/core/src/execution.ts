@@ -1,4 +1,9 @@
 import { createHash } from "node:crypto";
+import {
+  hashCanonicalJson,
+  isContractIdentity,
+  type ContractIdentity,
+} from "./identity.js";
 
 import {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
@@ -11,7 +16,6 @@ import {
   isUnknownRecord,
   isRepositoryRelativePath,
   isWorkflowPhase,
-  stableJson,
   type WorkflowPhase,
 } from "./workflow.js";
 
@@ -38,7 +42,6 @@ export type AgentRepositoryAccess =
   | "read-only"
   | "exclusive-write"
   | "read-only-plus-exclusive-validation";
-export type ContractIdentity = `sha256:${string}`;
 
 const phaseByAgentRole: Readonly<Record<PhaseAgentRole, WorkflowPhase>> =
   Object.freeze({
@@ -440,7 +443,7 @@ function validateDispatch(
 function validateContextBinding(
   request: BindPhaseExecutionRequest,
 ): PhaseExecutionFailure | null {
-  if (hashCanonicalContract(request.manifest) !== request.dispatch.contextManifestIdentity) {
+  if (hashCanonicalJson(request.manifest) !== request.dispatch.contextManifestIdentity) {
     return failure(
       "execution.context_invalid",
       "$.dispatch.contextManifestIdentity",
@@ -747,7 +750,7 @@ function validateAgentBinding(
       "Use prompt-body-only overrides.",
     );
   }
-  if (hashCanonicalContract(contract) !== request.dispatch.agentContractIdentity) {
+  if (hashCanonicalJson(contract) !== request.dispatch.agentContractIdentity) {
     return failure(
       "execution.agent_invalid",
       "$.dispatch.agentContractIdentity",
@@ -930,9 +933,6 @@ function validateCapability(
 }
 
 
-function isContractIdentity(value: unknown): value is ContractIdentity {
-  return typeof value === "string" && /^sha256:[0-9a-f]{64}$/iu.test(value);
-}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -959,10 +959,6 @@ function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
 }
 
 
-function hashCanonicalContract(value: unknown): ContractIdentity {
-  const digest = createHash("sha256").update(stableJson(value)).digest("hex");
-  return `sha256:${digest}`;
-}
 
 function contentMatchesIdentity(
   content: string | Uint8Array,
