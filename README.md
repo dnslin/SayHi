@@ -2,12 +2,12 @@
 
 SayHi is a clean-room, OMP-native engineering workflow framework. It combines a repository-owned engineering memory, a typed workflow state machine, phase-specific sub-agents, and unchanged upstream Skills.
 
-The executable baseline currently contains only the TypeScript workspace and a shared bootstrap Core contract. It does not claim working workflow, CLI command, Plugin, Hook, Tool, or Agent behavior.
+The executable baseline contains the TypeScript workspace, shared bootstrap contract, and Core-owned versioned validation for shared domain values and durable record envelopes. It does not claim working workflow, CLI command, Plugin, Hook, Tool, or Agent behavior.
 
 ## Status
 
 - Product and architecture decisions: accepted
-- Implementation status: bootstrap contract workspace only
+- Implementation status: shared Core bootstrap and domain-validation contracts
 - Target license: MIT
 - First runtime adapter: Oh-My-Pi (OMP)
 - CLI name: `sayhi`

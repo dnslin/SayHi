@@ -48,3 +48,10 @@ SayHi vendors selected releases unchanged and supplies separate sidecar capabili
 - [Upstream synchronization workflow](https://github.com/dnslin/skills/blob/main/.github/workflows/sync-upstream-skills.yml)
 
 The Registry is a rolling build-time source. A SayHi release pins a full commit and verifies exact files independently.
+
+## Time standards
+
+- [IERS Bulletin C leap-second data](https://hpiers.obspm.fr/iers/bul/bulc/Leap_Second.dat)
+- [IANA leap-second list](https://data.iana.org/time-zones/tzdb/leap-seconds.list)
+
+The version 1 timestamp validator uses the leap seconds published through IERS Bulletin 72 (July 2026). A newly announced leap second requires a validation-contract update.
