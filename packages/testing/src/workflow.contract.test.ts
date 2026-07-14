@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -8,6 +9,7 @@ import {
   type StartWorkflowTaskRequest,
   type WorkflowGate,
   type WorkflowRoute,
+  type WorkflowEvent,
   type WorkflowState,
   type WorkflowTransition,
 } from "@dnslin/sayhi-core";
@@ -690,6 +692,46 @@ test("Build repair transitions stop at the configured attempt limit", () => {
   assert.equal(state.projection.lifecycle, "blocked");
 });
 
+test("replay rejects transition Events with missing initiativeGraph data", () => {
+  const state = advanceTask(
+    startTask("build"),
+    "active",
+    "explore",
+    "replay-missing-graph",
+  );
+  const sourceEvent = state.events[1]!;
+  const {
+    initiativeGraph: _omittedGraph,
+    chainDigest: _originalDigest,
+    ...eventWithoutGraph
+  } = sourceEvent;
+  const omittedGraphEvent = {
+    ...eventWithoutGraph,
+    chainDigest: digestReplayEvent(eventWithoutGraph),
+  } as unknown as WorkflowEvent;
+  const undefinedGraphPayload = {
+    ...eventWithoutGraph,
+    initiativeGraph: undefined,
+  };
+  const undefinedGraphEvent = {
+    ...undefinedGraphPayload,
+    chainDigest: digestReplayEvent(undefinedGraphPayload),
+  } as unknown as WorkflowEvent;
+
+  for (const malformedEvent of [omittedGraphEvent, undefinedGraphEvent]) {
+    const replayed = coreContract.replayWorkflowEvents([
+      state.events[0]!,
+      malformedEvent,
+    ]);
+
+    assert.equal(replayed.ok, false);
+    if (!replayed.ok) {
+      assert.equal(replayed.diagnostics[0]?.code, "workflow.event.invalid");
+      assert.equal(replayed.diagnostics[0]?.path, "$[1].initiativeGraph");
+    }
+  }
+});
+
 test("replay rejects malformed Event metadata and duplicate idempotency keys", () => {
   let state = startTask("build");
   state = advanceTask(state, "active", "explore", "replay-explore");
@@ -788,6 +830,45 @@ test("replay rejects a stale Event sequence without changing accepted history", 
   }
   assert.deepEqual(advanced.state.events, acceptedSnapshot);
 });
+
+function digestReplayEvent(event: Record<string, unknown>): string {
+  const payload: Record<string, unknown> = {
+    schemaVersion: event.schemaVersion,
+    eventId: event.eventId,
+    taskId: event.taskId,
+    route: event.route,
+    sequence: event.sequence,
+    previousChainDigest: event.previousChainDigest,
+    type: event.type,
+    from: event.from,
+    to: event.to,
+    actor: event.actor,
+    outcome: event.outcome,
+    gates: event.gates,
+    blockers: event.blockers,
+    initiativeGraph: event.initiativeGraph,
+    reason: event.reason,
+    idempotencyKey: event.idempotencyKey,
+    occurredAt: event.occurredAt,
+  };
+  const serialized = stableTestJson(payload);
+  assert.ok(serialized);
+  return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
+}
+
+function stableTestJson(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableTestJson(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableTestJson(record[key])}`)
+    .join(",")}}`;
+}
 
 function lifecycleTransitions(
   phases: readonly WorkflowTransition["from"]["phase"][],

@@ -1148,6 +1148,22 @@ function validateReplayEvent(
       `Migrate the Event to schemaVersion ${DURABLE_RECORD_SCHEMA_VERSION}.`,
     );
   }
+  if (!Object.hasOwn(event, "initiativeGraph")) {
+    return diagnostic(
+      "workflow.event.invalid",
+      `${path}.initiativeGraph`,
+      "Workflow Event must declare the initiativeGraph field.",
+      "Restore initiativeGraph as null or the accepted Dependency Graph snapshot.",
+    );
+  }
+  if (event.initiativeGraph !== null && !isUnknownRecord(event.initiativeGraph)) {
+    return diagnostic(
+      "workflow.event.invalid",
+      `${path}.initiativeGraph`,
+      "Workflow Event initiativeGraph must be null or a readable object.",
+      "Restore initiativeGraph as null or the accepted Dependency Graph snapshot.",
+    );
+  }
   if (
     !isIdentifier(event.taskId) ||
     !isWorkflowRoute(event.route) ||
