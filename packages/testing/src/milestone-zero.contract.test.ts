@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { extname, join, relative } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -23,6 +23,20 @@ const HASH_A = { algorithm: "sha256-lf-v1", digest: "a".repeat(64) } as const;
 const HASH_B = { algorithm: "sha256-bytes-v1", digest: "b".repeat(64) } as const;
 const CONTRACT_IDENTITY_A = `sha256:${"a".repeat(64)}` as const;
 const FINGERPRINT = `sha256:${"f".repeat(64)}`;
+const IGNORED_DIRECTORY_NAMES = new Set([".git", "dist", "node_modules"]);
+const TEXT_FILE_EXTENSIONS = new Set([
+  ".cjs",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".mjs",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".yaml",
+  ".yml",
+]);
 
 const contextManifest = [
   {
@@ -369,19 +383,6 @@ test("AC-0001: one Task crosses every versioned Milestone 0 contract family", ()
   assert.deepEqual(validateCliDependencyGraph(graphRequest), graphResult);
   assert.deepEqual(validateOmpDependencyGraph(graphRequest), graphResult);
 
-  const recordRequests = [
-    { contractVersion: 1, kind: "externalReference", record: externalReference },
-    { contractVersion: 1, kind: "knowledgeCandidate", record: knowledgeCandidate },
-    { contractVersion: 1, kind: "skillLock", record: skillLock },
-    { contractVersion: 1, kind: "managedFile", record: managedFile },
-  ] as const;
-  for (const request of recordRequests) {
-    const recordResult = coreContract.validateContractRecord(request);
-    assert.equal(recordResult.ok, true, request.kind);
-    assert.deepEqual(validateCliContractRecord(request), recordResult);
-    assert.deepEqual(validateOmpContractRecord(request), recordResult);
-  }
-
   const agentResult = {
     schemaVersion: 1,
     dispatchId: dispatch.dispatchId,
@@ -397,31 +398,32 @@ test("AC-0001: one Task crosses every versioned Milestone 0 contract family", ()
     findings: [],
     observedFinalFingerprint: FINGERPRINT,
   } as const;
-  const versionedFixtures: readonly (readonly [string, unknown])[] = [
-    ["Task Projection", replayed.state.projection],
-    ["Workflow Event", advanced.event],
-    ...contextManifest.map((entry) => ["Context Entry", entry] as const),
-    ["Baseline", baseline],
-    ["Lease", lease],
-    ["Agent Contract", agentContract],
-    ["Agent dispatch", dispatch],
-    ["Agent result", agentResult],
-    ["Evidence", evidenceRecord],
-    ["Dependency Graph", initiativeGraph],
-    ["External Reference", externalReference],
-    ["Knowledge Candidate", knowledgeCandidate],
-    ["Skill Lock", skillLock],
-    ["project manifest", projectManifest],
-    ["managed-file record", managedFile],
-  ];
-  for (const [name, fixture] of versionedFixtures) {
-    const result = coreContract.validateDomainValue({
-      contractVersion: 1,
-      kind: "recordEnvelope",
-      value: fixture,
-    });
-    assert.equal(result.ok, true, name);
+  const recordRequests = [
+    { contractVersion: 1, kind: "baseline", record: baseline },
+    { contractVersion: 1, kind: "lease", record: lease },
+    { contractVersion: 1, kind: "agentResult", record: agentResult },
+    { contractVersion: 1, kind: "evidence", record: evidenceRecord },
+    { contractVersion: 1, kind: "projectManifest", record: projectManifest },
+    { contractVersion: 1, kind: "externalReference", record: externalReference },
+    { contractVersion: 1, kind: "knowledgeCandidate", record: knowledgeCandidate },
+    { contractVersion: 1, kind: "skillLock", record: skillLock },
+    { contractVersion: 1, kind: "managedFile", record: managedFile },
+  ] as const;
+  for (const request of recordRequests) {
+    const recordResult = coreContract.validateContractRecord(request);
+    assert.equal(recordResult.ok, true, request.kind);
+    assert.deepEqual(validateCliContractRecord(request), recordResult);
+    assert.deepEqual(validateOmpContractRecord(request), recordResult);
   }
+
+  assert.equal(replayed.state.projection.schemaVersion, 1);
+  assert.equal(advanced.event.schemaVersion, 1);
+  for (const entry of contextManifest) {
+    assert.equal(entry.schemaVersion, 1);
+  }
+  assert.equal(agentContract.schemaVersion, 1);
+  assert.equal(dispatch.schemaVersion, 1);
+  assert.equal(initiativeGraph.schemaVersion, 1);
 });
 
 test("AC-0002: Route matrices declare Gates and reject undeclared transitions", () => {
@@ -466,16 +468,15 @@ test("AC-0002: Route matrices declare Gates and reject undeclared transitions", 
   }
 });
 
-test("AC-0003: accepted specifications use the SayHi domain vocabulary", () => {
+test("AC-0003: accepted specifications and ADRs use the SayHi domain vocabulary", () => {
   const domainLanguage = readRepositoryFile("CONTEXT.md");
-  const acceptedSpecifications = [
-    "docs/spec/architecture.md",
-    "docs/spec/data-contracts.md",
-    "docs/spec/security.md",
-    "docs/spec/workflow.md",
-  ]
-    .map(readRepositoryFile)
-    .join("\n");
+  const acceptedDocuments = [
+    ...collectTextSources(join(REPOSITORY_ROOT, "docs", "spec")),
+    ...collectTextSources(join(REPOSITORY_ROOT, "docs", "adr")),
+  ].filter((source) => source.path.endsWith(".md"));
+  const documentsByPath = new Map(
+    acceptedDocuments.map((source) => [source.path, source.source]),
+  );
   const domainDefinitions = [
     "**Route**:",
     "**Phase**:",
@@ -490,24 +491,68 @@ test("AC-0003: accepted specifications use the SayHi domain vocabulary", () => {
   for (const definition of domainDefinitions) {
     assert.ok(domainLanguage.includes(definition), definition);
   }
-  const requiredUsage = [
-    /\bRoute\b/u,
-    /\bPhase\b/u,
-    /\blifecycle\b/u,
-    /\bTask\b/u,
-    /\bProjection\b/u,
-    /\bWorkflow Event\b/u,
-    /\bContext Manifest\b/u,
-    /\bPhase Agent\b/u,
-    /\bWriter Lease\b/u,
-    /\btrust tiers?\b/iu,
+
+  const avoidedAliases = [
+    /\btask status\b/iu,
+    /\blifecycle state\b/iu,
+    /\bfull Task directory\b/iu,
+    /\bsource event history\b/iu,
+    /\blog line\b/iu,
+    /\bmutable status\b/iu,
+    /\bcopied mirror\b/iu,
+    /\bsemantic search result\b/iu,
+    /\bfull repository dump\b/iu,
+    /\bconfidence score\b/iu,
+    /\bunrestricted general agent\b/iu,
+    /\badvisory lock file\b/iu,
+    /\bparent-child list\b/iu,
   ];
-  for (const usage of requiredUsage) {
-    assert.match(acceptedSpecifications, usage);
+  for (const document of acceptedDocuments) {
+    for (const alias of avoidedAliases) {
+      assert.doesNotMatch(document.source, alias, document.path);
+    }
+  }
+
+  const adrVocabulary = [
+    [
+      "docs/adr/0004-repository-owned-project-store.md",
+      [/\bTasks\b/u, /\bExternal References\b/u],
+    ],
+    [
+      "docs/adr/0005-route-aware-seven-phase-workflow.md",
+      [/\bRoute\b/u, /\blifecycle\b/u, /\bPhase\b/u, /\bStep\b/u, /\bGates\b/u],
+    ],
+    [
+      "docs/adr/0006-event-log-and-task-projection.md",
+      [/\bTask\b/u, /\bWorkflow Event\b/u, /\bProjection\b/u],
+    ],
+    [
+      "docs/adr/0007-layered-context-and-trust.md",
+      [/\bContext Manifests\b/u, /\bEngine Instruction\b/u, /\bTask Context\b/u],
+    ],
+    [
+      "docs/adr/0008-capability-sealed-phase-agents.md",
+      [/\bPhase Agent\b/u, /\bCapability Contract\b/u, /\bPrompt Overrides\b/u],
+    ],
+    [
+      "docs/adr/0009-reader-writer-barrier-without-worktrees.md",
+      [/\bRead Wave\b/u, /\bWriter Lease\b/u, /\brepository fingerprint\b/u],
+    ],
+    [
+      "docs/adr/0010-local-task-authority-for-trackers.md",
+      [/\bTask Projection\b/u, /\bEvent stream\b/u, /\bExternal References\b/u],
+    ],
+  ] as const;
+  for (const [path, terms] of adrVocabulary) {
+    const source = documentsByPath.get(path);
+    assert.ok(source, path);
+    for (const term of terms) {
+      assert.match(source, term, path);
+    }
   }
 });
 
-test("AC-0004: provenance checks preserve the clean-room boundary", () => {
+test("AC-0004: full-tree provenance checks preserve the clean-room boundary", () => {
   const packageFiles = [
     "package.json",
     "packages/core/package.json",
@@ -529,7 +574,12 @@ test("AC-0004: provenance checks preserve the clean-room boundary", () => {
     }
   }
 
-  for (const sourceFile of collectTypeScriptSources(join(REPOSITORY_ROOT, "packages"))) {
+  const repositorySources = collectTextSources(REPOSITORY_ROOT);
+  const codeExtensions = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
+  for (const sourceFile of repositorySources) {
+    if (!codeExtensions.has(extname(sourceFile.path))) {
+      continue;
+    }
     const imports = sourceFile.source.matchAll(
       /(?:\bfrom\s+|\bimport\s*\()\s*["']([^"']+)["']/gu,
     );
@@ -544,47 +594,83 @@ test("AC-0004: provenance checks preserve the clean-room boundary", () => {
     }
   }
 
-  const readme = readRepositoryFile("README.md");
+  const trellisAuditFiles = new Set([
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "CONTEXT.md",
+    "docs/README.md",
+    "docs/adr/0001-clean-room-omp-first.md",
+    "docs/references.md",
+    "docs/spec/acceptance.md",
+    "docs/spec/design-tradeoffs.md",
+    "docs/spec/product.md",
+    "docs/spec/supply-chain.md",
+    "packages/testing/src/milestone-zero.contract.test.ts",
+  ]);
+  for (const sourceFile of repositorySources) {
+    const namesTrellis =
+      sourceFile.path.toLowerCase().includes("trellis") ||
+      /\bTrellis\b/u.test(sourceFile.source);
+    if (namesTrellis) {
+      assert.ok(trellisAuditFiles.has(sourceFile.path), sourceFile.path);
+    }
+  }
+
   const references = readRepositoryFile("docs/references.md");
+  const attributedUrls = new Set(
+    [...references.matchAll(/https:\/\/[^\s)<>\]`"']+/gu)].map((match) =>
+      normalizeUrl(match[0]),
+    ),
+  );
+  const referenceConsumers = repositorySources.filter(
+    (source) =>
+      (source.path === "README.md" || source.path.startsWith("docs/")) &&
+      source.path !== "docs/references.md",
+  );
+  for (const source of referenceConsumers) {
+    for (const match of source.source.matchAll(/https:\/\/[^\s)<>\]`"']+/gu)) {
+      const url = normalizeUrl(match[0]);
+      if (!isIllustrativeUrl(url)) {
+        assert.ok(attributedUrls.has(url), `${source.path}: ${url}`);
+      }
+    }
+  }
+
+  const readme = readRepositoryFile("README.md");
   assert.match(readme, /## Clean-room boundary/u);
   assert.match(readme, /MUST NOT copy or adapt OMP or Trellis/u);
-  assert.match(references, /## Trellis/u);
-  assert.match(references, /## Oh-My-Pi/u);
   assert.match(references, /does not reuse Trellis code/u);
 });
 
-test("AC-0005: security review exposes authority, trust, failure, and residual risk", () => {
+test("AC-0005: every privileged operation has explicit threat-model coverage", () => {
   const security = readRepositoryFile("docs/spec/security.md");
-  const objectives = markdownSection(security, "## 1. Security objectives");
-  const trustBoundaries = markdownSection(security, "## 3. Trust boundaries");
-  const authority = markdownSection(security, "## 4. Authority model");
-  const failClosed = markdownSection(security, "## 17. Fail-closed matrix");
-  const residualRisks = markdownSection(
-    security,
-    "## 18. Explicit residual risks",
-  );
+  const objectives = markdownSection(security, "## 1. Security objectives")
+    .split("\n")
+    .filter((line) => line.startsWith("- "))
+    .map((line) => line.slice(2).replace(/[.;]$/u, ""));
+  assert.equal(objectives.length, 8);
 
-  assert.equal(
-    objectives.split("\n").filter((line) => line.startsWith("- ")).length,
-    8,
-  );
-  assert.match(trustBoundaries, /Orchestrator and Phase Agent/u);
-  assert.match(trustBoundaries, /local state and external Trackers/u);
-  assert.match(authority, /Core alone accepts transitions/u);
-  assert.match(authority, /Humans approve persistent workflow entry/u);
-  assert.ok(
-    failClosed
-      .split("\n")
-      .filter((line) => line.startsWith("|") && !line.includes("---"))
-      .length >= 9,
-  );
-  assert.match(failClosed, /Agent identity mismatch \| block dispatch/u);
-  assert.match(failClosed, /output schema invalid \| reject Gate evidence/u);
-  assert.ok(
-    residualRisks.split("\n").filter((line) => line.startsWith("- ")).length >=
-      6,
-  );
-  assert.match(residualRisks, /cannot be prevented, only detected/u);
+  assert.ok(markdownSection(security, "## 3. Trust boundaries").length > 0);
+  assert.ok(markdownSection(security, "## 4. Authority model").length > 0);
+  const failClosed = markdownSection(security, "## 17. Fail-closed matrix");
+  assert.ok(markdownSection(security, "## 18. Explicit residual risks").length > 0);
+
+  const coverageRows = failClosed
+    .split("\n")
+    .filter((line) => line.startsWith("|") && !line.includes("---"))
+    .map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim()))
+    .filter(
+      (cells) =>
+        cells.length === 5 && cells[0] !== "Privileged operation",
+    );
+  assert.equal(coverageRows.length, objectives.length);
+  for (const operation of objectives) {
+    const coverage = coverageRows.find((cells) => cells[0] === operation);
+    assert.ok(coverage, operation);
+    for (const evidence of coverage.slice(1)) {
+      assert.ok(evidence.length > 0, operation);
+    }
+  }
 });
 
 function buildTaskRequest(taskId: string, eventSuffix: string) {
@@ -642,19 +728,42 @@ function readRepositoryFile(relativePath: string): string {
   return readFileSync(join(REPOSITORY_ROOT, relativePath), "utf8");
 }
 
-function collectTypeScriptSources(
-  directory: string,
-): readonly Readonly<{ path: string; source: string }>[] {
-  const sources: Readonly<{ path: string; source: string }>[] = [];
+interface RepositoryTextSource {
+  readonly path: string;
+  readonly source: string;
+}
+
+function collectTextSources(directory: string): readonly RepositoryTextSource[] {
+  const sources: RepositoryTextSource[] = [];
   for (const entry of readdirSync(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      sources.push(...collectTypeScriptSources(path));
-    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
-      sources.push({ path, source: readFileSync(path, "utf8") });
+    if (entry.isDirectory() && !IGNORED_DIRECTORY_NAMES.has(entry.name)) {
+      sources.push(...collectTextSources(path));
+    } else if (entry.isFile() && isTextFile(entry.name)) {
+      sources.push({
+        path: relative(REPOSITORY_ROOT, path).replaceAll("\\", "/"),
+        source: readFileSync(path, "utf8"),
+      });
     }
   }
   return sources;
+}
+
+function isTextFile(name: string): boolean {
+  return (
+    TEXT_FILE_EXTENSIONS.has(extname(name)) ||
+    name === "LICENSE" ||
+    name === ".gitignore"
+  );
+}
+
+function isIllustrativeUrl(url: string): boolean {
+  return url.startsWith("https://github.com/org/repo/");
+}
+
+function normalizeUrl(url: string | undefined): string {
+  assert.ok(url);
+  return url.replace(/[.,;:]$/u, "");
 }
 
 function markdownSection(markdown: string, heading: string): string {

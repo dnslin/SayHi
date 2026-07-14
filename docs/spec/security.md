@@ -233,6 +233,19 @@ Durable records store safe identifiers and reasons, not secret content. Local de
 | tracker outcome unknown | mark uncertain; inspect before retry |
 | no UI for required confirmation | deny and report blocked |
 
+### 17.1 Privileged operation coverage
+
+| Privileged operation | Authority | Trust boundary | Fail-closed behavior | Residual risk |
+|---|---|---|---|---|
+| change workflow state | Core accepts only declared transitions and Gates | Orchestrator requests cross into Core validation | reject undeclared, stale, or unmet-Gate transitions | a repository writer can rewrite history and evidence |
+| mutate files outside accepted scope | Core scope policy and the active Writer Lease authorize mutation | a Phase Agent or Writer crosses into the shared checkout | block the mutation and preserve files on scope or fingerprint mismatch | external editor changes cannot be prevented, only detected |
+| bypass review or validation | human approval plus Core Gate policy authorize completion and commit | Agent Evidence crosses into Core Gate and commit checks | reject invalid Evidence and block transitions or commits without current review | a model can reason incorrectly inside its granted capability |
+| convert untrusted content into project instructions | Core trust policy assigns instruction authority | Untrusted Reference content crosses into rendered Agent context | keep content data-only and deny trust upgrades | trust labels reduce but do not eliminate model influence |
+| include unrelated user work in a commit | scoped commit policy authorizes adopted Task paths only | Task-owned index content is separated from pre-existing user work | block unadopted or out-of-scope staged content | single-checkout external edits remain detectable rather than preventable |
+| expose credentials or sensitive logs | redaction and durable-record policy authorize stored output | process and adapter output crosses into the Project Store | redact secrets or reject unsafe durable output | pattern-based redaction is incomplete and approved commands may expose data |
+| replace pinned Skills or Phase Agents | release identity and Core contract policy authorize revisions | Registry or runtime definitions cross into Engine execution | block dispatch or release on any identity mismatch | a malicious installed Plugin still has local user permissions |
+| perform prohibited Git or external side effects | explicit human policy and typed ports authorize side effects | local Core requests cross into Git, process, or Tracker adapters | deny prohibited operations and mark uncertain outcomes for diagnosis | an approved shell command may still be destructive |
+
 ## 18. Explicit residual risks
 
 - A malicious installed Plugin executes with the user's local permissions.
