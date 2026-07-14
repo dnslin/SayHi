@@ -97,7 +97,7 @@ export type DomainValidationResult =
 type UnknownRecord = Record<string, unknown>;
 
 const UTC_TIMESTAMP_PATTERN =
-  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?[Zz]$/u;
+  /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|\+00:00)$/u;
 const SHA256_DIGEST_PATTERN = /^[0-9a-f]{64}$/iu;
 
 // IERS Bulletin 72 dates on which UTC second 60 actually occurred.
@@ -346,12 +346,16 @@ function validateContentHash(value: unknown): DomainValidationResult {
 }
 
 function validateVersion(value: unknown): DomainValidationResult {
-  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 0 ||
+    Object.is(value, -0)
+  ) {
     return failure(
       "validation.version.invalid",
       "$.value",
-      "Version must be a non-negative safe integer.",
-      "Provide an integer from 0 through Number.MAX_SAFE_INTEGER.",
+      "Version must be a lossless non-negative safe integer.",
+      "Provide an integer from 0 through Number.MAX_SAFE_INTEGER; do not use negative zero.",
     );
   }
 

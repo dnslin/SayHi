@@ -21,6 +21,11 @@ test("Core round-trips valid shared domain values without information loss", () 
     {
       contractVersion: 1,
       kind: "timestamp",
+      value: "2026-07-14T00:00:00+00:00",
+    },
+    {
+      contractVersion: 1,
+      kind: "timestamp",
       value: "1990-12-31T23:59:60Z",
     },
     {
@@ -29,6 +34,7 @@ test("Core round-trips valid shared domain values without information loss", () 
       value: { algorithm: "sha256-lf-v1", digest: "A".repeat(64) },
     },
     { contractVersion: 1, kind: "version", value: Number.MAX_SAFE_INTEGER },
+    { contractVersion: 1, kind: "version", value: 0 },
   ] as const;
 
   for (const request of cases) {
@@ -198,7 +204,13 @@ test("Core rejects malformed and boundary-invalid shared domain values", () => {
     ],
     [
       "timestamp",
-      "2026-07-14T00:00:00+00:00",
+      "2026-07-14T00:00:00+08:00",
+      "validation.timestamp.invalid",
+      "$.value",
+    ],
+    [
+      "timestamp",
+      "2026-07-14T00:00:00-00:00",
       "validation.timestamp.invalid",
       "$.value",
     ],
@@ -228,6 +240,7 @@ test("Core rejects malformed and boundary-invalid shared domain values", () => {
     ],
     ["version", -1, "validation.version.invalid", "$.value"],
     ["version", 1.5, "validation.version.invalid", "$.value"],
+    ["version", -0, "validation.version.invalid", "$.value"],
     [
       "version",
       Number.MAX_SAFE_INTEGER + 1,
