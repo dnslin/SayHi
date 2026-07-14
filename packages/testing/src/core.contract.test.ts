@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coreContract } from "@sayhi/core";
+import { coreContract } from "@dnslin/sayhi-core";
 
 test("Core exposes the versioned SayHi bootstrap contract", () => {
   assert.deepEqual(coreContract.readBootstrapContract(), {

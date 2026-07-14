@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "dependencies": {
-    "@sayhi/cli": "0.0.0",
-    "@sayhi/core": "0.0.0",
-    "@sayhi/omp-plugin": "0.0.0"
+    "@dnslin/sayhi-cli": "0.0.0",
+    "@dnslin/sayhi-core": "0.0.0",
+    "@dnslin/sayhi-omp": "0.0.0"
   }
 }

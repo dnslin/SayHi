@@ -7,9 +7,9 @@
     "noEmit": true,
     "types": ["node"],
     "paths": {
-      "@sayhi/core": ["./packages/core/src/index.ts"],
-      "@sayhi/cli": ["./packages/cli/src/index.ts"],
-      "@sayhi/omp-plugin": ["./packages/omp-plugin/src/index.ts"]
+      "@dnslin/sayhi-core": ["./packages/core/src/index.ts"],
+      "@dnslin/sayhi-cli": ["./packages/cli/src/index.ts"],
+      "@dnslin/sayhi-omp": ["./packages/omp-plugin/src/index.ts"]
     }
   },
   "include": ["packages/*/src/**/*.ts"]

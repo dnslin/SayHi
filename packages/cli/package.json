@@ -1,5 +1,5 @@
 {
-  "name": "@sayhi/cli",
+  "name": "@dnslin/sayhi-cli",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -10,6 +10,6 @@
     }
   },
   "dependencies": {
-    "@sayhi/core": "0.0.0"
+    "@dnslin/sayhi-core": "0.0.0"
   }
 }
