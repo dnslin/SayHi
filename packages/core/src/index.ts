@@ -1,3 +1,7 @@
+import {
+  authorizePhaseExecution,
+  bindPhaseExecution,
+} from "./execution.js";
 import { validateDomainValue } from "./validation.js";
 import {
   readRouteDefinition,
@@ -25,6 +29,40 @@ export type {
   ValidationDiagnosticCode,
   Version,
 } from "./validation.js";
+
+export {
+  PHASE_EXECUTION_CONTRACT_VERSION,
+  bindPhaseExecution,
+  authorizePhaseExecution,
+} from "./execution.js";
+export type {
+  AgentNetworkAccess,
+  AgentRepositoryAccess,
+  AuthorizePhaseExecutionRequest,
+  AuthorizePhaseExecutionResult,
+  BindPhaseExecutionRequest,
+  BindPhaseExecutionResult,
+  BoundSkillIdentity,
+  ContextInjectionMode,
+  ContextInstructionPolicy,
+  ContextManifestEntry,
+  ContextSource,
+  ContextTrustTier,
+  ContractIdentity,
+  CurrentContextContent,
+  PhaseAgentContract,
+  PhaseAgentRole,
+  PhaseCapability,
+  PhaseExecutionBinding,
+  PhaseExecutionMaterials,
+  PhaseExecutionDiagnostic,
+  PhaseExecutionAuthorization,
+  PhaseExecutionFailure,
+  PhaseExecutionDiagnosticCode,
+  PhaseExecutionDispatch,
+  RepositoryOperation,
+  SkillMaterial,
+} from "./execution.js";
 
 export {
   WORKFLOW_CONTRACT_VERSION,
@@ -78,6 +116,8 @@ export interface BootstrapContract {
 export interface CoreContract {
   readBootstrapContract(): BootstrapContract;
   readonly validateDomainValue: typeof validateDomainValue;
+  readonly bindPhaseExecution: typeof bindPhaseExecution;
+  readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
   readonly startWorkflowTask: typeof startWorkflowTask;
   readonly transitionWorkflow: typeof transitionWorkflow;
@@ -92,6 +132,8 @@ const bootstrapContract: BootstrapContract = Object.freeze({
 export const coreContract: CoreContract = Object.freeze({
   readBootstrapContract: () => bootstrapContract,
   validateDomainValue,
+  bindPhaseExecution,
+  authorizePhaseExecution,
   readRouteDefinition,
   startWorkflowTask,
   transitionWorkflow,

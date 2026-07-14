@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 
-import { DURABLE_RECORD_SCHEMA_VERSION, validateDomainValue } from "./validation.js";
+import {
+  DOMAIN_VALIDATION_CONTRACT_VERSION,
+  DURABLE_RECORD_SCHEMA_VERSION,
+  validateDomainValue,
+} from "./validation.js";
 
 export const WORKFLOW_CONTRACT_VERSION = 1 as const;
 
@@ -862,7 +866,7 @@ function validateTaskPaths(
   return null;
 }
 
-function isRepositoryRelativePath(value: unknown): value is string {
+export function isRepositoryRelativePath(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length > 0 &&
@@ -1380,7 +1384,7 @@ function isWorkflowLifecycle(value: unknown): value is WorkflowLifecycle {
   );
 }
 
-function isWorkflowPhase(value: unknown): value is WorkflowPhase {
+export function isWorkflowPhase(value: unknown): value is WorkflowPhase {
   return (
     value === "triage" ||
     value === "explore" ||
@@ -1412,7 +1416,7 @@ function isStringArray(value: unknown): value is readonly string[] {
   );
 }
 
-function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+export function isUnknownRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -1724,7 +1728,7 @@ function digestEvent(
   return `sha256:${createHash("sha256").update(stableJson(payload)).digest("hex")}`;
 }
 
-function stableJson(value: unknown): string {
+export function stableJson(value: unknown): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
@@ -1738,9 +1742,9 @@ function stableJson(value: unknown): string {
     .join(",")}}`;
 }
 
-function isIdentifier(value: unknown): value is string {
+export function isIdentifier(value: unknown): value is string {
   return validateDomainValue({
-    contractVersion: 1,
+    contractVersion: DOMAIN_VALIDATION_CONTRACT_VERSION,
     kind: "identifier",
     value,
   }).ok;
