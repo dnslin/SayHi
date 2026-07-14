@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   readCliBootstrapContract,
+  validateCliContractRecord,
   validateCliDomainValue,
   validateCliDependencyGraph,
 } from "@dnslin/sayhi-cli";
@@ -34,6 +35,25 @@ test("CLI exposes the same domain validation result as Core", () => {
   assert.deepEqual(
     validateCliDomainValue(invalidRequest),
     coreContract.validateDomainValue(invalidRequest),
+  );
+});
+
+test("CLI exposes the same contract record validation result as Core", () => {
+  const request = {
+    contractVersion: 1,
+    kind: "managedFile",
+    record: {
+      schemaVersion: 1,
+      path: ".sayhi/spec/project.md",
+      ownershipClass: "user-owned",
+      generatedSourceVersion: "1.0.0",
+      markerIds: [],
+    },
+  };
+
+  assert.deepEqual(
+    validateCliContractRecord(request),
+    coreContract.validateContractRecord(request),
   );
 });
 
