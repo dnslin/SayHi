@@ -1,18 +1,31 @@
 # SayHi
 
-SayHi is a clean-room, OMP-native engineering workflow framework design. It combines a repository-owned engineering memory, a typed workflow state machine, phase-specific sub-agents, and unchanged upstream Skills.
+SayHi is a clean-room, OMP-native engineering workflow framework. It combines a repository-owned engineering memory, a typed workflow state machine, phase-specific sub-agents, and unchanged upstream Skills.
 
-This repository currently contains **design documentation only**. It intentionally contains no executable Core, CLI, Plugin, Hook, Tool, or Agent implementation.
+The executable baseline currently contains only the TypeScript workspace and a shared bootstrap Core contract. It does not claim working workflow, CLI command, Plugin, Hook, Tool, or Agent behavior.
 
 ## Status
 
 - Product and architecture decisions: accepted
-- Implementation status: not started
+- Implementation status: bootstrap contract workspace only
 - Target license: MIT
 - First runtime adapter: Oh-My-Pi (OMP)
 - CLI name: `sayhi`
 - Project directory: `.sayhi/`
 - OMP command namespace: `/sayhi:*`
+
+## Workspace commands
+
+The baseline requires Node.js 22.17 or newer and npm 10.9.2 or newer. From a clean checkout:
+
+```sh
+npm ci
+npm run build
+npm run typecheck
+npm run test:contracts
+```
+
+`npm run test:contracts` builds the workspace before running the focused contract suite.
 
 ## Documentation
 
@@ -38,3 +51,9 @@ This repository currently contains **design documentation only**. It intentional
 SayHi studies the behavior and engineering trade-offs of [Trellis](https://github.com/mindfold-ai/Trellis), uses the extension surfaces documented by [Oh-My-Pi](https://omp.sh/docs/plugins), and orchestrates pinned, unchanged Skills sourced through [dnslin/skills](https://github.com/dnslin/skills), including the engineering and productivity Skills from [mattpocock/skills](https://github.com/mattpocock/skills).
 
 Trellis code, templates, prompts, and documentation text are not part of SayHi. Behavioral study does not make Trellis a code dependency.
+
+## Clean-room boundary
+
+Implementation is authored from SayHi's accepted specifications and ADRs plus publicly documented extension contracts. OMP is an integration target, not an implementation source or code dependency.
+
+Contributors MUST NOT copy or adapt OMP or Trellis implementation code, templates, prompts, tests, fixtures, or documentation text. Externally observed behavior must be independently expressed in SayHi contracts and tests, with source attribution recorded in [the references](./docs/references.md).

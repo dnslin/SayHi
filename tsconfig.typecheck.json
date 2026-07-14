@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "composite": false,
+    "declaration": false,
+    "declarationMap": false,
+    "noEmit": true,
+    "types": ["node"],
+    "paths": {
+      "@sayhi/core": ["./packages/core/src/index.ts"],
+      "@sayhi/cli": ["./packages/cli/src/index.ts"],
+      "@sayhi/omp-plugin": ["./packages/omp-plugin/src/index.ts"]
+    }
+  },
+  "include": ["packages/*/src/**/*.ts"]
+}

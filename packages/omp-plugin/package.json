@@ -1,0 +1,15 @@
+{
+  "name": "@sayhi/omp-plugin",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@sayhi/core": "0.0.0"
+  }
+}

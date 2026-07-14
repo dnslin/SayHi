@@ -1,0 +1,11 @@
+{
+  "name": "@sayhi/testing",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@sayhi/cli": "0.0.0",
+    "@sayhi/core": "0.0.0",
+    "@sayhi/omp-plugin": "0.0.0"
+  }
+}
