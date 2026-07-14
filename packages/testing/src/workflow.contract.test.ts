@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   coreContract,
+  type DependencyGraph,
   type GateEvidenceKind,
   type StartWorkflowTaskRequest,
   type WorkflowGate,
@@ -127,12 +128,18 @@ test("accepted Quick, Build, and Initiative Events replay to the same Task Proje
           candidate.to.phase === phase,
       );
       assert.ok(allowed, `missing ${route} transition to ${lifecycle}/${phase}`);
+      const initiativeGraph =
+        route === "initiative" &&
+        state.projection.phase === "plan" &&
+        phase === "integrate"
+          ? validInitiativeGraphSnapshot(state)
+          : undefined;
 
       const result = coreContract.transitionWorkflow(state, {
         contractVersion: 1,
         taskId: state.projection.id,
         expectedVersion: state.projection.version,
-        to: { lifecycle, phase, step: lifecycle === "completed" ? "completed" : "ready" },
+        to: { lifecycle, phase, step: allowed.to.step },
         gates: allowed.requiredGates.map((gate) => ({
           gate,
           evidence: [
@@ -142,6 +149,7 @@ test("accepted Quick, Build, and Initiative Events replay to the same Task Proje
             },
           ],
         })),
+        ...(initiativeGraph === undefined ? {} : { initiativeGraph }),
         event: eventMetadata(`${route}-${state.projection.version + 1}`),
       });
 
@@ -319,6 +327,68 @@ test("a Projection position inconsistent with its Event head cannot advance", ()
   assert.deepEqual(inconsistentState, snapshot);
 });
 
+test("mutation rejects a Task whose earlier Event history is invalid", () => {
+  let state = startTask("build");
+  state = advanceTask(state, "active", "explore", "history-explore");
+  const forgedState: WorkflowState = {
+    events: [
+      { ...state.events[0]!, reason: "tampered after acceptance" },
+      state.events[1]!,
+    ],
+    projection: state.projection,
+  };
+  const snapshot = structuredClone(forgedState);
+  const result = coreContract.transitionWorkflow(forgedState, {
+    contractVersion: 1,
+    taskId: forgedState.projection.id,
+    expectedVersion: forgedState.projection.version,
+    to: { lifecycle: "active", phase: "plan", step: "ready" },
+    gates: [
+      {
+        gate: "explore",
+        evidence: [
+          { kind: "validation", reference: "evidence/explore-complete.json" },
+        ],
+      },
+    ],
+    event: eventMetadata("forged-history"),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.strictEqual(result.state, forgedState);
+    assert.equal(result.diagnostics[0]?.code, "workflow.state.inconsistent");
+  }
+  assert.deepEqual(forgedState, snapshot);
+});
+
+test("Route transitions reject undeclared target Steps", () => {
+  const state = startTask("build");
+  const snapshot = structuredClone(state);
+  const result = coreContract.transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "explore", step: "invented" },
+    gates: [
+      {
+        gate: "route",
+        evidence: [
+          { kind: "human-approval", reference: "evidence/route-approved.json" },
+        ],
+      },
+    ],
+    event: eventMetadata("undeclared-step"),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.strictEqual(result.state, state);
+    assert.equal(result.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  assert.deepEqual(state, snapshot);
+});
+
 test("Task creation rejects repair policies above the Engine limit", () => {
   const result = coreContract.startWorkflowTask(startTaskRequest("build", 3));
 
@@ -326,6 +396,159 @@ test("Task creation rejects repair policies above the Engine limit", () => {
   if (!result.ok) {
     assert.equal(result.diagnostics[0]?.code, "workflow.request.invalid");
   }
+});
+
+test("Task creation rejects repository paths that escape Task Scope", () => {
+  const request = startTaskRequest("build");
+  const result = coreContract.startWorkflowTask({
+    ...request,
+    task: {
+      ...request.task,
+      scope: { ...request.task.scope, files: ["../outside.ts"] },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0]?.code, "workflow.request.invalid");
+    assert.equal(result.diagnostics[0]?.path, "$.task.scope.files[0]");
+  }
+});
+
+test("Build and Initiative creation require Route confirmation", () => {
+  for (const route of ["build", "initiative"] as const) {
+    const request = startTaskRequest(route);
+    const { routeGate, ...unconfirmed } = request;
+    assert.ok(routeGate);
+    const result = coreContract.startWorkflowTask(unconfirmed);
+
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.diagnostics[0]?.code, "workflow.gate.unmet");
+      assert.equal(result.diagnostics[0]?.path, "$.routeGate");
+    }
+  }
+});
+
+test("Initiative cannot leave Plan without a validated graph snapshot", () => {
+  let state = startTask("initiative");
+  state = advanceTask(state, "active", "explore", "graph-explore");
+  state = advanceTask(state, "active", "plan", "graph-plan");
+  const snapshot = structuredClone(state);
+  const transitionGates = [
+    {
+      gate: "plan",
+      evidence: [
+        { kind: "human-approval", reference: "evidence/plan-approved.json" },
+      ],
+    },
+    {
+      gate: "initiative-ready",
+      evidence: [{ kind: "workflow", reference: "evidence/graph-ready.json" }],
+    },
+  ] as const;
+  const result = coreContract.transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "integrate", step: "ready" },
+    gates: transitionGates,
+    event: eventMetadata("graph-missing"),
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.strictEqual(result.state, state);
+    assert.equal(result.diagnostics[0]?.code, "workflow.gate.unmet");
+    assert.equal(result.diagnostics[0]?.path, "$.initiativeGraph");
+  }
+
+  const graphBase = {
+    schemaVersion: 1 as const,
+    id: state.projection.initiativeGraphId!,
+    initiativeTaskId: state.projection.id,
+    version: 1,
+    nodes: [
+      {
+        taskId: "TASK-3-node-a",
+        priority: 50,
+        resources: {
+          files: ["packages/core/**"],
+          apis: ["CoreContract"],
+          schemas: [],
+          locks: [],
+        },
+      },
+      {
+        taskId: "TASK-3-node-b",
+        priority: 40,
+        resources: { files: [], apis: [], schemas: [], locks: [] },
+      },
+    ],
+    edges: [],
+    updatedByEvent: state.events[state.events.length - 1]!.eventId,
+  };
+  const invalidGraphs = [
+    {
+      name: "cycle",
+      graph: {
+        ...graphBase,
+        edges: [
+          { from: "TASK-3-node-a", to: "TASK-3-node-b", type: "blocks", reason: "a" },
+          { from: "TASK-3-node-b", to: "TASK-3-node-a", type: "blocks", reason: "b" },
+        ],
+      },
+    },
+    {
+      name: "missing-node",
+      graph: {
+        ...graphBase,
+        edges: [
+          {
+            from: "TASK-3-node-a",
+            to: "TASK-3-missing",
+            type: "blocks",
+            reason: "missing",
+          },
+        ],
+      },
+    },
+    {
+      name: "unsafe-resource",
+      graph: {
+        ...graphBase,
+        nodes: [
+          {
+            ...graphBase.nodes[0]!,
+            resources: {
+              ...graphBase.nodes[0]!.resources,
+              files: ["../outside.ts"],
+            },
+          },
+        ],
+      },
+    },
+  ] as const;
+
+  for (const { name, graph } of invalidGraphs) {
+    const request = {
+      contractVersion: 1 as const,
+      taskId: state.projection.id,
+      expectedVersion: state.projection.version,
+      to: { lifecycle: "active" as const, phase: "integrate" as const, step: "ready" },
+      gates: transitionGates,
+      initiativeGraph: graph,
+      event: eventMetadata(`graph-${name}`),
+    };
+    const invalid = coreContract.transitionWorkflow(state, request);
+    assert.equal(invalid.ok, false, name);
+    if (!invalid.ok) {
+      assert.strictEqual(invalid.state, state);
+      assert.equal(invalid.diagnostics[0]?.code, "workflow.graph.invalid");
+      assert.equal(invalid.diagnostics[0]?.path, "$.initiativeGraph");
+    }
+  }
+  assert.deepEqual(state, snapshot);
 });
 
 test("a block retry must repeat the accepted blocker intent", () => {
@@ -588,10 +811,13 @@ function advanceTask(
       candidate.to.phase === phase,
   );
   assert.ok(allowed, `missing transition to ${lifecycle}/${phase}`);
-  const preservesStep =
-    phase === state.projection.phase &&
-    lifecycle !== "completed" &&
-    lifecycle !== "archived";
+  assert.equal(state.projection.step, allowed.from.step);
+  const initiativeGraph =
+    state.projection.route === "initiative" &&
+    state.projection.phase === "plan" &&
+    phase === "integrate"
+      ? validInitiativeGraphSnapshot(state)
+      : undefined;
   const result = coreContract.transitionWorkflow(state, {
     contractVersion: 1,
     taskId: state.projection.id,
@@ -599,7 +825,7 @@ function advanceTask(
     to: {
       lifecycle,
       phase,
-      step: preservesStep ? state.projection.step : lifecycle,
+      step: allowed.to.step,
     },
     gates: allowed.requiredGates.map((gate) => ({
       gate,
@@ -608,12 +834,40 @@ function advanceTask(
       ],
     })),
     ...(blockers === undefined ? {} : { blockers }),
+    ...(initiativeGraph === undefined ? {} : { initiativeGraph }),
     event: eventMetadata(suffix),
   });
   if (!result.ok) {
     assert.fail(result.diagnostics[0]?.message ?? "Workflow transition failed");
   }
   return result.state;
+}
+
+function validInitiativeGraphSnapshot(state: WorkflowState): DependencyGraph {
+  const graphId = state.projection.initiativeGraphId;
+  const updatedByEvent = state.events[state.events.length - 1]?.eventId;
+  assert.ok(graphId);
+  assert.ok(updatedByEvent);
+  return {
+    schemaVersion: 1,
+    id: graphId,
+    initiativeTaskId: state.projection.id,
+    version: 1,
+    nodes: [
+      {
+        taskId: `${state.projection.id}-node-1`,
+        priority: 50,
+        resources: {
+          files: ["packages/core/**"],
+          apis: ["CoreContract"],
+          schemas: [],
+          locks: [],
+        },
+      },
+    ],
+    edges: [],
+    updatedByEvent,
+  };
 }
 
 function transition(
@@ -624,10 +878,26 @@ function transition(
   ...requiredGates: readonly WorkflowGate[]
 ): WorkflowTransition {
   return {
-    from: { lifecycle: fromLifecycle, phase: fromPhase },
-    to: { lifecycle: toLifecycle, phase: toPhase },
+    from: {
+      lifecycle: fromLifecycle,
+      phase: fromPhase,
+      step: expectedStep(fromLifecycle),
+    },
+    to: {
+      lifecycle: toLifecycle,
+      phase: toPhase,
+      step: expectedStep(toLifecycle),
+    },
     requiredGates,
   };
+}
+
+function expectedStep(
+  lifecycle: WorkflowTransition["to"]["lifecycle"],
+): string {
+  return lifecycle === "completed" || lifecycle === "archived"
+    ? lifecycle
+    : "ready";
 }
 
 function startTask(route: WorkflowRoute, maxRepairAttempts = 2): WorkflowState {
@@ -672,6 +942,15 @@ function startTaskRequest(
         push: "never",
         maxRepairAttempts,
       },
+    },
+    routeGate: {
+      gate: "route",
+      evidence: [
+        {
+          kind: route === "quick" ? "workflow" : "human-approval",
+          reference: `evidence/${route}-route-accepted.json`,
+        },
+      ],
     },
     event: eventMetadata(`${route}-created`),
   };

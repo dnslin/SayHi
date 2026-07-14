@@ -34,6 +34,10 @@ export {
   transitionWorkflow,
 } from "./workflow.js";
 export type {
+  DependencyGraph,
+  DependencyGraphEdge,
+  DependencyGraphEdgeType,
+  DependencyGraphNode,
   GateAcceptance,
   GateEvidence,
   GateEvidenceKind,
