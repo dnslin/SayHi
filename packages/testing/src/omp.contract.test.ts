@@ -4,6 +4,7 @@ import test from "node:test";
 import { coreContract } from "@dnslin/sayhi-core";
 import {
   readOmpBootstrapContract,
+  validateOmpContractRecord,
   validateOmpDomainValue,
   validateOmpDependencyGraph,
 } from "@dnslin/sayhi-omp";
@@ -34,6 +35,25 @@ test("OMP exposes the same domain validation result as Core", () => {
   assert.deepEqual(
     validateOmpDomainValue(invalidRequest),
     coreContract.validateDomainValue(invalidRequest),
+  );
+});
+
+test("OMP exposes the same contract record validation result as Core", () => {
+  const request = {
+    contractVersion: 1,
+    kind: "managedFile",
+    record: {
+      schemaVersion: 1,
+      path: ".sayhi/agents/project.md",
+      ownershipClass: "user-owned",
+      generatedSourceVersion: "1.0.0",
+      markerIds: [],
+    },
+  };
+
+  assert.deepEqual(
+    validateOmpContractRecord(request),
+    coreContract.validateContractRecord(request),
   );
 });
 

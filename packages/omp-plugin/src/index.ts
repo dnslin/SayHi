@@ -3,6 +3,7 @@ import {
   type BootstrapContract,
   type DomainValidationResult,
   type DependencyGraphValidationResult,
+  type ContractRecordValidationResult,
 } from "@dnslin/sayhi-core";
 
 export function readOmpBootstrapContract(): BootstrapContract {
@@ -13,6 +14,12 @@ export function validateOmpDomainValue(
   request: unknown,
 ): DomainValidationResult {
   return coreContract.validateDomainValue(request);
+}
+
+export function validateOmpContractRecord(
+  request: unknown,
+): ContractRecordValidationResult {
+  return coreContract.validateContractRecord(request);
 }
 
 export function validateOmpDependencyGraph(

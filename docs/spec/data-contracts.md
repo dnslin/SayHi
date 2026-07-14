@@ -413,7 +413,13 @@ The release Skill Lock contains:
       "name": "tdd",
       "path": "tdd",
       "files": [
-        { "path": "SKILL.md", "sha256": "..." }
+        {
+          "path": "SKILL.md",
+          "sha256": {
+            "algorithm": "sha256-bytes-v1",
+            "digest": "hex-encoded-sha256"
+          }
+        }
       ],
       "upstream": {
         "repository": "https://github.com/mattpocock/skills",
@@ -440,6 +446,8 @@ Runtime reads the installed lock for diagnostics but never fetches newer Skills.
 - marker IDs for Managed Blocks;
 - incoming update identity when an update is pending;
 - optional local override source.
+
+Installed base and incoming update identities use the Content Identity descriptor from section 2.
 
 Engine-owned content that does not match the installed base is locally modified and cannot be overwritten automatically. User-owned content has no replacement base. Managed-customizable content is composed from an Engine-owned base and constrained override or managed markers.
 

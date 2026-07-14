@@ -4,12 +4,38 @@ import {
   bindPhaseExecution,
 } from "./execution.js";
 import { validateDomainValue } from "./validation.js";
+import { validateContractRecord } from "./record-contracts.js";
 import {
   readRouteDefinition,
   replayWorkflowEvents,
   startWorkflowTask,
   transitionWorkflow,
 } from "./workflow.js";
+
+export {
+  RECORD_CONTRACT_VERSION,
+  validateContractRecord,
+} from "./record-contracts.js";
+export type {
+  ContractRecord,
+  ContractRecordDiagnostic,
+  ContractRecordDiagnosticCode,
+  ContractRecordKind,
+  ContractRecordValidationFailure,
+  ContractRecordValidationRequest,
+  ContractRecordValidationResult,
+  ContractRecordValidationSuccess,
+  ExternalReferenceRecord,
+  KnowledgeCandidateRecord,
+  KnowledgeCandidateStatus,
+  KnowledgeConfidence,
+  LockedSkill,
+  ManagedFileOwnershipClass,
+  ManagedFileRecord,
+  SkillLockFile,
+  SkillLockRecord,
+  SkillUpstreamIdentity,
+} from "./record-contracts.js";
 
 export {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
@@ -44,6 +70,8 @@ export type {
   DependencyGraphValidationSuccess,
 } from "./dependency-graph.js";
 
+export type { ContractIdentity } from "./identity.js";
+
 export {
   PHASE_EXECUTION_CONTRACT_VERSION,
   bindPhaseExecution,
@@ -62,7 +90,6 @@ export type {
   ContextManifestEntry,
   ContextSource,
   ContextTrustTier,
-  ContractIdentity,
   CurrentContextContent,
   PhaseAgentContract,
   PhaseAgentRole,
@@ -131,6 +158,7 @@ export interface CoreContract {
   readBootstrapContract(): BootstrapContract;
   readonly validateDomainValue: typeof validateDomainValue;
   readonly validateDependencyGraph: typeof validateDependencyGraph;
+  readonly validateContractRecord: typeof validateContractRecord;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -148,6 +176,7 @@ export const coreContract: CoreContract = Object.freeze({
   readBootstrapContract: () => bootstrapContract,
   validateDomainValue,
   validateDependencyGraph,
+  validateContractRecord,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,

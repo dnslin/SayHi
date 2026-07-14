@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { hashCanonicalJson, stableJson } from "./identity.js";
 
 import {
   DEPENDENCY_GRAPH_CONTRACT_VERSION,
@@ -1649,22 +1649,9 @@ function digestEvent(
   if (event.type === "task_created") {
     payload.task = event.task;
   }
-  return `sha256:${createHash("sha256").update(stableJson(payload)).digest("hex")}`;
+  return hashCanonicalJson(payload);
 }
 
-export function stableJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableJson(item)).join(",")}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
-    .join(",")}}`;
-}
 
 
 function isTimestamp(value: unknown): value is string {
