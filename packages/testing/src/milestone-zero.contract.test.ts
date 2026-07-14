@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 import test from "node:test";
@@ -22,10 +23,25 @@ const REPOSITORY_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const HASH_A = { algorithm: "sha256-lf-v1", digest: "a".repeat(64) } as const;
 const HASH_B = { algorithm: "sha256-bytes-v1", digest: "b".repeat(64) } as const;
 const CONTRACT_IDENTITY_A = `sha256:${"a".repeat(64)}` as const;
-const FINGERPRINT = `sha256:${"f".repeat(64)}`;
+const FINGERPRINT = `sha256:${"f".repeat(64)}` as const;
+const TRELLIS_PROVENANCE_REVISION = "e7c5ead4d0dfd717d11a40b6bc0c80d8af94c49a";
+const TRELLIS_ARTIFACT_HASHES = new Set([
+  "d3202d30daefa004db85e42adf110ec061b07e9609eb2135094be045ceb32576",
+  "4e6b6468ea88f25e07a9334e7b2e6dc10f0fc6c35186aa51353be8da3f5b6841",
+  "675391144226d66d42f7e808b8296b8633a0313e626a9c316a0292545fdeaea6",
+  "c677357c1353142076aa4ba2773b8cdd7843d833c160efd53e6a57d0bb625d25",
+  "8dce61cdce1b06939153f02b2b1624133e0258e081a390b118910a3c05c92532",
+  "e759409d48ed8c7d1710186d8180a602bd81bfe1d7cb6713c780e761534648c9",
+]);
 const IGNORED_DIRECTORY_NAMES = new Set([".git", "dist", "node_modules"]);
 const TEXT_FILE_EXTENSIONS = new Set([
   ".cjs",
+  ".css",
+  ".html",
+  ".py",
+  ".sh",
+  ".toml",
+  ".xml",
   ".js",
   ".json",
   ".jsx",
@@ -156,6 +172,8 @@ const dispatch = {
   expectedTaskVersion: 2,
   phase: "explore",
   agentRole: "research",
+  baseFingerprint: FINGERPRINT,
+  requestedAt: "2026-07-14T16:00:00Z",
   contextManifestIdentity:
     "sha256:452311e200983848fd535cd627cb726b32cfbd37cb682cde568f76fff2483552",
   agentContractIdentity:
@@ -314,15 +332,23 @@ const projectManifest = {
 
 test("AC-0001: one Task crosses every versioned Milestone 0 contract family", () => {
   const taskRequest = buildTaskRequest(TASK_ID, "CREATED");
-  const taskEnvelopeRequest = {
+  const taskDomainRequest = {
     contractVersion: 1,
-    kind: "recordEnvelope",
-    value: { schemaVersion: 1, ...taskRequest.task },
+    kind: "identifier",
+    value: taskRequest.task.id,
   } as const;
-  const domainResult = coreContract.validateDomainValue(taskEnvelopeRequest);
+  const domainResult = coreContract.validateDomainValue(taskDomainRequest);
   assert.equal(domainResult.ok, true);
-  assert.deepEqual(validateCliDomainValue(taskEnvelopeRequest), domainResult);
-  assert.deepEqual(validateOmpDomainValue(taskEnvelopeRequest), domainResult);
+  assert.deepEqual(validateCliDomainValue(taskDomainRequest), domainResult);
+  assert.deepEqual(validateOmpDomainValue(taskDomainRequest), domainResult);
+  const malformedTask = coreContract.startWorkflowTask({
+    ...taskRequest,
+    task: { ...taskRequest.task, route: "unmanaged" },
+  } as never);
+  assert.equal(malformedTask.ok, false);
+  if (!malformedTask.ok) {
+    assert.equal(malformedTask.diagnostics[0]?.code, "workflow.request.invalid");
+  }
 
   const started = coreContract.startWorkflowTask(taskRequest);
   if (!started.ok) {
@@ -392,6 +418,7 @@ test("AC-0001: one Task crosses every versioned Milestone 0 contract family", ()
     agentRole: dispatch.agentRole,
     contextManifestIdentity: dispatch.contextManifestIdentity,
     agentContractIdentity: dispatch.agentContractIdentity,
+    baseFingerprint: dispatch.baseFingerprint,
     outcome: "succeeded",
     artifacts: [],
     evidence: [evidenceRecord.id],
@@ -575,6 +602,13 @@ test("AC-0004: full-tree provenance checks preserve the clean-room boundary", ()
   }
 
   const repositorySources = collectTextSources(REPOSITORY_ROOT);
+  for (const sourceFile of repositorySources) {
+    const sourceIdentity = normalizedTextIdentity(sourceFile.source);
+    assert.ok(
+      !TRELLIS_ARTIFACT_HASHES.has(sourceIdentity),
+      `${sourceFile.path} duplicates a Trellis artifact from ${TRELLIS_PROVENANCE_REVISION}`,
+    );
+  }
   const codeExtensions = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
   for (const sourceFile of repositorySources) {
     if (!codeExtensions.has(extname(sourceFile.path))) {
@@ -640,6 +674,7 @@ test("AC-0004: full-tree provenance checks preserve the clean-room boundary", ()
   assert.match(readme, /## Clean-room boundary/u);
   assert.match(readme, /MUST NOT copy or adapt OMP or Trellis/u);
   assert.match(references, /does not reuse Trellis code/u);
+  assert.ok(references.includes(TRELLIS_PROVENANCE_REVISION));
 });
 
 test("AC-0005: every privileged operation has explicit threat-model coverage", () => {
@@ -648,8 +683,17 @@ test("AC-0005: every privileged operation has explicit threat-model coverage", (
     .split("\n")
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).replace(/[.;]$/u, ""));
-  assert.equal(objectives.length, 8);
-
+  const requirements = [
+    ["change workflow state", /\bCore\b/u, /\bcross\b/u, /\breject\b/u, /\bcan\b/u],
+    ["mutate files outside accepted scope", /\bCore\b.*\bWriter Lease\b/u, /\bcrosses\b/u, /\bblock\b.*\bpreserve\b/u, /\bcannot\b/u],
+    ["bypass review or validation", /\bhuman approval\b.*\bCore Gate\b/u, /\bcrosses\b/u, /\breject\b.*\bblock\b/u, /\bcan\b/u],
+    ["convert untrusted content into project instructions", /\bCore trust policy\b/u, /\bcrosses\b/u, /\bdata-only\b.*\bdeny\b/u, /\breduce\b.*\bdo not eliminate\b/u],
+    ["include unrelated user work in a commit", /\bscoped commit policy\b/u, /\bseparated\b/u, /\bblock\b/u, /\bremain\b/u],
+    ["expose credentials or sensitive logs", /\bredaction\b.*\bdurable-record policy\b/u, /\bcrosses\b/u, /\bredact\b.*\breject\b/u, /\bincomplete\b.*\bmay\b/u],
+    ["replace pinned Skills or Phase Agents", /\brelease identity\b.*\bCore contract policy\b/u, /\bcross(?:es)?\b/u, /\bblock\b/u, /\bstill\b/u],
+    ["perform prohibited Git or external side effects", /\bhuman policy\b.*\btyped ports\b/u, /\bcross\b/u, /\bdeny\b.*\buncertain\b/u, /\bmay\b/u],
+  ] as const;
+  assert.deepEqual(objectives, requirements.map(([operation]) => operation));
   assert.ok(markdownSection(security, "## 3. Trust boundaries").length > 0);
   assert.ok(markdownSection(security, "## 4. Authority model").length > 0);
   const failClosed = markdownSection(security, "## 17. Fail-closed matrix");
@@ -659,17 +703,15 @@ test("AC-0005: every privileged operation has explicit threat-model coverage", (
     .split("\n")
     .filter((line) => line.startsWith("|") && !line.includes("---"))
     .map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim()))
-    .filter(
-      (cells) =>
-        cells.length === 5 && cells[0] !== "Privileged operation",
-    );
-  assert.equal(coverageRows.length, objectives.length);
-  for (const operation of objectives) {
+    .filter((cells) => cells.length === 5 && cells[0] !== "Privileged operation");
+  assert.equal(coverageRows.length, requirements.length);
+  for (const [operation, authority, boundary, failure, risk] of requirements) {
     const coverage = coverageRows.find((cells) => cells[0] === operation);
     assert.ok(coverage, operation);
-    for (const evidence of coverage.slice(1)) {
-      assert.ok(evidence.length > 0, operation);
-    }
+    assert.match(coverage[1] ?? "", authority, operation);
+    assert.match(coverage[2] ?? "", boundary, operation);
+    assert.match(coverage[3] ?? "", failure, operation);
+    assert.match(coverage[4] ?? "", risk, operation);
   }
 });
 
@@ -755,6 +797,11 @@ function isTextFile(name: string): boolean {
     name === "LICENSE" ||
     name === ".gitignore"
   );
+}
+
+function normalizedTextIdentity(source: string): string {
+  const normalized = source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trim();
+  return createHash("sha256").update(normalized).digest("hex");
 }
 
 function isIllustrativeUrl(url: string): boolean {

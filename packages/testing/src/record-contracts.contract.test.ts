@@ -66,6 +66,7 @@ const AGENT_RESULT_RECORD = {
   agentRole: "research",
   contextManifestIdentity: `sha256:${"7".repeat(64)}`,
   agentContractIdentity: `sha256:${"8".repeat(64)}`,
+  baseFingerprint: `sha256:${"6".repeat(64)}`,
   outcome: "succeeded",
   artifacts: ["research/result.json"],
   evidence: ["evidence/validation.json"],
@@ -650,6 +651,13 @@ test("Core rejects malformed Baseline, Lease, Agent result, Evidence, and projec
       code: "record_contract.agent_result.invalid",
       path: "$.record.agentRole",
     },
+    {
+      kind: "agentResult",
+      record: { ...AGENT_RESULT_RECORD, baseFingerprint: "stale" },
+      code: "record_contract.agent_result.invalid",
+      path: "$.record.baseFingerprint",
+    },
+
     {
       kind: "evidence",
       record: { ...EVIDENCE_RECORD, result: "successful" },

@@ -157,6 +157,7 @@ export type AgentResultRecord = Readonly<Record<string, unknown>> & {
   readonly agentRole: PhaseAgentRole;
   readonly contextManifestIdentity: ContractIdentity;
   readonly agentContractIdentity: ContractIdentity;
+  readonly baseFingerprint: ContractIdentity;
   readonly outcome: AgentResultOutcome;
   readonly artifacts: readonly string[];
   readonly evidence: readonly string[];
@@ -897,6 +898,7 @@ function validateAgentResult(
   for (const field of [
     "contextManifestIdentity",
     "agentContractIdentity",
+    "baseFingerprint",
     "observedFinalFingerprint",
   ] as const) {
     if (!isContractIdentity(record[field])) {
