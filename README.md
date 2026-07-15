@@ -2,12 +2,12 @@
 
 SayHi is a clean-room, OMP-native engineering workflow framework. It combines a repository-owned engineering memory, a typed workflow state machine, phase-specific sub-agents, and unchanged upstream Skills.
 
-The executable baseline contains the TypeScript workspace, shared bootstrap contract, versioned validation for shared domain values and Initiative Dependency Graphs, Core-owned Route/Phase/Gate execution, durable Task Event/Projection persistence and recovery, and repository-owned Managed Project lifecycle operations. The CLI provides working `sayhi init`, `sayhi doctor`, `sayhi update`, and `sayhi uninstall` commands backed by Core; the OMP package exposes shared validation contracts but does not yet claim working Plugin, Hook, Tool, or Agent behavior.
+The executable baseline contains the TypeScript workspace, shared bootstrap contract, versioned validation for shared domain values and Initiative Dependency Graphs, Core-owned Route/Phase/Gate execution, durable Task Event/Projection persistence and recovery, hash-bound Context Manifest persistence, and repository-owned Managed Project lifecycle operations. The CLI provides working Project Store lifecycle commands plus `sayhi spec` creation, inspection, validation, and impact workflows and `sayhi context` add/list/remove/validate/refresh/freeze workflows backed by Core; the OMP package exposes shared validation contracts but does not yet claim working Plugin, Hook, Tool, or Agent behavior.
 
 ## Status
 
 - Product and architecture decisions: accepted
-- Implementation status: shared Core bootstrap, domain validation, Dependency Graph validation, workflow execution, durable Task Event/Projection persistence and recovery, and Managed Project `init`/`doctor`/`update`/`uninstall` with ownership-aware recovery
+- Implementation status: shared Core bootstrap, domain validation, Dependency Graph validation, workflow execution, durable Task Event/Projection persistence and recovery, hash-bound Specs and Context Manifests with trust separation and stale binding detection, and Managed Project lifecycle operations with ownership-aware recovery
 - Target license: MIT
 - First runtime adapter: Oh-My-Pi (OMP)
 - CLI name: `sayhi`

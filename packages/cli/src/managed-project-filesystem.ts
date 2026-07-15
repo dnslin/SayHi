@@ -81,6 +81,10 @@ export class NodeManagedProjectFileSystem
     return readFile(this.#resolveManagedPath(path), "utf8");
   }
 
+  async readRepositoryFile(path: string): Promise<string> {
+    return readFile(await this.#resolveReadableRepositoryPath(path), "utf8");
+  }
+
   async createDirectory(path: string): Promise<void> {
     await mkdir(this.#resolveManagedPath(path));
   }
@@ -319,6 +323,25 @@ export class NodeManagedProjectFileSystem
     }
     return target;
   }
+
+  async #resolveReadableRepositoryPath(path: string): Promise<string> {
+    const requested = this.#resolveRepositoryPath(path);
+    const [root, target] = await Promise.all([
+      realpath(this.#repositoryRoot),
+      realpath(requested),
+    ]);
+    const fromRoot = relative(root, target);
+    if (
+      fromRoot.length === 0 ||
+      fromRoot === ".." ||
+      fromRoot.startsWith(`..${sep}`) ||
+      !(await lstat(target)).isFile()
+    ) {
+      throw new Error("Context source must be a regular file inside the repository.");
+    }
+    return target;
+  }
+
 
   async #resolveWritableRepositoryPath(path: string): Promise<string> {
     const requested = this.#resolveRepositoryPath(path);
