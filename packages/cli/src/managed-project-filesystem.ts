@@ -12,12 +12,12 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, join, parse, relative, resolve } from "node:path";
 
 import type {
-  ManagedProjectFileSystem,
+  ManagedProjectMutationFileSystem,
   ManagedProjectPathKind,
 } from "@dnslin/sayhi-core";
 
 export class NodeManagedProjectFileSystem
-  implements ManagedProjectFileSystem
+  implements ManagedProjectMutationFileSystem
 {
   readonly #repositoryRoot: string;
 
@@ -74,6 +74,10 @@ export class NodeManagedProjectFileSystem
       await rm(temporary, { force: true }).catch(() => undefined);
       throw error;
     }
+  }
+
+  async removeFile(path: string): Promise<void> {
+    await rm(this.#resolveManagedPath(path), { force: true });
   }
 
   #resolveManagedPath(path: string): string {
