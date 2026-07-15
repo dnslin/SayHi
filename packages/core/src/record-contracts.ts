@@ -10,6 +10,8 @@ import type { PhaseAgentRole } from "./execution.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
   isIdentifier,
+  isNonEmptyString,
+  isTimestamp,
   validateDomainValue,
   type ContentHash,
 } from "./validation.js";
@@ -1214,9 +1216,6 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
 
 function isFullGitCommit(value: unknown): value is string {
   return typeof value === "string" && FULL_GIT_COMMIT_PATTERN.test(value);
@@ -1239,13 +1238,6 @@ function isUniqueStringArray(
   return true;
 }
 
-function isTimestamp(value: unknown): value is string {
-  return validateDomainValue({
-    contractVersion: 1,
-    kind: "timestamp",
-    value,
-  }).ok;
-}
 
 function isContentHash(value: unknown): value is ContentHash {
   return validateDomainValue({

@@ -7,6 +7,8 @@ import {
 
 import {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
+  isNonEmptyString,
+  isTimestamp,
   validateDomainValue,
   type ContentHash,
   type ContentHashAlgorithm,
@@ -958,17 +960,6 @@ function validateCapability(
 
 
 
-function isTimestamp(value: unknown): value is string {
-  return validateDomainValue({
-    contractVersion: 1,
-    kind: "timestamp",
-    value,
-  }).ok;
-}
-
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
 
 
 

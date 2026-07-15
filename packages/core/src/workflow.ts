@@ -11,7 +11,7 @@ import { isRepositoryRelativePath } from "./repository-path.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
   isIdentifier,
-  validateDomainValue,
+  isTimestamp,
 } from "./validation.js";
 
 export { isRepositoryRelativePath } from "./repository-path.js";
@@ -1654,13 +1654,6 @@ function digestEvent(
 
 
 
-function isTimestamp(value: unknown): value is string {
-  return validateDomainValue({
-    contractVersion: 1,
-    kind: "timestamp",
-    value,
-  }).ok;
-}
 
 function isWorkflowRoute(value: unknown): value is WorkflowRoute {
   return value === "quick" || value === "build" || value === "initiative";
