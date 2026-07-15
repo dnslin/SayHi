@@ -216,6 +216,9 @@ The manifest reader MUST preserve source boundaries during rendering. Content fr
     { "path": "notes.txt", "identity": { "algorithm": "sha256-bytes-v1", "digest": "..." } }
   ],
   "submodulesDigest": "sha256:...",
+  "dirtyPaths": [
+    { "path": "notes.txt", "identity": "sha256:..." }
+  ],
   "adoptedPaths": [],
   "declaredScope": {
     "files": ["packages/export/**"],
@@ -226,9 +229,9 @@ The manifest reader MUST preserve source boundaries during rendering. Content fr
 }
 ```
 
-A Repository Fingerprint is a compact digest of the same material at a point in time. Ignored runtime files are excluded. The exact canonical encoding MUST be versioned so two components cannot compare fingerprints produced by different algorithms as equal.
+A Repository Fingerprint is a compact digest of the same material at a point in time. Ignored runtime files and Project Store Task records are excluded; all other untracked paths, including ignored user files, are included. The exact canonical encoding MUST be versioned so two components cannot compare fingerprints produced by different algorithms as equal.
 
-Adopting a pre-existing change appends an Event and creates a new accepted Baseline revision. Adoption MUST show the exact paths and diffs being incorporated.
+Adopting a pre-existing change appends an Event that binds the new Baseline identity to its exact paths and diff identities. Adoption MUST show every path and diff being incorporated.
 
 ## 8. Lease record
 

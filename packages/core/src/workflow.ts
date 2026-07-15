@@ -1,4 +1,9 @@
-import { hashCanonicalJson, stableJson } from "./identity.js";
+import {
+  hashCanonicalJson,
+  isContractIdentity,
+  stableJson,
+  type ContractIdentity,
+} from "./identity.js";
 
 import {
   DEPENDENCY_GRAPH_CONTRACT_VERSION,
@@ -185,6 +190,11 @@ export interface TaskProjection extends WorkflowTaskDefinition {
   readonly updatedAt: string;
 }
 
+export interface BaselineAdoptedPath {
+  readonly path: string;
+  readonly identity: ContractIdentity;
+}
+
 interface WorkflowEventBase {
   readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
   readonly eventId: string;
@@ -215,7 +225,18 @@ export interface WorkflowTransitionedEvent extends WorkflowEventBase {
   readonly from: WorkflowPosition;
 }
 
-export type WorkflowEvent = TaskCreatedEvent | WorkflowTransitionedEvent;
+export interface BaselineAdoptedEvent extends WorkflowEventBase {
+  readonly type: "baseline_adopted";
+  readonly from: WorkflowPosition;
+  readonly baselineIdentity: ContractIdentity;
+  readonly adopted: readonly BaselineAdoptedPath[];
+}
+
+
+export type WorkflowEvent =
+  | TaskCreatedEvent
+  | WorkflowTransitionedEvent
+  | BaselineAdoptedEvent;
 
 export interface WorkflowState {
   readonly events: readonly WorkflowEvent[];
@@ -239,6 +260,16 @@ export interface TransitionWorkflowRequest {
   readonly initiativeGraph?: DependencyGraph;
   readonly event: WorkflowEventMetadata;
 }
+
+export interface AdoptWorkflowBaselineRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly baselineIdentity: ContractIdentity;
+  readonly adopted: readonly BaselineAdoptedPath[];
+  readonly event: WorkflowEventMetadata;
+}
+
 
 export type WorkflowDiagnosticCode = DependencyGraphDiagnosticCode
   | "workflow.request.invalid"
@@ -283,6 +314,21 @@ export type TransitionWorkflowResult =
       contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
       state: WorkflowState;
       event: WorkflowTransitionedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+
+
+export type AdoptWorkflowBaselineResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: BaselineAdoptedEvent;
     }>
   | Readonly<{
       ok: false;
@@ -568,6 +614,88 @@ export function transitionWorkflow(
   });
 }
 
+export function adoptWorkflowBaseline(
+  state: WorkflowState,
+  request: AdoptWorkflowBaselineRequest,
+): AdoptWorkflowBaselineResult {
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "baseline_adopted" &&
+      matchesBaselineAdoptionIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return baselineAdoptionFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Baseline adoption.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+
+  const requestDiagnostic = validateBaselineAdoptionRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return baselineAdoptionFailure(state, requestDiagnostic);
+  }
+
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "baseline_adopted" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    baselineIdentity: request.baselineIdentity,
+    adopted: copyBaselineAdoptedPaths(request.adopted),
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectBaselineAdoptedEvent(state.projection, event);
+  const nextState = freezeState([...state.events, event], projection);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: nextState,
+    event,
+  });
+}
+
 export function replayWorkflowEvents(
   events: readonly unknown[],
 ): ReplayWorkflowEventsResult {
@@ -655,6 +783,31 @@ export function replayWorkflowEvents(
       }
       const event = copyCreatedEvent(sourceEvent);
       projection = projectCreatedEvent(event);
+      acceptedEvents.push(event);
+      continue;
+    }
+
+    if (projection !== null && sourceEvent.type === "baseline_adopted") {
+      if (
+        sourceEvent.taskId !== projection.id ||
+        sourceEvent.route !== projection.route ||
+        !positionsEqual(sourceEvent.from, positionOf(projection)) ||
+        !positionsEqual(sourceEvent.to, positionOf(projection)) ||
+        sourceEvent.gates.length !== 0 ||
+        sourceEvent.initiativeGraph !== null ||
+        stableJson(sourceEvent.blockers) !== stableJson(projection.blockers)
+      ) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Baseline adoption must preserve the accepted Workflow position.",
+            "Restore the Baseline Event that records the current Task position without Gates or graph changes.",
+          ),
+        );
+      }
+      const event = copyBaselineAdoptedEvent(sourceEvent);
+      projection = projectBaselineAdoptedEvent(projection, event);
       acceptedEvents.push(event);
       continue;
     }
@@ -998,6 +1151,58 @@ function validateTransitionInvariants(
   return null;
 }
 
+function validateBaselineAdoptionRequest(
+  state: WorkflowState,
+  request: AdoptWorkflowBaselineRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (request.taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Baseline adoption Task id does not match the current Projection.",
+      "Reload the intended Task and submit its stable id.",
+    );
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (request.expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${request.expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Projection and reconsider the Baseline adoption.",
+    );
+  }
+  if (!isContractIdentity(request.baselineIdentity)) {
+    return invalidRequest(
+      "$.baselineIdentity",
+      "Baseline adoption requires a SHA-256 Baseline identity.",
+    );
+  }
+  if (!isBaselineAdoptedPaths(request.adopted)) {
+    return invalidRequest(
+      "$.adopted",
+      "Baseline adoption paths must be unique repository-relative paths with SHA-256 diff identities.",
+    );
+  }
+  return validateEventMetadata(request.event, "$.event");
+}
+
 function validateInitiativeGraphTransition(
   projection: TaskProjection,
   events: readonly WorkflowEvent[],
@@ -1137,6 +1342,23 @@ function matchesTransitionIntent(
   );
 }
 
+function matchesBaselineAdoptionIntent(
+  event: BaselineAdoptedEvent,
+  request: AdoptWorkflowBaselineRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    event.baselineIdentity === request.baselineIdentity &&
+    stableJson(event.adopted) === stableJson(request.adopted) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
+
+
 function validateReplayEvent(
   event: unknown,
   index: number,
@@ -1199,13 +1421,17 @@ function validateReplayEvent(
   if (
     event.type === "task_created"
       ? event.from !== null || !isWorkflowTaskDefinition(event.task)
-      : event.type !== "workflow_transitioned" || !isWorkflowPosition(event.from)
+      : event.type === "workflow_transitioned"
+        ? !isWorkflowPosition(event.from)
+        : event.type === "baseline_adopted"
+          ? !isBaselineAdoptedEventPayload(event)
+          : true
   ) {
     return diagnostic(
       "workflow.event.invalid",
       path,
       "Workflow Event type payload is invalid.",
-      "Restore the required task_created or workflow_transitioned payload.",
+      "Restore the required task_created, workflow_transitioned, or baseline_adopted payload.",
     );
   }
   return validateEventMetadata(event, path);
@@ -1271,6 +1497,39 @@ function isWorkflowPosition(value: unknown): value is WorkflowPosition {
     value.step.length > 0
   );
 }
+
+function isBaselineAdoptedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    isContractIdentity(event.baselineIdentity) &&
+    isBaselineAdoptedPaths(event.adopted)
+  );
+}
+
+function isBaselineAdoptedPaths(
+  value: unknown,
+): value is readonly BaselineAdoptedPath[] {
+  if (!Array.isArray(value)) {
+    return false;
+  }
+  const paths = new Set<string>();
+  for (const entry of value) {
+    if (
+      !isUnknownRecord(entry) ||
+      !isRepositoryRelativePath(entry.path) ||
+      !isContractIdentity(entry.identity) ||
+      paths.has(entry.path)
+    ) {
+      return false;
+    }
+    paths.add(entry.path);
+  }
+  return true;
+}
+
 
 function isGateAcceptance(value: unknown): value is GateAcceptance {
   if (!isUnknownRecord(value) || !isWorkflowGate(value.gate)) {
@@ -1490,6 +1749,19 @@ function projectTransitionEvent(
   });
 }
 
+function projectBaselineAdoptedEvent(
+  projection: TaskProjection,
+  event: BaselineAdoptedEvent,
+): TaskProjection {
+  return Object.freeze({
+    ...projection,
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    updatedAt: event.occurredAt,
+  });
+}
+
+
 function copyTaskDefinition(task: WorkflowTaskDefinition): WorkflowTaskDefinition {
   return Object.freeze({
     id: task.id,
@@ -1542,6 +1814,22 @@ function copyTransitionEvent(
   });
 }
 
+function copyBaselineAdoptedEvent(
+  event: BaselineAdoptedEvent,
+): BaselineAdoptedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph: null,
+    adopted: copyBaselineAdoptedPaths(event.adopted),
+  });
+}
+
+
 
 function copyGateAcceptances(
   gates: readonly GateAcceptance[],
@@ -1565,6 +1853,13 @@ function copyActor(actor: WorkflowActor): WorkflowActor {
 function copyStrings(values: readonly string[]): readonly string[] {
   return Object.freeze([...values]);
 }
+
+function copyBaselineAdoptedPaths(
+  paths: readonly BaselineAdoptedPath[],
+): readonly BaselineAdoptedPath[] {
+  return Object.freeze(paths.map((path) => Object.freeze({ ...path })));
+}
+
 
 function freezePosition(position: WorkflowPosition): WorkflowPosition {
   return Object.freeze({ ...position });
@@ -1637,9 +1932,11 @@ function isValidCreationEvent(event: WorkflowEvent): event is TaskCreatedEvent {
 }
 
 function digestEvent(
-  event: Omit<TaskCreatedEvent, "chainDigest"> |
-    Omit<WorkflowTransitionedEvent, "chainDigest"> |
-    WorkflowEvent,
+  event:
+    | Omit<TaskCreatedEvent, "chainDigest">
+    | Omit<WorkflowTransitionedEvent, "chainDigest">
+    | Omit<BaselineAdoptedEvent, "chainDigest">
+    | WorkflowEvent,
 ): string {
   const payload: Record<string, unknown> = {
     schemaVersion: event.schemaVersion,
@@ -1662,6 +1959,9 @@ function digestEvent(
   };
   if (event.type === "task_created") {
     payload.task = event.task;
+  } else if (event.type === "baseline_adopted") {
+    payload.baselineIdentity = event.baselineIdentity;
+    payload.adopted = event.adopted;
   }
   return hashCanonicalJson(payload);
 }
@@ -1703,6 +2003,18 @@ function transitionFailure(
   state: WorkflowState,
   diagnosticValue: WorkflowDiagnostic,
 ): TransitionWorkflowResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+
+function baselineAdoptionFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): AdoptWorkflowBaselineResult {
   return Object.freeze({
     ok: false,
     contractVersion: WORKFLOW_CONTRACT_VERSION,
