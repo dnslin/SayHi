@@ -16,6 +16,7 @@ export type {
   CliJsonVersion,
   CliRunResult,
 } from "./run-cli.js";
+export { NodeManagedProjectFileSystem } from "./managed-project-filesystem.js";
 
 
 export function readCliBootstrapContract(): BootstrapContract {

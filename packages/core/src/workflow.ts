@@ -569,7 +569,7 @@ export function transitionWorkflow(
 }
 
 export function replayWorkflowEvents(
-  events: readonly WorkflowEvent[],
+  events: readonly unknown[],
 ): ReplayWorkflowEventsResult {
   if (events.length === 0) {
     return replayFailure(
@@ -587,11 +587,13 @@ export function replayWorkflowEvents(
   let projection: TaskProjection | null = null;
 
   for (let index = 0; index < events.length; index += 1) {
-    const sourceEvent = events[index]!;
-    const recordDiagnostic = validateReplayEvent(sourceEvent, index);
+    const sourceValue = events[index]!;
+    const recordDiagnostic = validateReplayEvent(sourceValue, index);
     if (recordDiagnostic !== null) {
       return replayFailure(recordDiagnostic);
     }
+    // validateReplayEvent establishes the fields read during replay.
+    const sourceEvent = sourceValue as WorkflowEvent;
     if (seenIdempotencyKeys.has(sourceEvent.idempotencyKey)) {
       return replayFailure(
         diagnostic(
@@ -1136,10 +1138,18 @@ function matchesTransitionIntent(
 }
 
 function validateReplayEvent(
-  event: WorkflowEvent,
+  event: unknown,
   index: number,
 ): WorkflowDiagnostic | null {
   const path = `$[${index}]`;
+  if (!isUnknownRecord(event)) {
+    return diagnostic(
+      "workflow.event.invalid",
+      path,
+      "Workflow Event must be a readable JSON object.",
+      "Restore a complete schema-valid Workflow Event object.",
+    );
+  }
   if (event.schemaVersion !== DURABLE_RECORD_SCHEMA_VERSION) {
     return diagnostic(
       "workflow.event.invalid",
@@ -1167,6 +1177,7 @@ function validateReplayEvent(
   if (
     !isIdentifier(event.taskId) ||
     !isWorkflowRoute(event.route) ||
+    typeof event.sequence !== "number" ||
     !Number.isSafeInteger(event.sequence) ||
     event.sequence < 1 ||
     typeof event.chainDigest !== "string" ||
@@ -1201,9 +1212,12 @@ function validateReplayEvent(
 }
 
 function validateEventMetadata(
-  event: WorkflowEventMetadata,
+  event: unknown,
   path: string,
 ): WorkflowDiagnostic | null {
+  if (!isUnknownRecord(event)) {
+    return invalidRequest(path, "Event metadata must be a readable object.");
+  }
   if (!isIdentifier(event.eventId)) {
     return invalidRequest(`${path}.eventId`, "Event id must be non-empty.");
   }

@@ -15,6 +15,12 @@ import {
   startWorkflowTask,
   transitionWorkflow,
 } from "./workflow.js";
+import {
+  advanceDurableTask,
+  createDurableTask,
+  diagnoseDurableTasks,
+  recoverDurableTask,
+} from "./task-lifecycle.js";
 
 export {
   RECORD_CONTRACT_VERSION,
@@ -213,6 +219,28 @@ export type {
   WorkflowTransitionedEvent,
 } from "./workflow.js";
 
+export {
+  TASK_LIFECYCLE_CONTRACT_VERSION,
+  advanceDurableTask,
+  createDurableTask,
+  diagnoseDurableTasks,
+  recoverDurableTask,
+} from "./task-lifecycle.js";
+export type {
+  AdvanceDurableTaskRequest,
+  AdvanceDurableTaskResult,
+  CreateDurableTaskRequest,
+  CreateDurableTaskResult,
+  DiagnoseDurableTasksRequest,
+  DiagnoseDurableTasksResult,
+  RecoverDurableTaskRequest,
+  RecoverDurableTaskResult,
+  TaskLifecycleDiagnostic,
+  TaskLifecycleDiagnosticCode,
+  TaskLifecycleDirectoryEntry,
+  TaskLifecycleFileSystem,
+} from "./task-lifecycle.js";
+
 export interface BootstrapContract {
   readonly product: "SayHi";
   readonly contractVersion: 1;
@@ -231,6 +259,10 @@ export interface CoreContract {
   readonly startWorkflowTask: typeof startWorkflowTask;
   readonly transitionWorkflow: typeof transitionWorkflow;
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
+  readonly createDurableTask: typeof createDurableTask;
+  readonly advanceDurableTask: typeof advanceDurableTask;
+  readonly recoverDurableTask: typeof recoverDurableTask;
+  readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -251,4 +283,8 @@ export const coreContract: CoreContract = Object.freeze({
   startWorkflowTask,
   transitionWorkflow,
   replayWorkflowEvents,
+  createDurableTask,
+  advanceDurableTask,
+  recoverDurableTask,
+  diagnoseDurableTasks,
 });
