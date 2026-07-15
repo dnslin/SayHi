@@ -6,7 +6,7 @@ import { readRepositoryFile } from "./repository-test-support.js";
 test("AC-0005: every privileged operation has explicit threat-model coverage", () => {
   const security = readRepositoryFile("docs/spec/security.md");
   const objectives = markdownSection(security, "## 1. Security objectives")
-    .split("\n")
+    .split(/\r?\n/u)
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).replace(/[.;]$/u, ""));
   const requirements = [
@@ -26,7 +26,7 @@ test("AC-0005: every privileged operation has explicit threat-model coverage", (
   assert.ok(markdownSection(security, "## 18. Explicit residual risks").length > 0);
 
   const coverageRows = failClosed
-    .split("\n")
+    .split(/\r?\n/u)
     .filter((line) => line.startsWith("|") && !line.includes("---"))
     .map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim()))
     .filter((cells) => cells.length === 5 && cells[0] !== "Privileged operation");

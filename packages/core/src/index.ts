@@ -6,6 +6,10 @@ import {
 import { validateDomainValue } from "./validation.js";
 import { validateContractRecord } from "./record-contracts.js";
 import {
+  diagnoseManagedProject,
+  initializeManagedProject,
+} from "./managed-project.js";
+import {
   readRouteDefinition,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -48,6 +52,24 @@ export type {
   SkillLockRecord,
   SkillUpstreamIdentity,
 } from "./record-contracts.js";
+export {
+  MANAGED_PROJECT_CONTRACT_VERSION,
+  MANAGED_PROJECT_REQUIRED_DIRECTORIES,
+  diagnoseManagedProject,
+  initializeManagedProject,
+} from "./managed-project.js";
+export type {
+  DiagnoseManagedProjectRequest,
+  DiagnoseManagedProjectResult,
+  InitializeManagedProjectRequest,
+  InitializeManagedProjectResult,
+  ManagedProjectDiagnostic,
+  ManagedProjectDiagnosticCode,
+  ManagedProjectFileSystem,
+  ManagedProjectPathKind,
+  ManagedProjectState,
+} from "./managed-project.js";
+
 
 export {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
@@ -171,6 +193,8 @@ export interface CoreContract {
   readonly validateDomainValue: typeof validateDomainValue;
   readonly validateDependencyGraph: typeof validateDependencyGraph;
   readonly validateContractRecord: typeof validateContractRecord;
+  readonly diagnoseManagedProject: typeof diagnoseManagedProject;
+  readonly initializeManagedProject: typeof initializeManagedProject;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -189,6 +213,8 @@ export const coreContract: CoreContract = Object.freeze({
   validateDomainValue,
   validateDependencyGraph,
   validateContractRecord,
+  diagnoseManagedProject,
+  initializeManagedProject,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,

@@ -5,6 +5,18 @@ import {
   type DependencyGraphValidationResult,
   type ContractRecordValidationResult,
 } from "@dnslin/sayhi-core";
+export {
+  CLI_MANAGED_PROJECT_INSTALLATION,
+  runCli,
+} from "./run-cli.js";
+export type {
+  CliJsonEnvelope,
+  CliJsonDiagnostic,
+  CliJsonError,
+  CliJsonVersion,
+  CliRunResult,
+} from "./run-cli.js";
+
 
 export function readCliBootstrapContract(): BootstrapContract {
   return coreContract.readBootstrapContract();
