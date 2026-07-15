@@ -11,6 +11,8 @@ These sources informed the SayHi design. They are references for behavior and in
 - [Template hash behavior](https://github.com/mindfold-ai/Trellis/blob/main/packages/cli/src/utils/template-hash.ts)
 - [AGPL-3.0 license](https://github.com/mindfold-ai/Trellis/blob/main/LICENSE)
 
+The executable clean-room comparison pins these Trellis artifacts at revision `e7c5ead4d0dfd717d11a40b6bc0c80d8af94c49a` and rejects normalized whole-file hash matches in the SayHi source tree.
+
 SayHi preserves general lessons such as durable repository artifacts, session-scoped active work, context manifests, state breadcrumbs, compaction recovery, and hash-aware updates. It does not reuse Trellis code, templates, prompt bodies, or documentation wording.
 
 ## Oh-My-Pi

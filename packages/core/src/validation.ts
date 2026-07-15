@@ -254,8 +254,12 @@ function validateReadableDomainValue(request: unknown): DomainValidationResult {
   }
 }
 
-export function isIdentifier(value: unknown): value is string {
+export function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+export function isIdentifier(value: unknown): value is string {
+  return isNonEmptyString(value);
 }
 
 function validateIdentifier(value: unknown): DomainValidationResult {
@@ -276,8 +280,12 @@ function validateIdentifier(value: unknown): DomainValidationResult {
   };
 }
 
+export function isTimestamp(value: unknown): value is string {
+  return typeof value === "string" && isValidUtcTimestamp(value);
+}
+
 function validateTimestamp(value: unknown): DomainValidationResult {
-  if (typeof value !== "string" || !isValidUtcTimestamp(value)) {
+  if (!isTimestamp(value)) {
     return failure(
       "validation.timestamp.invalid",
       "$.value",

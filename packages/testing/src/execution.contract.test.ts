@@ -126,6 +126,8 @@ const dispatch = {
   expectedTaskVersion: 17,
   phase: "implement",
   agentRole: "implementation",
+  baseFingerprint: `sha256:${"d".repeat(64)}`,
+  requestedAt: "2026-07-14T04:00:00Z",
   contextManifestIdentity:
     "sha256:2a975fb670d14076ee04fae171394b7553597b4c7b237672d71deba5f8a220ca",
   agentContractIdentity:
@@ -152,6 +154,8 @@ test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identit
       expectedTaskVersion: 17,
       phase: "implement",
       agentRole: "implementation",
+      baseFingerprint: dispatch.baseFingerprint,
+      requestedAt: dispatch.requestedAt,
       contextManifestIdentity: dispatch.contextManifestIdentity,
       agentContractIdentity: dispatch.agentContractIdentity,
       skillIdentities: skills.map(({ name, identity }) => ({ name, identity })),
@@ -161,6 +165,49 @@ test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identit
   assert.equal(Object.isFrozen(result.binding), true);
   assert.equal(Object.isFrozen(result.binding.skillIdentities), true);
 });
+
+test("Core rejects dispatches without a valid Baseline fingerprint and request time", () => {
+  const cases = [
+    {
+      dispatch: { ...dispatch, baseFingerprint: "stale" },
+      path: "$.dispatch.baseFingerprint",
+      message: "Phase execution dispatch base fingerprint is invalid.",
+      remediation: "Bind dispatch to the current repository fingerprint.",
+    },
+    {
+      dispatch: { ...dispatch, requestedAt: "not-a-timestamp" },
+      path: "$.dispatch.requestedAt",
+      message: "Phase execution dispatch request time is invalid.",
+      remediation: "Record requestedAt as a valid UTC timestamp.",
+    },
+  ] as const;
+
+  for (const invalidCase of cases) {
+    assert.deepEqual(
+      coreContract.bindPhaseExecution({
+        contractVersion: 1,
+        dispatch: invalidCase.dispatch as never,
+        manifest,
+        currentContext,
+        agentContract,
+        skills,
+      }),
+      {
+        ok: false,
+        contractVersion: 1,
+        diagnostics: [
+          {
+            code: "execution.request_invalid",
+            path: invalidCase.path,
+            message: invalidCase.message,
+            remediation: invalidCase.remediation,
+          },
+        ],
+      },
+    );
+  }
+});
+
 
 test("Core rejects instruction authority on Task Context and Untrusted Reference entries", () => {
   const elevatedManifest = manifest.map((entry, index) =>

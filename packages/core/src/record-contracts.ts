@@ -5,9 +5,13 @@ import {
 } from "./identity.js";
 
 import { isRepositoryRelativePath } from "./repository-path.js";
+import { isWorkflowPhase, type TaskScope, type WorkflowPhase } from "./workflow.js";
+import type { PhaseAgentRole } from "./execution.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
   isIdentifier,
+  isNonEmptyString,
+  isTimestamp,
   validateDomainValue,
   type ContentHash,
 } from "./validation.js";
@@ -15,6 +19,11 @@ import {
 export const RECORD_CONTRACT_VERSION = 1 as const;
 
 export type ContractRecordKind =
+  | "baseline"
+  | "lease"
+  | "agentResult"
+  | "evidence"
+  | "projectManifest"
   | "knowledgeCandidate"
   | "externalReference"
   | "skillLock"
@@ -99,7 +108,111 @@ export type ManagedFileRecord = Readonly<Record<string, unknown>> & {
   readonly localOverrideSource?: string;
 };
 
+export interface BaselineUntrackedFile {
+  readonly path: string;
+  readonly identity: ContentHash;
+}
+
+export type BaselineRecord = Readonly<Record<string, unknown>> & {
+  readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
+  readonly capturedAt: string;
+  readonly repositoryRootIdentity: string;
+  readonly head: string | null;
+  readonly indexDigest: ContractIdentity;
+  readonly trackedWorktreeDigest: ContractIdentity;
+  readonly untracked: readonly BaselineUntrackedFile[];
+  readonly submodulesDigest: ContractIdentity;
+  readonly adoptedPaths: readonly string[];
+  readonly declaredScope: TaskScope;
+};
+
+export type LeaseKind = "reader" | "writer" | "validation";
+
+export interface LeaseOwner {
+  readonly sessionId: string;
+  readonly processId: number;
+  readonly hostId: string;
+  readonly installId: string;
+}
+
+export type LeaseRecord = Readonly<Record<string, unknown>> & {
+  readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
+  readonly leaseId: string;
+  readonly kind: LeaseKind;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly owner: LeaseOwner;
+  readonly baseFingerprint: ContractIdentity;
+  readonly acquiredAt: string;
+  readonly heartbeatAt: string;
+  readonly expiresAt: string;
+};
+
+export type AgentResultOutcome = "succeeded" | "failed" | "blocked";
+
+export type AgentResultRecord = Readonly<Record<string, unknown>> & {
+  readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
+  readonly dispatchId: string;
+  readonly taskId: string;
+  readonly expectedTaskVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly agentRole: PhaseAgentRole;
+  readonly contextManifestIdentity: ContractIdentity;
+  readonly agentContractIdentity: ContractIdentity;
+  readonly baseFingerprint: ContractIdentity;
+  readonly outcome: AgentResultOutcome;
+  readonly artifacts: readonly string[];
+  readonly evidence: readonly string[];
+  readonly findings: readonly string[];
+  readonly observedFinalFingerprint: ContractIdentity;
+};
+
+export type EvidenceResult = "not-run" | "passed" | "failed" | "inconclusive";
+
+export interface EvidenceCommand {
+  readonly argv: readonly string[];
+  readonly cwd: string;
+  readonly exitCode: number;
+}
+
+export type EvidenceRecord = Readonly<Record<string, unknown>> & {
+  readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
+  readonly id: string;
+  readonly taskId: string;
+  readonly kind: string;
+  readonly producer: string;
+  readonly baseFingerprint: ContractIdentity;
+  readonly command: EvidenceCommand;
+  readonly artifacts: readonly string[];
+  readonly result: EvidenceResult;
+  readonly startedAt: string;
+  readonly completedAt: string;
+};
+
+export interface InstalledProjectVersions {
+  readonly core: string;
+  readonly cli: string;
+  readonly ompPlugin: string;
+  readonly projectSchema: number;
+  readonly templates: string;
+  readonly skillLockDigest: ContractIdentity;
+}
+
+export type ProjectManifestRecord = Readonly<Record<string, unknown>> & {
+  readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
+  readonly projectId: string;
+  readonly installed: InstalledProjectVersions;
+  readonly initializedAt: string;
+  readonly updatedAt: string;
+  readonly ownershipManifest: string;
+};
+
 export type ContractRecord =
+  | BaselineRecord
+  | LeaseRecord
+  | AgentResultRecord
+  | EvidenceRecord
+  | ProjectManifestRecord
   | KnowledgeCandidateRecord
   | ExternalReferenceRecord
   | SkillLockRecord
@@ -117,6 +230,11 @@ export type ContractRecordDiagnosticCode =
   | "record_contract.contract_version.unsupported"
   | "record_contract.kind.unsupported"
   | "record_contract.schema_version.unsupported"
+  | "record_contract.baseline.invalid"
+  | "record_contract.lease.invalid"
+  | "record_contract.agent_result.invalid"
+  | "record_contract.evidence.invalid"
+  | "record_contract.project_manifest.invalid"
   | "record_contract.knowledge.invalid"
   | "record_contract.external_reference.invalid"
   | "record_contract.skill_lock.invalid"
@@ -203,7 +321,7 @@ function validateReadableRequest(
       "record_contract.kind.unsupported",
       "$.kind",
       "Contract record kind is unsupported.",
-      "Use knowledgeCandidate, externalReference, skillLock, or managedFile.",
+      "Use baseline, lease, agentResult, evidence, projectManifest, knowledgeCandidate, externalReference, skillLock, or managedFile.",
     );
   }
   if (!isRecord(request.record)) {
@@ -262,6 +380,16 @@ function validateRecord(
   record: UnknownRecord,
 ): ContractRecordValidationFailure | null {
   switch (kind) {
+    case "baseline":
+      return validateBaseline(record);
+    case "lease":
+      return validateLease(record);
+    case "agentResult":
+      return validateAgentResult(record);
+    case "evidence":
+      return validateEvidence(record);
+    case "projectManifest":
+      return validateProjectManifest(record);
     case "knowledgeCandidate":
       return validateKnowledgeCandidate(record);
     case "externalReference":
@@ -561,6 +689,431 @@ function validateManagedFile(
   return null;
 }
 
+function validateBaseline(
+  record: UnknownRecord,
+): ContractRecordValidationFailure | null {
+  if (!isTimestamp(record.capturedAt)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.capturedAt",
+      "capturedAt must be a valid UTC timestamp.",
+    );
+  }
+  if (!isIdentifier(record.repositoryRootIdentity)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.repositoryRootIdentity",
+      "repositoryRootIdentity must be a non-empty identifier.",
+    );
+  }
+  if (record.head !== null && !isFullGitCommit(record.head)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.head",
+      "head must be null or an immutable full Git object identity.",
+    );
+  }
+  for (const field of [
+    "indexDigest",
+    "trackedWorktreeDigest",
+    "submodulesDigest",
+  ] as const) {
+    if (!isContractIdentity(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.${field}`,
+        `${field} must be a SHA-256 contract identity.`,
+      );
+    }
+  }
+  if (!Array.isArray(record.untracked)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.untracked",
+      "untracked must be an array.",
+    );
+  }
+  const untrackedPaths = new Set<string>();
+  for (let index = 0; index < record.untracked.length; index += 1) {
+    const entry = record.untracked[index];
+    if (!isRecord(entry) || !isRepositoryRelativePath(entry.path)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.untracked[${index}].path`,
+        "untracked paths must be repository-relative.",
+      );
+    }
+    if (untrackedPaths.has(entry.path)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.untracked[${index}].path`,
+        "untracked paths must be unique.",
+      );
+    }
+    if (!isContentHash(entry.identity)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.untracked[${index}].identity`,
+        "untracked content must have an algorithm-specific identity.",
+      );
+    }
+    untrackedPaths.add(entry.path);
+  }
+  if (!isUniqueRepositoryPathArray(record.adoptedPaths)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.adoptedPaths",
+      "adoptedPaths must contain unique repository-relative paths.",
+    );
+  }
+  if (!isTaskScope(record.declaredScope)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.declaredScope",
+      "declaredScope must contain valid file, API, schema, and lock resources.",
+    );
+  }
+  return null;
+}
+
+function validateLease(record: UnknownRecord): ContractRecordValidationFailure | null {
+  for (const field of ["leaseId", "projectId", "taskId"] as const) {
+    if (!isIdentifier(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.lease.invalid",
+        "Lease",
+        `$.record.${field}`,
+        `${field} must be a non-empty identifier.`,
+      );
+    }
+  }
+  if (!isLeaseKind(record.kind)) {
+    return invalidMilestoneRecord(
+      "record_contract.lease.invalid",
+      "Lease",
+      "$.record.kind",
+      "kind must be reader, writer, or validation.",
+    );
+  }
+  if (!isRecord(record.owner)) {
+    return invalidMilestoneRecord(
+      "record_contract.lease.invalid",
+      "Lease",
+      "$.record.owner",
+      "owner must be an object.",
+    );
+  }
+  for (const field of ["sessionId", "hostId", "installId"] as const) {
+    if (!isIdentifier(record.owner[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.lease.invalid",
+        "Lease",
+        `$.record.owner.${field}`,
+        `${field} must be a non-empty identifier.`,
+      );
+    }
+  }
+  if (
+    typeof record.owner.processId !== "number" ||
+    !Number.isSafeInteger(record.owner.processId) ||
+    record.owner.processId <= 0
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.lease.invalid",
+      "Lease",
+      "$.record.owner.processId",
+      "processId must be a positive safe integer.",
+    );
+  }
+  if (!isContractIdentity(record.baseFingerprint)) {
+    return invalidMilestoneRecord(
+      "record_contract.lease.invalid",
+      "Lease",
+      "$.record.baseFingerprint",
+      "baseFingerprint must be a SHA-256 contract identity.",
+    );
+  }
+  if (
+    !areOrderedTimestamps(record.acquiredAt, record.heartbeatAt, record.expiresAt)
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.lease.invalid",
+      "Lease",
+      "$.record.expiresAt",
+      "lease timestamps must be valid UTC values ordered acquired, heartbeat, expiry.",
+    );
+  }
+  return null;
+}
+
+function validateAgentResult(
+  record: UnknownRecord,
+): ContractRecordValidationFailure | null {
+  for (const field of ["dispatchId", "taskId"] as const) {
+    if (!isIdentifier(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.agent_result.invalid",
+        "Agent result",
+        `$.record.${field}`,
+        `${field} must be a non-empty identifier.`,
+      );
+    }
+  }
+  if (
+    typeof record.expectedTaskVersion !== "number" ||
+    !Number.isSafeInteger(record.expectedTaskVersion) ||
+    record.expectedTaskVersion < 1
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.expectedTaskVersion",
+      "expectedTaskVersion must be a positive safe integer.",
+    );
+  }
+  if (!isWorkflowPhase(record.phase)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.phase",
+      "phase must be a supported workflow Phase.",
+    );
+  }
+  if (!isPhaseAgentRole(record.agentRole)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.agentRole",
+      "agentRole must be a supported Phase Agent role.",
+    );
+  }
+  for (const field of [
+    "contextManifestIdentity",
+    "agentContractIdentity",
+    "baseFingerprint",
+    "observedFinalFingerprint",
+  ] as const) {
+    if (!isContractIdentity(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.agent_result.invalid",
+        "Agent result",
+        `$.record.${field}`,
+        `${field} must be a SHA-256 contract identity.`,
+      );
+    }
+  }
+  if (!isAgentResultOutcome(record.outcome)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.outcome",
+      "outcome must be succeeded, failed, or blocked.",
+    );
+  }
+  for (const field of ["artifacts", "evidence", "findings"] as const) {
+    if (!isUniqueStringArray(record[field], false)) {
+      return invalidMilestoneRecord(
+        "record_contract.agent_result.invalid",
+        "Agent result",
+        `$.record.${field}`,
+        `${field} must contain unique non-empty references.`,
+      );
+    }
+  }
+  return null;
+}
+
+function validateEvidence(
+  record: UnknownRecord,
+): ContractRecordValidationFailure | null {
+  for (const field of ["id", "taskId"] as const) {
+    if (!isIdentifier(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.evidence.invalid",
+        "Evidence",
+        `$.record.${field}`,
+        `${field} must be a non-empty identifier.`,
+      );
+    }
+  }
+  for (const field of ["kind", "producer"] as const) {
+    if (!isNonEmptyString(record[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.evidence.invalid",
+        "Evidence",
+        `$.record.${field}`,
+        `${field} must be a non-empty string.`,
+      );
+    }
+  }
+  if (!isContractIdentity(record.baseFingerprint)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.baseFingerprint",
+      "baseFingerprint must be a SHA-256 contract identity.",
+    );
+  }
+  if (!isRecord(record.command)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.command",
+      "command must be an object.",
+    );
+  }
+  if (!isStringArray(record.command.argv, true)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.command.argv",
+      "command argv must contain at least one non-empty argument.",
+    );
+  }
+  if (!isRepositoryRelativePath(record.command.cwd)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.command.cwd",
+      "command cwd must be repository-relative.",
+    );
+  }
+  if (
+    typeof record.command.exitCode !== "number" ||
+    !Number.isSafeInteger(record.command.exitCode) ||
+    record.command.exitCode < 0
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.command.exitCode",
+      "command exitCode must be a non-negative safe integer.",
+    );
+  }
+  if (!isUniqueStringArray(record.artifacts, false)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.artifacts",
+      "artifacts must contain unique non-empty references.",
+    );
+  }
+  if (!isEvidenceResult(record.result)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.result",
+      "result must be not-run, passed, failed, or inconclusive.",
+    );
+  }
+  if (!areOrderedTimestamps(record.startedAt, record.completedAt)) {
+    return invalidMilestoneRecord(
+      "record_contract.evidence.invalid",
+      "Evidence",
+      "$.record.completedAt",
+      "Evidence timestamps must be valid UTC values ordered start then completion.",
+    );
+  }
+  return null;
+}
+
+function validateProjectManifest(
+  record: UnknownRecord,
+): ContractRecordValidationFailure | null {
+  if (!isIdentifier(record.projectId)) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.projectId",
+      "projectId must be a non-empty identifier.",
+    );
+  }
+  if (!isRecord(record.installed)) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.installed",
+      "installed must be an object.",
+    );
+  }
+  for (const field of ["core", "cli", "ompPlugin", "templates"] as const) {
+    if (!isNonEmptyString(record.installed[field])) {
+      return invalidMilestoneRecord(
+        "record_contract.project_manifest.invalid",
+        "Project manifest",
+        `$.record.installed.${field}`,
+        `${field} must be a non-empty installed version.`,
+      );
+    }
+  }
+  if (
+    typeof record.installed.projectSchema !== "number" ||
+    !Number.isSafeInteger(record.installed.projectSchema) ||
+    record.installed.projectSchema < 1
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.installed.projectSchema",
+      "projectSchema must be a positive safe integer.",
+    );
+  }
+  if (!isContractIdentity(record.installed.skillLockDigest)) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.installed.skillLockDigest",
+      "skillLockDigest must be a SHA-256 contract identity.",
+    );
+  }
+  if (!areOrderedTimestamps(record.initializedAt, record.updatedAt)) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.updatedAt",
+      "manifest timestamps must be valid UTC values ordered initialization then update.",
+    );
+  }
+  if (!isRepositoryRelativePath(record.ownershipManifest)) {
+    return invalidMilestoneRecord(
+      "record_contract.project_manifest.invalid",
+      "Project manifest",
+      "$.record.ownershipManifest",
+      "ownershipManifest must be a repository-relative path.",
+    );
+  }
+  return null;
+}
+
+function invalidMilestoneRecord(
+  code:
+    | "record_contract.baseline.invalid"
+    | "record_contract.lease.invalid"
+    | "record_contract.agent_result.invalid"
+    | "record_contract.evidence.invalid"
+    | "record_contract.project_manifest.invalid",
+  label: string,
+  path: string,
+  message: string,
+): ContractRecordValidationFailure {
+  return failure(
+    code,
+    path,
+    `${label} ${message}`,
+    `Provide a schema-valid ${label} record.`,
+  );
+}
+
 function invalidKnowledge(
   path: string,
   message: string,
@@ -626,6 +1179,11 @@ function failure(
 
 function isContractRecordKind(value: unknown): value is ContractRecordKind {
   return (
+    value === "baseline" ||
+    value === "lease" ||
+    value === "agentResult" ||
+    value === "evidence" ||
+    value === "projectManifest" ||
     value === "knowledgeCandidate" ||
     value === "externalReference" ||
     value === "skillLock" ||
@@ -658,9 +1216,6 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
 
 function isFullGitCommit(value: unknown): value is string {
   return typeof value === "string" && FULL_GIT_COMMIT_PATTERN.test(value);
@@ -683,13 +1238,6 @@ function isUniqueStringArray(
   return true;
 }
 
-function isTimestamp(value: unknown): value is string {
-  return validateDomainValue({
-    contractVersion: 1,
-    kind: "timestamp",
-    value,
-  }).ok;
-}
 
 function isContentHash(value: unknown): value is ContentHash {
   return validateDomainValue({
@@ -697,6 +1245,108 @@ function isContentHash(value: unknown): value is ContentHash {
     kind: "contentHash",
     value,
   }).ok;
+}
+
+function isLeaseKind(value: unknown): value is LeaseKind {
+  return value === "reader" || value === "writer" || value === "validation";
+}
+
+function isAgentResultOutcome(value: unknown): value is AgentResultOutcome {
+  return value === "succeeded" || value === "failed" || value === "blocked";
+}
+
+function isEvidenceResult(value: unknown): value is EvidenceResult {
+  return (
+    value === "not-run" ||
+    value === "passed" ||
+    value === "failed" ||
+    value === "inconclusive"
+  );
+}
+
+function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
+  return (
+    value === "research" ||
+    value === "planning" ||
+    value === "architecture" ||
+    value === "implementation" ||
+    value === "standards-review" ||
+    value === "spec-review" ||
+    value === "integration" ||
+    value === "knowledge"
+  );
+}
+
+function isTaskScope(value: unknown): value is TaskScope {
+  return (
+    isRecord(value) &&
+    isUniqueRepositoryPathArray(value.files) &&
+    isUniqueStringArray(value.apis, false) &&
+    isUniqueStringArray(value.schemas, false) &&
+    isUniqueRepositoryPathArray(value.locks)
+  );
+}
+
+function isUniqueRepositoryPathArray(value: unknown): value is readonly string[] {
+  return (
+    isUniqueStringArray(value, false) &&
+    value.every((path) => isRepositoryRelativePath(path))
+  );
+}
+
+function isStringArray(value: unknown, requireItem: boolean): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    (!requireItem || value.length > 0) &&
+    value.every((item) => isNonEmptyString(item))
+  );
+}
+
+interface ComparableUtcTimestamp {
+  readonly wholeSeconds: string;
+  readonly fractionalSeconds: string;
+}
+
+function areOrderedTimestamps(...values: readonly unknown[]): boolean {
+  let previous: ComparableUtcTimestamp | undefined;
+  for (const value of values) {
+    if (!isTimestamp(value)) {
+      return false;
+    }
+    const current = comparableUtcTimestamp(value);
+    if (previous !== undefined && compareUtcTimestamps(current, previous) < 0) {
+      return false;
+    }
+    previous = current;
+  }
+  return true;
+}
+
+function comparableUtcTimestamp(value: string): ComparableUtcTimestamp {
+  const utc = value.toUpperCase().replace(/\+00:00$/u, "Z").slice(0, -1);
+  const separator = utc.indexOf(".");
+  return separator === -1
+    ? { wholeSeconds: utc, fractionalSeconds: "" }
+    : {
+        wholeSeconds: utc.slice(0, separator),
+        fractionalSeconds: utc.slice(separator + 1),
+      };
+}
+
+function compareUtcTimestamps(
+  left: ComparableUtcTimestamp,
+  right: ComparableUtcTimestamp,
+): number {
+  if (left.wholeSeconds !== right.wholeSeconds) {
+    return left.wholeSeconds < right.wholeSeconds ? -1 : 1;
+  }
+  const precision = Math.max(
+    left.fractionalSeconds.length,
+    right.fractionalSeconds.length,
+  );
+  const leftFraction = left.fractionalSeconds.padEnd(precision, "0");
+  const rightFraction = right.fractionalSeconds.padEnd(precision, "0");
+  return leftFraction === rightFraction ? 0 : leftFraction < rightFraction ? -1 : 1;
 }
 
 

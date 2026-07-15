@@ -13,6 +13,101 @@ const CONTENT_HASH_B = {
   digest: "b".repeat(64),
 } as const;
 
+const BASELINE_RECORD = {
+  schemaVersion: 1,
+  capturedAt: "2026-07-14T16:00:00Z",
+  repositoryRootIdentity: "PROJECT-7",
+  head: "1".repeat(40),
+  indexDigest: `sha256:${"2".repeat(64)}`,
+  trackedWorktreeDigest: `sha256:${"3".repeat(64)}`,
+  untracked: [
+    {
+      path: "notes.txt",
+      identity: {
+        algorithm: "sha256-bytes-v1",
+        digest: "4".repeat(64),
+      },
+    },
+  ],
+  submodulesDigest: `sha256:${"5".repeat(64)}`,
+  adoptedPaths: ["notes.txt"],
+  declaredScope: {
+    files: ["packages/testing/**"],
+    apis: ["CoreContract"],
+    schemas: [],
+    locks: ["package-lock.json"],
+  },
+} as const;
+
+const LEASE_RECORD = {
+  schemaVersion: 1,
+  leaseId: "LEASE-7",
+  kind: "writer",
+  projectId: "PROJECT-7",
+  taskId: "TASK-7",
+  owner: {
+    sessionId: "SESSION-7",
+    processId: 7007,
+    hostId: "HOST-7",
+    installId: "INSTALL-7",
+  },
+  baseFingerprint: `sha256:${"6".repeat(64)}`,
+  acquiredAt: "2026-07-14T16:00:00Z",
+  heartbeatAt: "2026-07-14T16:00:30Z",
+  expiresAt: "2026-07-14T16:01:00Z",
+} as const;
+
+const AGENT_RESULT_RECORD = {
+  schemaVersion: 1,
+  dispatchId: "DISPATCH-7",
+  taskId: "TASK-7",
+  expectedTaskVersion: 2,
+  phase: "explore",
+  agentRole: "research",
+  contextManifestIdentity: `sha256:${"7".repeat(64)}`,
+  agentContractIdentity: `sha256:${"8".repeat(64)}`,
+  baseFingerprint: `sha256:${"6".repeat(64)}`,
+  outcome: "succeeded",
+  artifacts: ["research/result.json"],
+  evidence: ["evidence/validation.json"],
+  findings: [],
+  observedFinalFingerprint: `sha256:${"9".repeat(64)}`,
+} as const;
+
+const EVIDENCE_RECORD = {
+  schemaVersion: 1,
+  id: "EVIDENCE-7",
+  taskId: "TASK-7",
+  kind: "validation",
+  producer: "sayhi-contract-suite",
+  baseFingerprint: `sha256:${"a".repeat(64)}`,
+  command: {
+    argv: ["npm", "run", "test:contracts"],
+    cwd: ".",
+    exitCode: 0,
+  },
+  artifacts: [],
+  result: "passed",
+  startedAt: "2026-07-14T16:00:00Z",
+  completedAt: "2026-07-14T16:01:00Z",
+} as const;
+
+const PROJECT_MANIFEST_RECORD = {
+  schemaVersion: 1,
+  projectId: "PROJECT-7",
+  installed: {
+    core: "0.0.0",
+    cli: "0.0.0",
+    ompPlugin: "0.0.0",
+    projectSchema: 1,
+    templates: "0.0.0",
+    skillLockDigest: `sha256:${"b".repeat(64)}`,
+  },
+  initializedAt: "2026-07-14T16:00:00Z",
+  updatedAt: "2026-07-14T16:00:00Z",
+  ownershipManifest: ".sayhi/managed-files.json",
+} as const;
+
 test("Core round-trips every versioned knowledge, External Reference, Skill, and managed-file record", () => {
   const cases = [
     {
@@ -506,4 +601,118 @@ test("Core requires algorithm-specific descriptors for managed-file content iden
     }).ok,
     false,
   );
+});
+
+test("Core round-trips Baseline, Lease, Agent result, Evidence, and project manifest records", () => {
+  const cases = [
+    { kind: "baseline", record: BASELINE_RECORD },
+    { kind: "lease", record: LEASE_RECORD },
+    { kind: "agentResult", record: AGENT_RESULT_RECORD },
+    { kind: "evidence", record: EVIDENCE_RECORD },
+    { kind: "projectManifest", record: PROJECT_MANIFEST_RECORD },
+  ] as const;
+
+  for (const { kind, record } of cases) {
+    const result = coreContract.validateContractRecord({
+      contractVersion: 1,
+      kind,
+      record,
+    });
+    assert.equal(result.ok, true, kind);
+    if (result.ok) {
+      assert.equal(result.kind, kind);
+      assert.deepEqual(result.record, record);
+      assert.notStrictEqual(result.record, record);
+      assert.match(result.identity, /^sha256:[0-9a-f]{64}$/u);
+    }
+  }
+});
+
+test("Core rejects malformed Baseline, Lease, Agent result, Evidence, and project manifest records", () => {
+  const cases = [
+    {
+      kind: "baseline",
+      record: { ...BASELINE_RECORD, head: "short" },
+      code: "record_contract.baseline.invalid",
+      path: "$.record.head",
+    },
+    {
+      kind: "lease",
+      record: {
+        ...LEASE_RECORD,
+        owner: { ...LEASE_RECORD.owner, processId: 0 },
+      },
+      code: "record_contract.lease.invalid",
+      path: "$.record.owner.processId",
+    },
+    {
+      kind: "agentResult",
+      record: { ...AGENT_RESULT_RECORD, agentRole: "root" },
+      code: "record_contract.agent_result.invalid",
+      path: "$.record.agentRole",
+    },
+    {
+      kind: "agentResult",
+      record: { ...AGENT_RESULT_RECORD, baseFingerprint: "stale" },
+      code: "record_contract.agent_result.invalid",
+      path: "$.record.baseFingerprint",
+    },
+
+    {
+      kind: "evidence",
+      record: { ...EVIDENCE_RECORD, result: "successful" },
+      code: "record_contract.evidence.invalid",
+      path: "$.record.result",
+    },
+    {
+      kind: "projectManifest",
+      record: {
+        ...PROJECT_MANIFEST_RECORD,
+        installed: {
+          ...PROJECT_MANIFEST_RECORD.installed,
+          skillLockDigest: "unversioned",
+        },
+      },
+      code: "record_contract.project_manifest.invalid",
+      path: "$.record.installed.skillLockDigest",
+    },
+  ] as const;
+
+  for (const { kind, record, code, path } of cases) {
+    const result = coreContract.validateContractRecord({
+      contractVersion: 1,
+      kind,
+      record,
+    });
+    assert.equal(result.ok, false, kind);
+    if (!result.ok) {
+      assert.equal(result.diagnostics[0]?.code, code);
+      assert.equal(result.diagnostics[0]?.path, path);
+    }
+  }
+});
+
+test("Core preserves accepted UTC leap seconds in ordered record timestamps", () => {
+  const leaseResult = coreContract.validateContractRecord({
+    contractVersion: 1,
+    kind: "lease",
+    record: {
+      ...LEASE_RECORD,
+      acquiredAt: "2016-12-31T23:59:60Z",
+      heartbeatAt: "2017-01-01T00:00:00Z",
+      expiresAt: "2017-01-01T00:00:01Z",
+    },
+  });
+  assert.equal(leaseResult.ok, true);
+
+  const evidenceResult = coreContract.validateContractRecord({
+    contractVersion: 1,
+    kind: "evidence",
+    record: {
+      ...EVIDENCE_RECORD,
+      startedAt: "2016-12-31T23:59:60Z",
+      completedAt: "2017-01-01T00:00:00Z",
+    },
+  });
+  assert.equal(evidenceResult.ok, true);
 });

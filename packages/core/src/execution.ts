@@ -7,6 +7,8 @@ import {
 
 import {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
+  isNonEmptyString,
+  isTimestamp,
   validateDomainValue,
   type ContentHash,
   type ContentHashAlgorithm,
@@ -103,6 +105,8 @@ export interface PhaseExecutionDispatch {
   readonly expectedTaskVersion: number;
   readonly phase: WorkflowPhase;
   readonly agentRole: PhaseAgentRole;
+  readonly baseFingerprint: ContractIdentity;
+  readonly requestedAt: string;
   readonly contextManifestIdentity: ContractIdentity;
   readonly agentContractIdentity: ContractIdentity;
 }
@@ -137,6 +141,8 @@ export interface PhaseExecutionBinding {
   readonly expectedTaskVersion: number;
   readonly phase: WorkflowPhase;
   readonly agentRole: PhaseAgentRole;
+  readonly baseFingerprint: ContractIdentity;
+  readonly requestedAt: string;
   readonly contextManifestIdentity: ContractIdentity;
   readonly agentContractIdentity: ContractIdentity;
   readonly skillIdentities: readonly BoundSkillIdentity[];
@@ -261,6 +267,8 @@ function bindReadablePhaseExecution(
     expectedTaskVersion: request.dispatch.expectedTaskVersion,
     phase: request.dispatch.phase,
     agentRole: request.dispatch.agentRole,
+    baseFingerprint: request.dispatch.baseFingerprint,
+    requestedAt: request.dispatch.requestedAt,
     contextManifestIdentity: request.dispatch.contextManifestIdentity,
     agentContractIdentity: request.dispatch.agentContractIdentity,
     skillIdentities: skillsResult.skillIdentities,
@@ -324,6 +332,8 @@ function authorizeReadablePhaseExecution(
       expectedTaskVersion: binding.expectedTaskVersion,
       phase: binding.phase,
       agentRole: binding.agentRole,
+      baseFingerprint: binding.baseFingerprint,
+      requestedAt: binding.requestedAt,
       contextManifestIdentity: binding.contextManifestIdentity,
       agentContractIdentity: binding.agentContractIdentity,
     },
@@ -408,6 +418,22 @@ function validateDispatch(
       "$.dispatch.expectedTaskVersion",
       "Expected Task version must be a non-negative safe integer.",
       "Read the current Task Projection version and retry.",
+    );
+  }
+  if (!isContractIdentity(dispatch.baseFingerprint)) {
+    return failure(
+      "execution.request_invalid",
+      "$.dispatch.baseFingerprint",
+      "Phase execution dispatch base fingerprint is invalid.",
+      "Bind dispatch to the current repository fingerprint.",
+    );
+  }
+  if (!isTimestamp(dispatch.requestedAt)) {
+    return failure(
+      "execution.request_invalid",
+      "$.dispatch.requestedAt",
+      "Phase execution dispatch request time is invalid.",
+      "Record requestedAt as a valid UTC timestamp.",
     );
   }
   if (!isWorkflowPhase(dispatch.phase)) {
@@ -934,9 +960,6 @@ function validateCapability(
 
 
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
-}
 
 
 
