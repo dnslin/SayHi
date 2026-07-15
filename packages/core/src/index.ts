@@ -10,10 +10,18 @@ import {
   initializeManagedProject,
 } from "./managed-project.js";
 import {
+  createSpec,
+  findImpactedSpecContexts,
+  listSpecs,
+  readSpec,
+  validateSpecs,
+} from "./spec.js";
+import {
   readRouteDefinition,
   adoptWorkflowBaseline,
   replayWorkflowEvents,
   startWorkflowTask,
+  recordContextManifestChange,
   transitionWorkflow,
 } from "./workflow.js";
 import {
@@ -22,7 +30,13 @@ import {
   createDurableTask,
   diagnoseDurableTasks,
   recoverDurableTask,
+  readDurableTask,
+  refreshDurableContextManifest,
+  freezeDurableContextManifest,
+  addDurableContextManifestEntry,
+  removeDurableContextManifestEntry,
   withDurableTaskWriter,
+  inspectDurableContextManifest,
 } from "./task-lifecycle.js";
 
 export {
@@ -146,6 +160,34 @@ export type {
 
 export type { ContractIdentity } from "./identity.js";
 
+export { CONTEXT_MANIFEST_CONTRACT_VERSION } from "./context-manifest.js";
+export type { ContextManifestDiagnostic } from "./context-manifest.js";
+export {
+  SPEC_CONTRACT_VERSION,
+  createSpec,
+  findImpactedSpecContexts,
+  listSpecs,
+  readSpec,
+  validateSpecs,
+} from "./spec.js";
+export type {
+  CreateSpecRequest,
+  CreateSpecResult,
+  ListSpecsResult,
+  FindImpactedSpecContextsRequest,
+  FindImpactedSpecContextsResult,
+  ReadSpecRequest,
+  ReadSpecResult,
+  SpecDiagnostic,
+  SpecContextImpact,
+  SpecImpactFileSystem,
+  SpecDirectoryEntry,
+  SpecFileSystem,
+  ValidateSpecsRequest,
+  ValidateSpecsResult,
+} from "./spec.js";
+
+
 export {
   PHASE_EXECUTION_CONTRACT_VERSION,
   bindPhaseExecution,
@@ -186,6 +228,7 @@ export {
   replayWorkflowEvents,
   startWorkflowTask,
   transitionWorkflow,
+  recordContextManifestChange,
 } from "./workflow.js";
 export type {
   DependencyGraph,
@@ -199,6 +242,10 @@ export type {
   AdoptWorkflowBaselineRequest,
   AdoptWorkflowBaselineResult,
   BaselineAdoptedEvent,
+  ContextManifestChange,
+  ContextManifestChangedEvent,
+  RecordContextManifestChangeRequest,
+  RecordContextManifestChangeResult,
   BaselineAdoptedPath,
   RouteDefinition,
   StartWorkflowTaskRequest,
@@ -230,15 +277,32 @@ export type {
 
 export {
   TASK_LIFECYCLE_CONTRACT_VERSION,
+  addDurableContextManifestEntry,
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
   diagnoseDurableTasks,
   recoverDurableTask,
+  readDurableTask,
+  refreshDurableContextManifest,
+  freezeDurableContextManifest,
+  inspectDurableContextManifest,
+  removeDurableContextManifestEntry,
   withDurableTaskWriter,
 } from "./task-lifecycle.js";
 export type {
   AdvanceDurableTaskRequest,
+  AddDurableContextManifestEntryRequest,
+  AddDurableContextManifestEntryResult,
+  ContextManifestFileSystem,
+  InspectDurableContextManifestRequest,
+  InspectDurableContextManifestResult,
+  RefreshDurableContextManifestRequest,
+  RefreshDurableContextManifestResult,
+  FreezeDurableContextManifestRequest,
+  FreezeDurableContextManifestResult,
+  RemoveDurableContextManifestEntryRequest,
+  RemoveDurableContextManifestEntryResult,
   AdoptDurableTaskBaselineRequest,
   AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
@@ -248,6 +312,8 @@ export type {
   DiagnoseDurableTasksResult,
   RecoverDurableTaskRequest,
   RecoverDurableTaskResult,
+  ReadDurableTaskRequest,
+  ReadDurableTaskResult,
   TaskLifecycleDiagnostic,
   TaskLifecycleDiagnosticCode,
   TaskLifecycleDirectoryEntry,
@@ -271,6 +337,11 @@ export interface CoreContract {
   readonly validateContractRecord: typeof validateContractRecord;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
   readonly initializeManagedProject: typeof initializeManagedProject;
+  readonly createSpec: typeof createSpec;
+  readonly findImpactedSpecContexts: typeof findImpactedSpecContexts;
+  readonly listSpecs: typeof listSpecs;
+  readonly readSpec: typeof readSpec;
+  readonly validateSpecs: typeof validateSpecs;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -278,12 +349,19 @@ export interface CoreContract {
   readonly transitionWorkflow: typeof transitionWorkflow;
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
+  readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly createDurableTask: typeof createDurableTask;
   readonly advanceDurableTask: typeof advanceDurableTask;
+  readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
+  readonly refreshDurableContextManifest: typeof refreshDurableContextManifest;
+  readonly freezeDurableContextManifest: typeof freezeDurableContextManifest;
+  readonly removeDurableContextManifestEntry: typeof removeDurableContextManifestEntry;
   readonly recoverDurableTask: typeof recoverDurableTask;
+  readonly readDurableTask: typeof readDurableTask;
   readonly adoptDurableTaskBaseline: typeof adoptDurableTaskBaseline;
   readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
+  readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -298,6 +376,11 @@ export const coreContract: CoreContract = Object.freeze({
   validateContractRecord,
   diagnoseManagedProject,
   initializeManagedProject,
+  createSpec,
+  findImpactedSpecContexts,
+  listSpecs,
+  readSpec,
+  validateSpecs,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
@@ -305,10 +388,17 @@ export const coreContract: CoreContract = Object.freeze({
   transitionWorkflow,
   replayWorkflowEvents,
   adoptWorkflowBaseline,
+  recordContextManifestChange,
   createDurableTask,
   advanceDurableTask,
+  addDurableContextManifestEntry,
+  refreshDurableContextManifest,
+  freezeDurableContextManifest,
   recoverDurableTask,
+  removeDurableContextManifestEntry,
+  readDurableTask,
   adoptDurableTaskBaseline,
   diagnoseDurableTasks,
   withDurableTaskWriter,
+  inspectDurableContextManifest,
 });

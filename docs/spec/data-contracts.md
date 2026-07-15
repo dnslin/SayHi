@@ -199,6 +199,7 @@ Allowed trust values are:
 - `untrusted-reference`
 
 The manifest reader MUST preserve source boundaries during rendering. Content from `untrusted-reference` MUST be placed in data-only containers and MUST NOT be concatenated into an instruction block.
+An `approved-spec` entry MUST match the source path and content identity recorded in Core-maintained approved project state. A path, filename, heading, or unrecorded file under `.sayhi/spec/` MUST NOT assign instruction authority.
 
 ## 7. Repository Baseline and Fingerprint
 

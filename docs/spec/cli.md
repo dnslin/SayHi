@@ -106,20 +106,21 @@ No V1 command performs push, reset, stash, rebase, revert, or forced checkout.
 ### 4.4 Specifications and context
 
 ```text
+sayhi spec create <path> --from <source> --dry-run|--apply
 sayhi spec list
 sayhi spec show <path>
 sayhi spec validate [path]
 sayhi spec impacted <path>
 
 sayhi context list <task-id> [phase]
-sayhi context add <task-id> <phase> <source>
-sayhi context remove <task-id> <phase> <entry-id>
+sayhi context add <task-id> <phase> <source> --dry-run|--apply
+sayhi context remove <task-id> <phase> <entry-id> --dry-run|--apply
 sayhi context validate <task-id> [phase]
-sayhi context refresh <task-id> [phase]
-sayhi context freeze <task-id> <phase>
+sayhi context refresh <task-id> [phase] --dry-run|--apply [--accept-approved-spec-change]
+sayhi context freeze <task-id> <phase> --dry-run|--apply
 ```
 
-Context mutations produce a plan, validate trust assignment, and append Events. `refresh` recalculates identity but MUST NOT silently accept changed semantics; required Approved Spec changes require confirmation.
+Context mutations produce a plan with `--dry-run`, validate trust assignment, and append Events only with `--apply`. When omitted, `[phase]` resolves to the current Task Phase. `spec create --apply` records the created content identity as approved project state; a file placed manually under `.sayhi/spec/` is still an Untrusted Reference. `refresh` recalculates identity but MUST NOT silently accept changed semantics; changed Approved Spec content requires the scoped `--accept-approved-spec-change` confirmation flag.
 
 ### 4.5 Dependency graph
 

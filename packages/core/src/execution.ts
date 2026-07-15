@@ -1,9 +1,20 @@
-import { createHash } from "node:crypto";
 import {
   hashCanonicalJson,
   isContractIdentity,
   type ContractIdentity,
 } from "./identity.js";
+import {
+  contentMatchesIdentity,
+  validateContextManifestEntries,
+} from "./context-manifest.js";
+import type {
+  ContextInjectionMode,
+  ContextInstructionPolicy,
+  ContextManifestEntry,
+  ContextSource,
+  ContextTrustTier,
+  CurrentContextContent,
+} from "./context-manifest.js";
 
 import {
   DOMAIN_VALIDATION_CONTRACT_VERSION,
@@ -22,14 +33,16 @@ import {
 } from "./workflow.js";
 
 export const PHASE_EXECUTION_CONTRACT_VERSION = 1 as const;
+export type {
+  ContextInjectionMode,
+  ContextInstructionPolicy,
+  ContextManifestEntry,
+  ContextSource,
+  ContextTrustTier,
+  CurrentContextContent,
+} from "./context-manifest.js";
 
-export type ContextTrustTier =
-  | "engine-instruction"
-  | "approved-spec"
-  | "task-context"
-  | "untrusted-reference";
-export type ContextInjectionMode = "full" | "summary" | "pointer";
-export type ContextInstructionPolicy = "scoped-instruction" | "data-only";
+
 export type PhaseAgentRole =
   | "research"
   | "planning"
@@ -57,31 +70,6 @@ const phaseByAgentRole: Readonly<Record<PhaseAgentRole, WorkflowPhase>> =
     knowledge: "finish",
   });
 
-export interface ContextSource {
-  readonly type: string;
-  readonly value: string;
-}
-
-export interface ContextManifestEntry {
-  readonly schemaVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
-  readonly id: string;
-  readonly source: ContextSource;
-  readonly kind: string;
-  readonly reason: string;
-  readonly required: boolean;
-  readonly mode: ContextInjectionMode;
-  readonly trust: ContextTrustTier;
-  readonly instructionPolicy: ContextInstructionPolicy;
-  readonly scope: readonly string[];
-  readonly identity: ContentHash;
-  readonly addedBy: string;
-  readonly acceptedByEvent?: string;
-}
-
-export interface CurrentContextContent {
-  readonly source: ContextSource;
-  readonly content: string | Uint8Array;
-}
 
 export interface PhaseAgentContract {
   readonly schemaVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
@@ -478,23 +466,19 @@ function validateContextBinding(
     );
   }
 
-  const entryIds = new Set<string>();
-  for (let index = 0; index < request.manifest.length; index += 1) {
-    const entry = request.manifest[index];
-    if (entry === undefined) {
-      return failure(
-        "execution.context_invalid",
-        `$.manifest[${index}]`,
-        "Context Manifest cannot contain an empty entry.",
-        "Remove array gaps and provide a complete Context Entry.",
-      );
-    }
-    const entryFailure = validateContextManifestEntry(entry, index, entryIds);
-    if (entryFailure !== null) {
-      return entryFailure;
-    }
+  const manifest = validateContextManifestEntries(request.manifest);
+  if (!manifest.ok) {
+    const diagnostic = manifest.diagnostics[0]!;
+    return failure(
+      "execution.context_invalid",
+      `$.manifest${diagnostic.path.slice(1)}`,
+      diagnostic.message,
+      diagnostic.remediation,
+    );
+  }
+  for (let index = 0; index < manifest.entries.length; index += 1) {
     const freshnessFailure = validateRequiredContextEntry(
-      entry,
+      manifest.entries[index]!,
       index,
       request.currentContext,
     );
@@ -505,145 +489,6 @@ function validateContextBinding(
   return null;
 }
 
-function validateContextManifestEntry(
-  entry: ContextManifestEntry,
-  index: number,
-  entryIds: Set<string>,
-): PhaseExecutionFailure | null {
-  const path = `$.manifest[${index}]`;
-  if (entry.schemaVersion !== PHASE_EXECUTION_CONTRACT_VERSION) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.schemaVersion`,
-      "Context Manifest entry schema version is unsupported.",
-      "Regenerate the Manifest with entry schemaVersion 1.",
-    );
-  }
-  if (!isIdentifier(entry.id) || entryIds.has(entry.id)) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.id`,
-      "Context Manifest entry ID is invalid or duplicated.",
-      "Provide one unique non-empty ID per Context Entry.",
-    );
-  }
-  entryIds.add(entry.id);
-  if (
-    !isUnknownRecord(entry.source) ||
-    !isNonEmptyString(entry.source.type) ||
-    !isNonEmptyString(entry.source.value)
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.source`,
-      "Context Manifest entry source is invalid.",
-      "Provide a typed source with a non-empty value.",
-    );
-  }
-  if (
-    entry.source.type === "project-path" &&
-    !isRepositoryRelativePath(entry.source.value)
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.source.value`,
-      "Project-path Context source must stay inside the repository.",
-      "Use a normalized repository-relative path without dot segments.",
-    );
-  }
-  if (!isNonEmptyString(entry.kind) || !isNonEmptyString(entry.reason)) {
-    return failure(
-      "execution.context_invalid",
-      path,
-      "Context Manifest entry kind and reason are required.",
-      "Describe the Context Entry kind and why the Phase needs it.",
-    );
-  }
-  if (typeof entry.required !== "boolean") {
-    return failure(
-      "execution.context_invalid",
-      `${path}.required`,
-      "Context Manifest entry required flag must be boolean.",
-      "Set required to true or false.",
-    );
-  }
-  if (entry.mode !== "full" && entry.mode !== "summary" && entry.mode !== "pointer") {
-    return failure(
-      "execution.context_invalid",
-      `${path}.mode`,
-      "Context Manifest entry has an unsupported injection mode.",
-      "Use full, summary, or pointer.",
-    );
-  }
-  if (!isContextTrustTier(entry.trust)) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.trust`,
-      "Context Manifest entry has an unsupported Trust Tier.",
-      "Use engine-instruction, approved-spec, task-context, or untrusted-reference.",
-    );
-  }
-  if (
-    entry.instructionPolicy !== "scoped-instruction" &&
-    entry.instructionPolicy !== "data-only"
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.instructionPolicy`,
-      "Context Manifest entry has an unsupported instruction policy.",
-      "Use scoped-instruction or data-only.",
-    );
-  }
-  if (
-    (entry.trust === "task-context" || entry.trust === "untrusted-reference") &&
-    entry.instructionPolicy !== "data-only"
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.instructionPolicy`,
-      "Only Engine Instruction and Approved Spec entries may carry instruction authority.",
-      "Set instructionPolicy to data-only for Task Context and Untrusted Reference entries.",
-    );
-  }
-  if (
-    !Array.isArray(entry.scope) ||
-    !entry.scope.every((scope) => isRepositoryRelativePath(scope))
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.scope`,
-      "Context Manifest entry scope must contain repository-relative patterns.",
-      "Use '/' paths without absolute roots, backslashes, or '..' traversal.",
-    );
-  }
-  if (
-    !validateDomainValue({
-      contractVersion: DOMAIN_VALIDATION_CONTRACT_VERSION,
-      kind: "contentHash",
-      value: entry.identity,
-    }).ok
-  ) {
-    return failure(
-      "execution.context_invalid",
-      `${path}.identity`,
-      "Context Manifest entry content identity is invalid.",
-      "Use a supported SHA-256 content identity with a 64-character hexadecimal digest.",
-    );
-  }
-  if (
-    !isIdentifier(entry.addedBy) ||
-    (entry.acceptedByEvent !== undefined &&
-      !isIdentifier(entry.acceptedByEvent))
-  ) {
-    return failure(
-      "execution.context_invalid",
-      path,
-      "Context Manifest entry provenance is invalid.",
-      "Provide valid addedBy and optional acceptedByEvent identifiers.",
-    );
-  }
-  return null;
-}
 
 function validateRequiredContextEntry(
   entry: ContextManifestEntry,
@@ -983,36 +828,6 @@ function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
 
 
 
-function contentMatchesIdentity(
-  content: string | Uint8Array,
-  identity: ContentHash,
-): boolean {
-  const digest = createHash("sha256")
-    .update(contentBytes(content, identity.algorithm))
-    .digest("hex");
-  return digest.toLowerCase() === identity.digest.toLowerCase();
-}
-
-function contentBytes(
-  content: string | Uint8Array,
-  algorithm: ContentHashAlgorithm,
-): string | Uint8Array {
-  if (algorithm === "sha256-bytes-v1") {
-    return content;
-  }
-  const text = typeof content === "string" ? content : new TextDecoder().decode(content);
-  return text.replace(/\r\n?/gu, "\n");
-}
-
-
-function isContextTrustTier(value: unknown): value is ContextTrustTier {
-  return (
-    value === "engine-instruction" ||
-    value === "approved-spec" ||
-    value === "task-context" ||
-    value === "untrusted-reference"
-  );
-}
 
 
 

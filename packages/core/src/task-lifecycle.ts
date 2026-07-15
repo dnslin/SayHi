@@ -1,4 +1,4 @@
-import { stableJson } from "./identity.js";
+import { hashCanonicalJson, stableJson } from "./identity.js";
 import {
   RECORD_CONTRACT_VERSION,
   validateContractRecord,
@@ -9,13 +9,29 @@ import type {
   ManagedProjectPathKind,
 } from "./managed-project.js";
 import {
+  contentMatchesIdentity,
+  hashTextContent,
+  parseContextManifest,
+  serializeContextManifest,
+  type ContextManifestDiagnostic,
+  type ContextManifestEntry,
+  type ContextTrustTier,
+} from "./context-manifest.js";
+import {
+  approveSpec,
+  isApprovedSpec,
+  readApprovedSpecs,
+} from "./spec-approval.js";
+import {
   adoptWorkflowBaseline,
   isRepositoryRelativePath,
   replayWorkflowEvents,
   startWorkflowTask,
+  recordContextManifestChange,
   transitionWorkflow,
   type BaselineAdoptedEvent,
   type StartWorkflowTaskRequest,
+  type ContextManifestChangedEvent,
   type TaskCreatedEvent,
   type TaskProjection,
   type TaskScope,
@@ -26,6 +42,7 @@ import {
   type WorkflowEventMetadata,
   type WorkflowState,
   type WorkflowTransitionedEvent,
+  type WorkflowPhase,
 } from "./workflow.js";
 
 export const TASK_LIFECYCLE_CONTRACT_VERSION = 1 as const;
@@ -45,6 +62,10 @@ export interface TaskLifecycleFileSystem extends ManagedProjectFileSystem {
     operation: () => Promise<Result>,
   ): Promise<Result>;
 }
+export interface ContextManifestFileSystem extends TaskLifecycleFileSystem {
+  readRepositoryFile(path: string): Promise<string>;
+}
+
 
 export interface TaskBaselineCaptureRequest {
   readonly taskId: string;
@@ -77,7 +98,14 @@ export type TaskLifecycleDiagnosticCode =
   | "task_lifecycle.baseline.adoption_required"
   | "task_lifecycle.baseline.drift"
   | "task_lifecycle.writer.scope"
-  | "task_lifecycle.writer.unavailable";
+  | "task_lifecycle.writer.unavailable"
+  | "context_manifest.missing"
+  | "context_manifest.invalid"
+  | "context_manifest.source.unreadable"
+  | "context_manifest.source.duplicate"
+  | "context_manifest.approval_required"
+  | "context_manifest.entry.missing"
+  | "context_manifest.stale";
 
 export interface TaskLifecycleDiagnostic {
   readonly code: TaskLifecycleDiagnosticCode;
@@ -100,6 +128,11 @@ export interface RecoverDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly taskId: string;
 }
+export interface ReadDurableTaskRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+}
+
 
 export interface DiagnoseDurableTasksRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
@@ -119,6 +152,51 @@ export interface WithDurableTaskWriterRequest<Value> {
   readonly expectedVersion: number;
   readonly operation: (writer: TaskWriter) => Promise<Value>;
 }
+export interface AddDurableContextManifestEntryRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly source: string;
+  readonly event: WorkflowEventMetadata;
+  readonly persist?: boolean;
+}
+
+export interface InspectDurableContextManifestRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly phase: WorkflowPhase;
+}
+export interface RefreshDurableContextManifestRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly acceptRequiredApprovedSpecChanges: boolean;
+  readonly event: WorkflowEventMetadata;
+  readonly persist?: boolean;
+}
+export interface FreezeDurableContextManifestRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly event: WorkflowEventMetadata;
+  readonly persist?: boolean;
+}
+
+export interface RemoveDurableContextManifestEntryRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly entryId: string;
+  readonly event: WorkflowEventMetadata;
+  readonly persist?: boolean;
+}
+
+
+
 
 
 interface TaskLifecycleFailure {
@@ -165,6 +243,73 @@ export type WithDurableTaskWriterResult<Value> =
       changedPaths: readonly string[];
     }>
   | TaskLifecycleFailure;
+export type AddDurableContextManifestEntryResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: ContextManifestChangedEvent;
+      entry: ContextManifestEntry;
+      planned: boolean;
+    }>
+  | TaskLifecycleFailure;
+export type RefreshDurableContextManifestResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: ContextManifestChangedEvent;
+      entries: readonly ContextManifestEntry[];
+      planned: boolean;
+    }>
+  | TaskLifecycleFailure;
+export type FreezeDurableContextManifestResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: ContextManifestChangedEvent;
+      entries: readonly ContextManifestEntry[];
+      planned: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+export type RemoveDurableContextManifestEntryResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: ContextManifestChangedEvent;
+      entries: readonly ContextManifestEntry[];
+      planned: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+
+
+export type InspectDurableContextManifestResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: "valid" | "stale";
+      entries: readonly ContextManifestEntry[];
+      diagnostics: readonly ContextManifestDiagnostic[];
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: "missing" | "invalid";
+      diagnostics: readonly ContextManifestDiagnostic[];
+    }>;
+export type ReadDurableTaskResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+    }>
+  | TaskLifecycleFailure;
+
+
 
 export type RecoverDurableTaskResult =
   | Readonly<{
@@ -331,6 +476,163 @@ export async function withDurableTaskWriter<Value>(
     return writerUnavailable();
   }
 }
+export async function readDurableTask(
+  request: ReadDurableTaskRequest,
+): Promise<ReadDurableTaskResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  return loaded.ok
+    ? Object.freeze({
+        ok: true,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        state: loaded.state,
+      })
+    : loaded;
+}
+
+export async function addDurableContextManifestEntry(
+  request: AddDurableContextManifestEntryRequest,
+): Promise<AddDurableContextManifestEntryResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      addDurableContextManifestEntryLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+export async function refreshDurableContextManifest(
+  request: RefreshDurableContextManifestRequest,
+): Promise<RefreshDurableContextManifestResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      refreshDurableContextManifestLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+export async function freezeDurableContextManifest(
+  request: FreezeDurableContextManifestRequest,
+): Promise<FreezeDurableContextManifestResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      freezeDurableContextManifestLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+
+export async function removeDurableContextManifestEntry(
+  request: RemoveDurableContextManifestEntryRequest,
+): Promise<RemoveDurableContextManifestEntryResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      removeDurableContextManifestEntryLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+
+
+
+export async function inspectDurableContextManifest(
+  request: InspectDurableContextManifestRequest,
+): Promise<InspectDurableContextManifestResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return Object.freeze({
+      ok: false,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: "invalid",
+      diagnostics: Object.freeze(
+        loaded.diagnostics.map((item) =>
+          contextManifestDiagnostic(item.path, item.message, item.remediation),
+        ),
+      ),
+    });
+  }
+  const reference = loaded.state.projection.contexts[request.phase];
+  if (reference === undefined) {
+    return missingContextManifest(`context/${request.phase}.jsonl`);
+  }
+  const path = `.sayhi/tasks/${request.taskId}/${reference}`;
+  try {
+    if ((await request.fileSystem.inspect(path)).kind !== "file") {
+      return missingContextManifest(path);
+    }
+    const parsed = parseContextManifest(await request.fileSystem.readFile(path));
+    if (!parsed.ok) {
+      return invalidContextManifest(parsed.diagnostics);
+    }
+    const approvalDiagnostics = await approvedSpecBindingDiagnostics(
+      request.fileSystem,
+      parsed.entries,
+    );
+    if (approvalDiagnostics.length > 0) {
+      return invalidContextManifest(approvalDiagnostics);
+    }
+    const diagnostics: ContextManifestDiagnostic[] = [];
+    for (const entry of parsed.entries) {
+      if (entry.source.type !== "project-path") {
+        continue;
+      }
+      try {
+        const content = await request.fileSystem.readRepositoryFile(entry.source.value);
+        if (!contentMatchesIdentity(content, entry.identity)) {
+          diagnostics.push(
+            contextManifestDiagnostic(
+              entry.source.value,
+              "Context Manifest content no longer matches its identity.",
+              "Restore the source or refresh the phase Manifest before dispatch.",
+            ),
+          );
+        }
+      } catch {
+        diagnostics.push(
+          contextManifestDiagnostic(
+            entry.source.value,
+            "Required Context Manifest content is missing.",
+            "Restore the required source or refresh and approve the phase Manifest.",
+          ),
+        );
+      }
+    }
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: diagnostics.length === 0 ? "valid" : "stale",
+      entries: parsed.entries,
+      diagnostics: Object.freeze(diagnostics),
+    });
+  } catch {
+    return invalidContextManifest([
+      contextManifestDiagnostic(
+        path,
+        "Context Manifest could not be inspected safely.",
+        "Repair the Context Manifest file and retry inspection.",
+      ),
+    ]);
+  }
+}
+
 
 
 async function createDurableTaskLocked(
@@ -382,6 +684,583 @@ async function createDurableTaskLocked(
     return ioFailure(activePath);
   }
 }
+async function addDurableContextManifestEntryLocked(
+  request: AddDurableContextManifestEntryRequest,
+  paths: TaskPaths,
+): Promise<AddDurableContextManifestEntryResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const manifest = await loadContextManifestForMutation(
+    request.fileSystem,
+    paths,
+    loaded.state.projection,
+    request.phase,
+  );
+  if (!manifest.ok) {
+    return manifest;
+  }
+  const { entries, manifestPath, manifestReference } = manifest;
+  if (!isRepositoryRelativePath(request.source)) {
+    return contextLifecycleFailure(
+      "context_manifest.source.unreadable",
+      request.source,
+      "Context source must be a repository-relative path.",
+      "Use a normalized path without absolute roots, backslashes, or '..' traversal.",
+    );
+  }
+  let content: string;
+  try {
+    content = await request.fileSystem.readRepositoryFile(request.source);
+  } catch {
+    return contextLifecycleFailure(
+      "context_manifest.source.unreadable",
+      request.source,
+      "Context source is missing, unreadable, or unsafe.",
+      "Restore a regular repository file at the requested source path.",
+    );
+  }
+  if (entries.some((entry) => entry.source.value === request.source)) {
+    return contextLifecycleFailure(
+      "context_manifest.source.duplicate",
+      request.source,
+      "Context source is already bound to this Manifest.",
+      "Use context refresh for the existing entry or choose a different source.",
+    );
+  }
+  const identity = hashTextContent(content);
+  let approvedSpec = false;
+  if (request.source.startsWith(".sayhi/spec/")) {
+    const approvals = await readApprovedSpecs(request.fileSystem);
+    if (approvals.ok === false) {
+      const diagnostic = approvals.diagnostics[0]!;
+      return contextLifecycleFailure(
+        "context_manifest.invalid",
+        diagnostic.path,
+        diagnostic.message,
+        diagnostic.remediation,
+      );
+    }
+    approvedSpec = isApprovedSpec(approvals.approvals, request.source, identity);
+  }
+  const trust: ContextTrustTier = approvedSpec
+    ? "approved-spec"
+    : request.source.startsWith(`${paths.taskDirectory}/`)
+      ? "task-context"
+      : "untrusted-reference";
+  const entry = Object.freeze({
+    schemaVersion: 1 as const,
+    id: `CTX-${request.phase}-${hashCanonicalJson({ phase: request.phase, source: request.source }).slice(7, 19)}`,
+    source: Object.freeze({ type: "project-path", value: request.source }),
+    kind: trust === "approved-spec" ? "spec" : "reference",
+    reason: "Selected through the SayHi CLI.",
+    required: true,
+    mode: "full" as const,
+    trust,
+    instructionPolicy:
+      trust === "approved-spec" ? "scoped-instruction" : "data-only",
+    scope: Object.freeze(["**/*"]),
+    identity,
+    addedBy: "sayhi-cli",
+  }) satisfies ContextManifestEntry;
+  const nextEntries = Object.freeze([...entries, entry]);
+  const changed = recordContextManifestChange(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: request.expectedVersion,
+    phase: request.phase,
+    manifestPath: manifestReference,
+    manifestIdentity: hashCanonicalJson(nextEntries),
+    change: "added",
+    event: request.event,
+  });
+  if (!changed.ok) {
+    return failure(changed.diagnostics);
+  }
+  const persisted = await persistContextManifestChange({
+    fileSystem: request.fileSystem,
+    paths,
+    manifestPath,
+    entries: nextEntries,
+    previousEventCount: loaded.state.events.length,
+    state: changed.state,
+    event: changed.event,
+    persist: request.persist ?? true,
+  });
+  if (persisted !== null) {
+    return persisted;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: changed.state,
+    event: changed.event,
+    entry,
+    planned: request.persist === false,
+  });
+}
+async function refreshDurableContextManifestLocked(
+  request: RefreshDurableContextManifestRequest,
+  paths: TaskPaths,
+): Promise<RefreshDurableContextManifestResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const manifest = await loadContextManifestForMutation(
+    request.fileSystem,
+    paths,
+    loaded.state.projection,
+    request.phase,
+    request.acceptRequiredApprovedSpecChanges,
+  );
+  if (!manifest.ok) {
+    return manifest;
+  }
+  const approvals = manifest.entries.some(
+    (entry) => entry.trust === "approved-spec",
+  )
+    ? await readApprovedSpecs(request.fileSystem)
+    : null;
+  if (approvals !== null && approvals.ok === false) {
+    const diagnostic = approvals.diagnostics[0]!;
+    return contextLifecycleFailure(
+      "context_manifest.invalid",
+      diagnostic.path,
+      diagnostic.message,
+      diagnostic.remediation,
+    );
+  }
+  let approvalRequired = false;
+  const approvedSpecUpdates: ContextManifestEntry[] = [];
+  const nextEntries: ContextManifestEntry[] = [];
+  for (const entry of manifest.entries) {
+    if (entry.source.type !== "project-path") {
+      return contextLifecycleFailure(
+        "context_manifest.source.unreadable",
+        entry.source.value,
+        "Only repository-path Context sources can be refreshed through the CLI.",
+        "Restore the source as a project-path entry or remove it from the Manifest.",
+      );
+    }
+    let content: string;
+    try {
+      content = await request.fileSystem.readRepositoryFile(entry.source.value);
+    } catch {
+      return contextLifecycleFailure(
+        "context_manifest.stale",
+        entry.source.value,
+        "Context source is missing, unreadable, or unsafe.",
+        "Restore the source before refreshing the Context Manifest.",
+      );
+    }
+    const identity = hashTextContent(content);
+    const approvedSpecChanged =
+      entry.trust === "approved-spec" &&
+      (!contentMatchesIdentity(content, entry.identity) ||
+        (approvals !== null &&
+          isApprovedSpec(approvals.approvals, entry.source.value, identity) === false));
+    approvalRequired ||= approvedSpecChanged;
+    const nextEntry = Object.freeze({
+      ...entry,
+      identity,
+      ...(approvedSpecChanged && request.acceptRequiredApprovedSpecChanges
+        ? { acceptedByEvent: request.event.eventId }
+        : {}),
+    });
+    if (approvedSpecChanged && request.acceptRequiredApprovedSpecChanges) {
+      approvedSpecUpdates.push(nextEntry);
+    }
+    nextEntries.push(nextEntry);
+  }
+  if (approvalRequired && !request.acceptRequiredApprovedSpecChanges) {
+    return contextLifecycleFailure(
+      "context_manifest.approval_required",
+      manifest.manifestPath,
+      "Refreshing changed Approved Spec content requires explicit approval.",
+      "Review the changed Spec, then retry with explicit approval for this refresh.",
+    );
+  }
+  const frozenEntries = Object.freeze(nextEntries);
+  const changed = recordContextManifestChange(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: request.expectedVersion,
+    phase: request.phase,
+    manifestPath: manifest.manifestReference,
+    manifestIdentity: hashCanonicalJson(frozenEntries),
+    change: "refreshed",
+    event: request.event,
+  });
+  if (!changed.ok) {
+    return failure(changed.diagnostics);
+  }
+  const persisted = await persistContextManifestChange({
+    fileSystem: request.fileSystem,
+    paths,
+    manifestPath: manifest.manifestPath,
+    entries: frozenEntries,
+    previousEventCount: loaded.state.events.length,
+    state: changed.state,
+    event: changed.event,
+    persist: request.persist ?? true,
+  });
+  if (persisted !== null) {
+    return persisted;
+  }
+  if (request.persist !== false) {
+    for (const entry of approvedSpecUpdates) {
+      const approval = await approveSpec(request.fileSystem, {
+        path: entry.source.value,
+        identity: entry.identity,
+        approvedBy: "sayhi-context-refresh",
+      });
+      if (approval.ok === false) {
+        const diagnostic = approval.diagnostics[0]!;
+        return contextLifecycleFailure(
+          "context_manifest.invalid",
+          diagnostic.path,
+          diagnostic.message,
+          diagnostic.remediation,
+        );
+      }
+    }
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: changed.state,
+    event: changed.event,
+    entries: frozenEntries,
+    planned: request.persist === false,
+  });
+}
+async function freezeDurableContextManifestLocked(
+  request: FreezeDurableContextManifestRequest,
+  paths: TaskPaths,
+): Promise<FreezeDurableContextManifestResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const manifest = await loadContextManifestForMutation(
+    request.fileSystem,
+    paths,
+    loaded.state.projection,
+    request.phase,
+  );
+  if (!manifest.ok) {
+    return manifest;
+  }
+  for (const entry of manifest.entries) {
+    if (!entry.required || entry.source.type !== "project-path") {
+      continue;
+    }
+    let content: string;
+    try {
+      content = await request.fileSystem.readRepositoryFile(entry.source.value);
+    } catch {
+      return contextLifecycleFailure(
+        "context_manifest.stale",
+        entry.source.value,
+        "Required Context Manifest content is missing.",
+        "Restore the source or remove the Context Entry before freezing.",
+      );
+    }
+    if (!contentMatchesIdentity(content, entry.identity)) {
+      return contextLifecycleFailure(
+        "context_manifest.stale",
+        entry.source.value,
+        "Required Context Manifest content no longer matches its identity.",
+        "Refresh and approve the phase Manifest before freezing.",
+      );
+    }
+  }
+  const entries = Object.freeze(
+    manifest.entries.map((entry) =>
+      Object.freeze({ ...entry, acceptedByEvent: request.event.eventId }),
+    ),
+  );
+  const changed = recordContextManifestChange(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: request.expectedVersion,
+    phase: request.phase,
+    manifestPath: manifest.manifestReference,
+    manifestIdentity: hashCanonicalJson(entries),
+    change: "frozen",
+    event: request.event,
+  });
+  if (!changed.ok) {
+    return failure(changed.diagnostics);
+  }
+  const persisted = await persistContextManifestChange({
+    fileSystem: request.fileSystem,
+    paths,
+    manifestPath: manifest.manifestPath,
+    entries,
+    previousEventCount: loaded.state.events.length,
+    state: changed.state,
+    event: changed.event,
+    persist: request.persist ?? true,
+  });
+  if (persisted !== null) {
+    return persisted;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: changed.state,
+    event: changed.event,
+    entries,
+    planned: request.persist === false,
+  });
+}
+
+async function removeDurableContextManifestEntryLocked(
+  request: RemoveDurableContextManifestEntryRequest,
+  paths: TaskPaths,
+): Promise<RemoveDurableContextManifestEntryResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const manifest = await loadContextManifestForMutation(
+    request.fileSystem,
+    paths,
+    loaded.state.projection,
+    request.phase,
+  );
+  if (!manifest.ok) {
+    return manifest;
+  }
+  if (!manifest.entries.some((entry) => entry.id === request.entryId)) {
+    return contextLifecycleFailure(
+      "context_manifest.entry.missing",
+      request.entryId,
+      "Context Manifest does not contain the requested Entry ID.",
+      "List the Manifest entries and retry with an existing Entry ID.",
+    );
+  }
+  const entries = Object.freeze(
+    manifest.entries.filter((entry) => entry.id !== request.entryId),
+  );
+  const changed = recordContextManifestChange(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: request.expectedVersion,
+    phase: request.phase,
+    manifestPath: manifest.manifestReference,
+    manifestIdentity: hashCanonicalJson(entries),
+    change: "removed",
+    event: request.event,
+  });
+  if (!changed.ok) {
+    return failure(changed.diagnostics);
+  }
+  const persisted = await persistContextManifestChange({
+    fileSystem: request.fileSystem,
+    paths,
+    manifestPath: manifest.manifestPath,
+    entries,
+    previousEventCount: loaded.state.events.length,
+    state: changed.state,
+    event: changed.event,
+    persist: request.persist ?? true,
+  });
+  if (persisted !== null) {
+    return persisted;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: changed.state,
+    event: changed.event,
+    entries,
+    planned: request.persist === false,
+  });
+}
+
+
+interface LoadedContextManifest {
+  readonly ok: true;
+  readonly entries: readonly ContextManifestEntry[];
+  readonly manifestPath: string;
+  readonly manifestReference: string;
+}
+
+async function loadContextManifestForMutation(
+  fileSystem: ContextManifestFileSystem,
+  paths: TaskPaths,
+  projection: TaskProjection,
+  phase: WorkflowPhase,
+  allowApprovalMismatch = false,
+): Promise<LoadedContextManifest | TaskLifecycleFailure> {
+  const manifestReference =
+    projection.contexts[phase] ?? `context/${phase}.jsonl`;
+  if (manifestReference !== `context/${phase}.jsonl`) {
+    return contextLifecycleFailure(
+      "context_manifest.invalid",
+      manifestReference,
+      "Context Manifest pointer does not match its Task Phase.",
+      "Restore the Task-local context/<phase>.jsonl pointer before changing Context.",
+    );
+  }
+  const manifestPath = `${paths.taskDirectory}/${manifestReference}`;
+  try {
+    const entry = await fileSystem.inspect(manifestPath);
+    if (entry.kind === "missing") {
+      return Object.freeze({
+        ok: true,
+        entries: Object.freeze([]),
+        manifestPath,
+        manifestReference,
+      });
+    }
+    if (entry.kind !== "file") {
+      return contextLifecycleFailure(
+        "context_manifest.invalid",
+        manifestPath,
+        "Context Manifest path is not a regular file.",
+        "Replace the unsafe path with the Task-local Context Manifest file.",
+      );
+    }
+    const parsed = parseContextManifest(await fileSystem.readFile(manifestPath));
+    if (!parsed.ok) {
+      return contextLifecycleFailure(
+        "context_manifest.invalid",
+        manifestPath,
+        parsed.diagnostics[0]!.message,
+        parsed.diagnostics[0]!.remediation,
+      );
+    }
+    const approvalDiagnostics = await approvedSpecBindingDiagnostics(
+      fileSystem,
+      parsed.entries,
+    );
+    if (approvalDiagnostics.length > 0 && !allowApprovalMismatch) {
+      const diagnostic = approvalDiagnostics[0]!;
+      return contextLifecycleFailure(
+        "context_manifest.invalid",
+        diagnostic.path,
+        diagnostic.message,
+        diagnostic.remediation,
+      );
+    }
+    return Object.freeze({
+      ok: true,
+      entries: parsed.entries,
+      manifestPath,
+      manifestReference,
+    });
+  } catch {
+    return ioFailure(manifestPath);
+  }
+}
+async function approvedSpecBindingDiagnostics(
+  fileSystem: ContextManifestFileSystem,
+  entries: readonly ContextManifestEntry[],
+): Promise<readonly ContextManifestDiagnostic[]> {
+  const approvedEntries = entries.filter(
+    (entry) => entry.trust === "approved-spec",
+  );
+  if (approvedEntries.length === 0) {
+    return Object.freeze([]);
+  }
+  const approvals = await readApprovedSpecs(fileSystem);
+  if (approvals.ok === false) {
+    return Object.freeze(
+      approvals.diagnostics.map((diagnostic) =>
+        contextManifestDiagnostic(
+          diagnostic.path,
+          diagnostic.message,
+          diagnostic.remediation,
+        ),
+      ),
+    );
+  }
+  const diagnostics = approvedEntries.flatMap((entry) => {
+    if (entry.source.type !== "project-path") {
+      return [
+        contextManifestDiagnostic(
+          entry.id,
+          "Approved Spec Context must reference a repository file.",
+          "Replace the entry with an explicitly approved repository Spec.",
+        ),
+      ];
+    }
+    if (isApprovedSpec(approvals.approvals, entry.source.value, entry.identity)) {
+      return [];
+    }
+    return [
+      contextManifestDiagnostic(
+        entry.source.value,
+        "Approved Spec Context is not bound to an approved current content identity.",
+        "Create the Spec through SayHi or explicitly refresh its changed content with approval.",
+      ),
+    ];
+  });
+  return Object.freeze(diagnostics);
+}
+
+
+interface PersistContextManifestChangeRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly paths: TaskPaths;
+  readonly manifestPath: string;
+  readonly entries: readonly ContextManifestEntry[];
+  readonly previousEventCount: number;
+  readonly state: WorkflowState;
+  readonly event: ContextManifestChangedEvent;
+  readonly persist: boolean;
+}
+
+async function persistContextManifestChange(
+  request: PersistContextManifestChangeRequest,
+): Promise<TaskLifecycleFailure | null> {
+  try {
+    const contextDirectory = `${request.paths.taskDirectory}/context`;
+    const directory = await request.fileSystem.inspect(contextDirectory);
+    if (directory.kind === "missing") {
+      if (request.persist) {
+        await request.fileSystem.createDirectory(contextDirectory);
+      }
+    } else if (directory.kind !== "directory") {
+      return contextLifecycleFailure(
+        "context_manifest.invalid",
+        contextDirectory,
+        "Task Context directory is unavailable.",
+        "Replace the unsafe path with a directory before changing Context.",
+      );
+    }
+    if (request.persist === false) {
+      return null;
+    }
+    if (request.state.events.length > request.previousEventCount) {
+      await request.fileSystem.appendFile(
+        request.paths.eventsPath,
+        serializeEvent(request.event),
+      );
+    }
+    await request.fileSystem.writeFile(
+      request.manifestPath,
+      serializeContextManifest(request.entries),
+    );
+    if (request.state.events.length > request.previousEventCount) {
+      await writeProjectionIfChanged(
+        request.fileSystem,
+        request.paths.projectionPath,
+        request.state.projection,
+      );
+    }
+    return null;
+  } catch {
+    return ioFailure(request.manifestPath);
+  }
+}
+
+
 
 async function advanceDurableTaskLocked(
   request: AdvanceDurableTaskRequest,
@@ -628,6 +1507,58 @@ function ioDiagnostic(path: string): TaskLifecycleDiagnostic {
     "Inspect the Project Store path and permissions, then retry diagnosis.",
   );
 }
+function contextLifecycleFailure(
+  code: Extract<
+    TaskLifecycleDiagnosticCode,
+    | "context_manifest.missing"
+    | "context_manifest.invalid"
+    | "context_manifest.source.unreadable"
+    | "context_manifest.source.duplicate"
+    | "context_manifest.approval_required"
+    | "context_manifest.entry.missing"
+    | "context_manifest.stale"
+  >,
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([diagnostic(code, path, message, remediation)]);
+}
+
+function contextManifestDiagnostic(
+  path: string,
+  message: string,
+  remediation: string,
+): ContextManifestDiagnostic {
+  return Object.freeze({ path, message, remediation });
+}
+
+function missingContextManifest(path: string): InspectDurableContextManifestResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: "missing",
+    diagnostics: Object.freeze([
+      contextManifestDiagnostic(
+        path,
+        "Context Manifest is missing.",
+        "Add or restore the Context Manifest for this Task Phase.",
+      ),
+    ]),
+  });
+}
+
+function invalidContextManifest(
+  diagnostics: readonly ContextManifestDiagnostic[],
+): InspectDurableContextManifestResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: "invalid",
+    diagnostics: Object.freeze([...diagnostics]),
+  });
+}
+
 
 async function loadTask(
   fileSystem: TaskLifecycleFileSystem,
