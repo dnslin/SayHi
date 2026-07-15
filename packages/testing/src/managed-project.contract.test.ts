@@ -50,6 +50,7 @@ class MemoryManagedProjectFileSystem implements ManagedProjectMutationFileSystem
   readonly symlinks = new Set<string>();
   readonly writes: string[] = [];
   #failOncePath: string | null = null;
+  sharedWriterLockCalls = 0;
 
   failOnce(path: string): void {
     this.#failOncePath = path;
@@ -93,6 +94,13 @@ class MemoryManagedProjectFileSystem implements ManagedProjectMutationFileSystem
   async removeFile(path: string): Promise<void> {
     this.files.delete(path);
     this.writes.push(path);
+  }
+
+  async withSharedCheckoutWriterLock<Result>(
+    operation: () => Promise<Result>,
+  ): Promise<Result> {
+    this.sharedWriterLockCalls += 1;
+    return operation();
   }
 }
 
@@ -251,6 +259,7 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
 
   assert.equal(applied.ok, true);
   assert.equal(applied.state, "applied");
+  assert.equal(fileSystem.sharedWriterLockCalls, 1);
   assert.equal(
     fileSystem.files.get(".sayhi/.gitignore"),
     NEXT_RUNTIME_IGNORE_CONTENT,

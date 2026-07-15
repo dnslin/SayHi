@@ -11,15 +11,18 @@ import {
 } from "./managed-project.js";
 import {
   readRouteDefinition,
+  adoptWorkflowBaseline,
   replayWorkflowEvents,
   startWorkflowTask,
   transitionWorkflow,
 } from "./workflow.js";
 import {
   advanceDurableTask,
+  adoptDurableTaskBaseline,
   createDurableTask,
   diagnoseDurableTasks,
   recoverDurableTask,
+  withDurableTaskWriter,
 } from "./task-lifecycle.js";
 
 export {
@@ -31,6 +34,7 @@ export type {
   AgentResultRecord,
   BaselineRecord,
   BaselineUntrackedFile,
+  BaselineDirtyPath,
   ContractRecord,
   ContractRecordDiagnostic,
   ContractRecordDiagnosticCode,
@@ -177,6 +181,7 @@ export type {
 
 export {
   WORKFLOW_CONTRACT_VERSION,
+  adoptWorkflowBaseline,
   readRouteDefinition,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -191,6 +196,10 @@ export type {
   GateEvidence,
   GateEvidenceKind,
   ReplayWorkflowEventsResult,
+  AdoptWorkflowBaselineRequest,
+  AdoptWorkflowBaselineResult,
+  BaselineAdoptedEvent,
+  BaselineAdoptedPath,
   RouteDefinition,
   StartWorkflowTaskRequest,
   StartWorkflowTaskResult,
@@ -222,12 +231,16 @@ export type {
 export {
   TASK_LIFECYCLE_CONTRACT_VERSION,
   advanceDurableTask,
+  adoptDurableTaskBaseline,
   createDurableTask,
   diagnoseDurableTasks,
   recoverDurableTask,
+  withDurableTaskWriter,
 } from "./task-lifecycle.js";
 export type {
   AdvanceDurableTaskRequest,
+  AdoptDurableTaskBaselineRequest,
+  AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
   CreateDurableTaskRequest,
   CreateDurableTaskResult,
@@ -239,6 +252,11 @@ export type {
   TaskLifecycleDiagnosticCode,
   TaskLifecycleDirectoryEntry,
   TaskLifecycleFileSystem,
+  TaskBaselineCaptureRequest,
+  TaskBaselineFileSystem,
+  TaskWriter,
+  WithDurableTaskWriterRequest,
+  WithDurableTaskWriterResult,
 } from "./task-lifecycle.js";
 
 export interface BootstrapContract {
@@ -259,10 +277,13 @@ export interface CoreContract {
   readonly startWorkflowTask: typeof startWorkflowTask;
   readonly transitionWorkflow: typeof transitionWorkflow;
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
+  readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly createDurableTask: typeof createDurableTask;
   readonly advanceDurableTask: typeof advanceDurableTask;
   readonly recoverDurableTask: typeof recoverDurableTask;
+  readonly adoptDurableTaskBaseline: typeof adoptDurableTaskBaseline;
   readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
+  readonly withDurableTaskWriter: typeof withDurableTaskWriter;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -283,8 +304,11 @@ export const coreContract: CoreContract = Object.freeze({
   startWorkflowTask,
   transitionWorkflow,
   replayWorkflowEvents,
+  adoptWorkflowBaseline,
   createDurableTask,
   advanceDurableTask,
   recoverDurableTask,
+  adoptDurableTaskBaseline,
   diagnoseDurableTasks,
+  withDurableTaskWriter,
 });

@@ -30,6 +30,12 @@ const BASELINE_RECORD = {
     },
   ],
   submodulesDigest: `sha256:${"5".repeat(64)}`,
+  dirtyPaths: [
+    {
+      path: "notes.txt",
+      identity: `sha256:${"6".repeat(64)}`,
+    },
+  ],
   adoptedPaths: ["notes.txt"],
   declaredScope: {
     files: ["packages/testing/**"],
@@ -635,6 +641,15 @@ test("Core rejects malformed Baseline, Lease, Agent result, Evidence, and projec
       record: { ...BASELINE_RECORD, head: "short" },
       code: "record_contract.baseline.invalid",
       path: "$.record.head",
+    },
+    {
+      kind: "baseline",
+      record: {
+        ...BASELINE_RECORD,
+        dirtyPaths: [{ path: "notes.txt", identity: "unversioned" }],
+      },
+      code: "record_contract.baseline.invalid",
+      path: "$.record.dirtyPaths[0].identity",
     },
     {
       kind: "lease",

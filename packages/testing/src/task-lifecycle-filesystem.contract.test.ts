@@ -1,20 +1,28 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 import { NodeManagedProjectFileSystem, runCli } from "@dnslin/sayhi-cli";
 import {
   advanceDurableTask,
+  adoptDurableTaskBaseline,
   createDurableTask,
   initializeManagedProject,
   recoverDurableTask,
+  withDurableTaskWriter,
   type ContractIdentity,
+  type BaselineRecord,
+  type TaskScope,
 } from "@dnslin/sayhi-core";
 
 import {
   taskLifecycleExploreTransition,
+  taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
@@ -38,6 +46,14 @@ const INSTALLATION = {
   templates: "0.1.0",
   skillLockDigest: `sha256:${"a".repeat(64)}` as ContractIdentity,
 } as const;
+
+const executeFile = promisify(execFile);
+const TASK_SCOPE = Object.freeze({
+  files: ["packages/core/**", "packages/cli/**"],
+  apis: ["TaskLifecycleFileSystem"],
+  schemas: ["events.jsonl", "task.json"],
+  locks: [],
+}) satisfies TaskScope;
 
 test("Node filesystem persists and recovers a Task across adapter instances", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-lifecycle-"));
@@ -156,6 +172,262 @@ test("Node filesystem serializes concurrent Task advances across adapters", asyn
   }
 });
 
+test("Baseline excludes durable Task Store records from other Tasks", async (t) => {
+  const { repository, fileSystem } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(
+      {
+        ...TASK_FIXTURE,
+        taskId: "TASK-11-OTHER",
+        eventNamespace: "11-OTHER",
+      },
+      "2026-07-15T09:30:00Z",
+    ),
+  });
+  assert.equal(created.ok, true);
+
+  const observed = await captureTaskBaseline(fileSystem, []);
+
+  assert.equal(
+    observed.dirtyPaths.some((change) => change.path.startsWith(".sayhi/tasks/")),
+    false,
+  );
+});
+
+test("Writer blocks dirty files until their exact Baseline is adopted", async (t) => {
+  const { repository, fileSystem, created } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const sourcePath = join(repository, "packages", "core", "existing.ts");
+  await writeFile(sourcePath, "export const state = 'dirty';\n", "utf8");
+  await writeFile(join(repository, "ignored-user.txt"), "private notes\n", "utf8");
+  const observed = await captureTaskBaseline(fileSystem, []);
+
+  assert.deepEqual(
+    observed.dirtyPaths.map((change) => change.path),
+    ["ignored-user.txt", "packages/core/existing.ts"],
+  );
+  const missingAdoption = await adoptDurableTaskBaseline({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: created.state.projection.version,
+    baseline: observed,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "BASELINE-REJECTED",
+      "2026-07-15T10:00:00Z",
+    ),
+  });
+  assert.equal(missingAdoption.ok, false);
+  if (!missingAdoption.ok) {
+    assert.equal(
+      missingAdoption.diagnostics[0]?.code,
+      "task_lifecycle.baseline.adoption_required",
+    );
+  }
+
+  const adopted = await adoptBaseline(
+    fileSystem,
+    created.state.projection.version,
+    observed,
+  );
+  assert.equal(adopted.event.type, "baseline_adopted");
+  assert.deepEqual(adopted.event.adopted, observed.dirtyPaths);
+  const written = await withDurableTaskWriter({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: adopted.state.projection.version,
+    operation: async (writer) => {
+      await writer.writeFile("packages/core/generated.ts", "export {};\n");
+      return "written";
+    },
+  });
+
+  assert.equal(written.ok, true);
+  if (written.ok) {
+    assert.equal(written.value, "written");
+    assert.deepEqual(written.changedPaths, ["packages/core/generated.ts"]);
+    assert.deepEqual(
+      written.finalBaseline.dirtyPaths.map((change) => change.path),
+      [
+        "ignored-user.txt",
+        "packages/core/existing.ts",
+        "packages/core/generated.ts",
+      ],
+    );
+  }
+  assert.equal(
+    await readFile(join(repository, "packages", "core", "generated.ts"), "utf8"),
+    "export {};\n",
+  );
+});
+
+test("Writer rejects Baseline drift before changing project files", async (t) => {
+  const { repository, fileSystem, created } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const observed = await captureTaskBaseline(fileSystem, []);
+  const adopted = await adoptBaseline(
+    fileSystem,
+    created.state.projection.version,
+    observed,
+  );
+  await writeFile(
+    join(repository, "packages", "core", "existing.ts"),
+    "export const state = 'drifted';\n",
+    "utf8",
+  );
+
+  const rejected = await withDurableTaskWriter({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: adopted.state.projection.version,
+    operation: async (writer) => {
+      await writer.writeFile("packages/core/should-not-exist.ts", "export {};\n");
+    },
+  });
+
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "task_lifecycle.baseline.drift");
+  }
+  await assert.rejects(
+    readFile(join(repository, "packages", "core", "should-not-exist.ts"), "utf8"),
+  );
+});
+
+test("Node Writer serializes concurrent mutation attempts", async (t) => {
+  const { repository, fileSystem, created } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const observed = await captureTaskBaseline(fileSystem, []);
+  const adopted = await adoptBaseline(
+    fileSystem,
+    created.state.projection.version,
+    observed,
+  );
+  let activeWriters = 0;
+  let peakWriters = 0;
+
+  const results = await Promise.all([
+    withDurableTaskWriter({
+      fileSystem: new NodeManagedProjectFileSystem(repository),
+      taskId: TASK_ID,
+      expectedVersion: adopted.state.projection.version,
+      operation: async (writer) => {
+        activeWriters += 1;
+        peakWriters = Math.max(peakWriters, activeWriters);
+        try {
+          await delay(25);
+          await writer.writeFile("packages/core/first.ts", "export const first = true;\n");
+          return "first";
+        } finally {
+          activeWriters -= 1;
+        }
+      },
+    }),
+    withDurableTaskWriter({
+      fileSystem: new NodeManagedProjectFileSystem(repository),
+      taskId: TASK_ID,
+      expectedVersion: adopted.state.projection.version,
+      operation: async (writer) => {
+        activeWriters += 1;
+        peakWriters = Math.max(peakWriters, activeWriters);
+        try {
+          await writer.writeFile("packages/core/second.ts", "export const second = true;\n");
+          return "second";
+        } finally {
+          activeWriters -= 1;
+        }
+      },
+    }),
+  ]);
+
+  assert.equal(peakWriters, 1);
+  assert.equal(results.filter((result) => result.ok).length, 1);
+  const rejected = results.find((result) => !result.ok);
+  assert.ok(rejected && !rejected.ok);
+  assert.equal(rejected.diagnostics[0]?.code, "task_lifecycle.baseline.drift");
+});
+
+test("Node Writer never recovers a lock from PID liveness alone", async (t) => {
+  const { repository, fileSystem } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const lockPath = join(repository, ".sayhi", ".runtime", "writer.lock");
+  await writeFile(lockPath, '{"pid":999999,"token":"stale"}', "utf8");
+  let entered = false;
+  const waiting = fileSystem.withWriterMutationLock(async () => {
+    entered = true;
+  });
+
+  await delay(30);
+  assert.equal(entered, false);
+  await rm(lockPath);
+  await waiting;
+  assert.equal(entered, true);
+});
+
+test("Node Task lock never recovers a lock from PID liveness alone", async (t) => {
+  const { repository, fileSystem } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const lockPath = join(
+    repository,
+    ".sayhi",
+    ".runtime",
+    `task-${TASK_ID}.lock`,
+  );
+  await writeFile(lockPath, '{"pid":999999,"token":"stale"}', "utf8");
+  let entered = false;
+  const waiting = fileSystem.withTaskMutationLock(
+    `.sayhi/.runtime/task-${TASK_ID}.lock`,
+    async () => {
+      entered = true;
+    },
+  );
+
+  await delay(30);
+  assert.equal(entered, false);
+  await rm(lockPath);
+  await waiting;
+  assert.equal(entered, true);
+});
+
+
+
+test("Node Writer rejects a symlinked parent without escaping the repository", async (t) => {
+  const { repository, fileSystem, created } = await createTaskRepository();
+  const outside = await mkdtemp(join(tmpdir(), "sayhi-task-writer-escape-"));
+  t.after(async () =>
+    Promise.all([
+      rm(repository, { recursive: true, force: true }),
+      rm(outside, { recursive: true, force: true }),
+    ]),
+  );
+  await symlink(
+    outside,
+    join(repository, "packages", "core", "linked"),
+    "junction",
+  );
+  const observed = await captureTaskBaseline(fileSystem, []);
+  const adopted = await adoptBaseline(
+    fileSystem,
+    created.state.projection.version,
+    observed,
+  );
+
+  const rejected = await withDurableTaskWriter({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: adopted.state.projection.version,
+    operation: async (writer) => {
+      await writer.writeFile("packages/core/linked/escaped.ts", "export {};\n");
+    },
+  });
+
+  assert.equal(rejected.ok, false);
+  await assert.rejects(readFile(join(outside, "escaped.ts"), "utf8"));
+});
+
+
 test("CLI doctor reports corrupt durable Event history without mutation", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-doctor-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
@@ -193,6 +465,73 @@ test("CLI doctor reports corrupt durable Event history without mutation", async 
   assert.equal(await readFile(eventsPath, "utf8"), corruptHistory);
   assert.equal(await readFile(projectionPath, "utf8"), projection);
 });
+
+async function createTaskRepository() {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-baseline-"));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await mkdir(join(repository, "packages", "core"), { recursive: true });
+  await writeFile(
+    join(repository, "packages", "core", "existing.ts"),
+    "export const state = 'clean';\n",
+    "utf8",
+  );
+  await writeFile(join(repository, ".gitignore"), "ignored-user.txt\n", "utf8");
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const initialized = await initializeManagedProject({
+    fileSystem,
+    installation: INSTALLATION,
+    projectId: "PROJECT-11-BASELINE",
+    timestamp: "2026-07-15T09:00:00Z",
+  });
+  assert.equal(initialized.ok, true);
+  await runGit(repository, "add", "--all");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  if (!created.ok) {
+    assert.fail(created.diagnostics[0]?.message ?? "Task creation failed");
+  }
+  return Object.freeze({ repository, fileSystem, created });
+}
+
+async function captureTaskBaseline(
+  fileSystem: NodeManagedProjectFileSystem,
+  adoptedPaths: readonly string[],
+) {
+  return fileSystem.captureBaseline({
+    taskId: TASK_ID,
+    declaredScope: TASK_SCOPE,
+    adoptedPaths,
+  });
+}
+
+async function adoptBaseline(
+  fileSystem: NodeManagedProjectFileSystem,
+  expectedVersion: number,
+  observed: BaselineRecord,
+) {
+  const adoptedPaths = observed.dirtyPaths.map((change) => change.path);
+  const adopted = await adoptDurableTaskBaseline({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion,
+    baseline: { ...observed, adoptedPaths },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      `BASELINE-${expectedVersion}`,
+      "2026-07-15T10:00:00Z",
+    ),
+  });
+  if (!adopted.ok) {
+    assert.fail(adopted.diagnostics[0]?.message ?? "Baseline adoption failed");
+  }
+  return adopted;
+}
+
+async function runGit(repository: string, ...args: readonly string[]) {
+  await executeFile("git", args, { cwd: repository, windowsHide: true });
+}
 
 function parseJsonObject(source: string): object {
   const value: unknown = JSON.parse(source);

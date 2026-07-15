@@ -5,7 +5,12 @@ import {
 } from "./identity.js";
 
 import { isRepositoryRelativePath } from "./repository-path.js";
-import { isWorkflowPhase, type TaskScope, type WorkflowPhase } from "./workflow.js";
+import {
+  isWorkflowPhase,
+  type BaselineAdoptedPath,
+  type TaskScope,
+  type WorkflowPhase,
+} from "./workflow.js";
 import type { PhaseAgentRole } from "./execution.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
@@ -113,6 +118,9 @@ export interface BaselineUntrackedFile {
   readonly identity: ContentHash;
 }
 
+export type BaselineDirtyPath = BaselineAdoptedPath;
+
+
 export type BaselineRecord = Readonly<Record<string, unknown>> & {
   readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
   readonly capturedAt: string;
@@ -122,6 +130,7 @@ export type BaselineRecord = Readonly<Record<string, unknown>> & {
   readonly trackedWorktreeDigest: ContractIdentity;
   readonly untracked: readonly BaselineUntrackedFile[];
   readonly submodulesDigest: ContractIdentity;
+  readonly dirtyPaths: readonly BaselineDirtyPath[];
   readonly adoptedPaths: readonly string[];
   readonly declaredScope: TaskScope;
 };
@@ -766,6 +775,43 @@ function validateBaseline(
       );
     }
     untrackedPaths.add(entry.path);
+  }
+  if (!Array.isArray(record.dirtyPaths)) {
+    return invalidMilestoneRecord(
+      "record_contract.baseline.invalid",
+      "Baseline",
+      "$.record.dirtyPaths",
+      "dirtyPaths must be an array.",
+    );
+  }
+  const dirtyPaths = new Set<string>();
+  for (let index = 0; index < record.dirtyPaths.length; index += 1) {
+    const entry = record.dirtyPaths[index];
+    if (!isRecord(entry) || !isRepositoryRelativePath(entry.path)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.dirtyPaths[${index}].path`,
+        "dirty paths must be repository-relative.",
+      );
+    }
+    if (dirtyPaths.has(entry.path)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.dirtyPaths[${index}].path`,
+        "dirty paths must be unique.",
+      );
+    }
+    if (!isContractIdentity(entry.identity)) {
+      return invalidMilestoneRecord(
+        "record_contract.baseline.invalid",
+        "Baseline",
+        `$.record.dirtyPaths[${index}].identity`,
+        "dirty path identities must be SHA-256 contract identities.",
+      );
+    }
+    dirtyPaths.add(entry.path);
   }
   if (!isUniqueRepositoryPathArray(record.adoptedPaths)) {
     return invalidMilestoneRecord(

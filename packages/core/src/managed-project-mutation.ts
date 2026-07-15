@@ -28,6 +28,9 @@ export const MANAGED_PROJECT_OPERATION_JOURNAL_PATH =
 export interface ManagedProjectMutationFileSystem
   extends ManagedProjectFileSystem {
   removeFile(path: string): Promise<void>;
+  withSharedCheckoutWriterLock<Result>(
+    operation: () => Promise<Result>,
+  ): Promise<Result>;
 }
 
 export interface ManagedProjectUpdateFile {
@@ -509,72 +512,89 @@ export async function applyManagedProjectPlan(
   request: ApplyManagedProjectPlanRequest,
 ): Promise<ApplyManagedProjectPlanResult> {
   try {
-    const journal: ManagedProjectOperationJournal = Object.freeze({
-      schemaVersion: 1,
-      timestamp: request.timestamp,
-      plan: request.plan,
-    });
-    if (!isManagedProjectOperationJournal(journal)) {
-      return invalidMutation(
-        MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
-        "The managed-file plan or operation timestamp is invalid.",
-        "Create a fresh plan and use a valid UTC timestamp.",
-      );
-    }
-    const journalEntry = await request.fileSystem.inspect(
-      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+    return await request.fileSystem.withSharedCheckoutWriterLock(() =>
+      applyManagedProjectPlanLocked(request),
     );
-    if (journalEntry.kind !== "missing") {
-      return invalidMutation(
-        MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
-        "A managed-file operation already requires recovery.",
-        "Recover the recorded operation before creating another plan.",
-      );
-    }
-    const preflight = await validatePlanSnapshot(
-      request.fileSystem,
-      request.plan,
-    );
-    if (preflight !== null) {
-      return preflight;
-    }
-    await request.fileSystem.writeFile(
-      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
-      prettyJson(journal),
-    );
-    return await finishManagedProjectOperation(request.fileSystem, journal);
   } catch {
     return operationIoFailure();
   }
 }
 
+async function applyManagedProjectPlanLocked(
+  request: ApplyManagedProjectPlanRequest,
+): Promise<ApplyManagedProjectPlanResult> {
+  const journal: ManagedProjectOperationJournal = Object.freeze({
+    schemaVersion: 1,
+    timestamp: request.timestamp,
+    plan: request.plan,
+  });
+  if (!isManagedProjectOperationJournal(journal)) {
+    return invalidMutation(
+      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+      "The managed-file plan or operation timestamp is invalid.",
+      "Create a fresh plan and use a valid UTC timestamp.",
+    );
+  }
+  const journalEntry = await request.fileSystem.inspect(
+    MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+  );
+  if (journalEntry.kind !== "missing") {
+    return invalidMutation(
+      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+      "A managed-file operation already requires recovery.",
+      "Recover the recorded operation before creating another plan.",
+    );
+  }
+  const preflight = await validatePlanSnapshot(request.fileSystem, request.plan);
+  if (preflight !== null) {
+    return preflight;
+  }
+  await request.fileSystem.writeFile(
+    MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+    prettyJson(journal),
+  );
+  return finishManagedProjectOperation(request.fileSystem, journal);
+}
+
+
 export async function recoverManagedProjectOperation(
   request: RecoverManagedProjectOperationRequest,
 ): Promise<ApplyManagedProjectPlanResult> {
   try {
-    const entry = await request.fileSystem.inspect(MANAGED_PROJECT_OPERATION_JOURNAL_PATH);
-    if (entry.kind !== "file") {
-      return invalidMutation(
-        MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
-        "No recoverable managed-file operation journal exists.",
-        "Create and apply a new update or uninstall plan.",
-      );
-    }
-    const parsed: unknown = JSON.parse(
-      await request.fileSystem.readFile(MANAGED_PROJECT_OPERATION_JOURNAL_PATH),
+    return await request.fileSystem.withSharedCheckoutWriterLock(() =>
+      recoverManagedProjectOperationLocked(request),
     );
-    if (!isManagedProjectOperationJournal(parsed)) {
-      return invalidMutation(
-        MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
-        "The managed-file operation journal is invalid or unsafe.",
-        "Restore the journal from a trusted operation or resolve it manually.",
-      );
-    }
-    return await finishManagedProjectOperation(request.fileSystem, parsed);
   } catch {
     return operationIoFailure();
   }
 }
+
+async function recoverManagedProjectOperationLocked(
+  request: RecoverManagedProjectOperationRequest,
+): Promise<ApplyManagedProjectPlanResult> {
+  const entry = await request.fileSystem.inspect(
+    MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+  );
+  if (entry.kind !== "file") {
+    return invalidMutation(
+      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+      "No recoverable managed-file operation journal exists.",
+      "Create and apply a new update or uninstall plan.",
+    );
+  }
+  const parsed: unknown = JSON.parse(
+    await request.fileSystem.readFile(MANAGED_PROJECT_OPERATION_JOURNAL_PATH),
+  );
+  if (!isManagedProjectOperationJournal(parsed)) {
+    return invalidMutation(
+      MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+      "The managed-file operation journal is invalid or unsafe.",
+      "Restore the journal from a trusted operation or resolve it manually.",
+    );
+  }
+  return finishManagedProjectOperation(request.fileSystem, parsed);
+}
+
 
 async function finishManagedProjectOperation(
   fileSystem: ManagedProjectMutationFileSystem,

@@ -252,6 +252,7 @@ const baseline = {
   indexDigest: `sha256:${"2".repeat(64)}`,
   trackedWorktreeDigest: `sha256:${"3".repeat(64)}`,
   untracked: [],
+  dirtyPaths: [],
   submodulesDigest: `sha256:${"4".repeat(64)}`,
   adoptedPaths: [],
   declaredScope: {
