@@ -54,6 +54,10 @@ export type {
 } from "./record-contracts.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
+  MANAGED_PROJECT_CONFIG_CONTENT,
+  MANAGED_PROJECT_CONFIG_PATH,
+  MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+  MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
   MANAGED_PROJECT_REQUIRED_DIRECTORIES,
   diagnoseManagedProject,
   initializeManagedProject,
@@ -69,6 +73,32 @@ export type {
   ManagedProjectPathKind,
   ManagedProjectState,
 } from "./managed-project.js";
+export {
+  applyManagedProjectPlan,
+  MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+  recoverManagedProjectOperation,
+  planManagedProjectUninstall,
+  planManagedProjectUpdate,
+} from "./managed-project-mutation.js";
+export type {
+  ApplyManagedProjectPlanRequest,
+  ApplyManagedProjectPlanResult,
+  ManagedProjectConflictVariants,
+  ManagedProjectInstalledFile,
+  ManagedProjectMutationPlan,
+  ManagedProjectMutationFileSystem,
+  ManagedProjectUninstallAction,
+  ManagedProjectUninstallConflictVariants,
+  ManagedProjectUninstallPlan,
+  ManagedProjectUpdateAction,
+  ManagedProjectUpdateFile,
+  ManagedProjectUpdatePlan,
+  PlanManagedProjectUninstallRequest,
+  PlanManagedProjectUninstallResult,
+  PlanManagedProjectUpdateRequest,
+  RecoverManagedProjectOperationRequest,
+  PlanManagedProjectUpdateResult,
+} from "./managed-project-mutation.js";
 
 
 export {

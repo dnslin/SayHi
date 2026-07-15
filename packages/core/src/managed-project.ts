@@ -7,6 +7,7 @@ import {
   type ManagedFileRecord,
   type ProjectManifestRecord,
 } from "./record-contracts.js";
+import { hasUnambiguousManagedBlocks } from "./managed-blocks.js";
 
 export const MANAGED_PROJECT_CONTRACT_VERSION = 1 as const;
 
@@ -24,10 +25,10 @@ export const MANAGED_PROJECT_REQUIRED_DIRECTORIES = Object.freeze([
 
 const PROJECT_MANIFEST_PATH = ".sayhi/manifest.json";
 const OWNERSHIP_MANIFEST_PATH = ".sayhi/managed-files.json";
-const PROJECT_CONFIG_PATH = ".sayhi/config.yaml";
-const RUNTIME_IGNORE_PATH = ".sayhi/.gitignore";
-const PROJECT_CONFIG_CONTENT = "schemaVersion: 1\n";
-const RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
+export const MANAGED_PROJECT_CONFIG_PATH = ".sayhi/config.yaml";
+export const MANAGED_PROJECT_RUNTIME_IGNORE_PATH = ".sayhi/.gitignore";
+export const MANAGED_PROJECT_CONFIG_CONTENT = "schemaVersion: 1\n";
+export const MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 
 export type ManagedProjectState =
   | "healthy"
@@ -124,9 +125,10 @@ export async function initializeManagedProject(
           paths: Object.freeze([]),
         });
       }
-      return initializationFailure(diagnosis);
-    }
-    if (store.kind !== "missing") {
+      if (diagnosis.state !== "missing") {
+        return initializationFailure(diagnosis);
+      }
+    } else if (store.kind !== "missing") {
       return initializationFailure(
         corrupt(
           "managed_project.path_unsafe",
@@ -144,12 +146,37 @@ export async function initializeManagedProject(
 
     const paths: string[] = [];
     for (const path of MANAGED_PROJECT_REQUIRED_DIRECTORIES) {
-      await request.fileSystem.createDirectory(path);
-      paths.push(path);
+      const entry = await request.fileSystem.inspect(path);
+      if (entry.kind === "missing") {
+        await request.fileSystem.createDirectory(path);
+        paths.push(path);
+      } else if (entry.kind !== "directory") {
+        return initializationFailure(invalidRequiredDirectory(path, entry.kind));
+      }
     }
     for (const [path, content] of generated.files) {
-      await request.fileSystem.writeFile(path, content);
-      paths.push(path);
+      const entry = await request.fileSystem.inspect(path);
+      if (entry.kind === "missing") {
+        await request.fileSystem.writeFile(path, content);
+        paths.push(path);
+        continue;
+      }
+      if (entry.kind !== "file") {
+        return initializationFailure(invalidRequiredFile(path, entry.kind));
+      }
+      if (path === MANAGED_PROJECT_CONFIG_PATH) {
+        continue;
+      }
+      if ((await request.fileSystem.readFile(path)) !== content) {
+        return initializationFailure(
+          corrupt(
+            "managed_project.file_modified",
+            path,
+            "An existing generated Project Store file differs from the installation content.",
+            "Preserve the existing file and resolve it before initializing SayHi again.",
+          ),
+        );
+      }
     }
 
     const diagnosis = await diagnoseManagedProject(request);
@@ -199,6 +226,22 @@ export async function diagnoseManagedProject(
     }
 
     const manifestEntry = await request.fileSystem.inspect(PROJECT_MANIFEST_PATH);
+    if (manifestEntry.kind === "missing") {
+      const ownershipEntry = await request.fileSystem.inspect(
+        OWNERSHIP_MANIFEST_PATH,
+      );
+      if (ownershipEntry.kind === "missing") {
+        return failure(
+          "missing",
+          diagnostic(
+            "managed_project.missing",
+            PROJECT_MANIFEST_PATH,
+            "This repository does not contain an installed SayHi Project Store.",
+            "Run sayhi init for this repository.",
+          ),
+        );
+      }
+    }
     if (manifestEntry.kind !== "file") {
       return invalidRequiredFile(PROJECT_MANIFEST_PATH, manifestEntry.kind);
     }
@@ -298,7 +341,7 @@ export async function diagnoseManagedProject(
       if (entry.kind !== "file") {
         return invalidRequiredFile(record.path, entry.kind);
       }
-      if (record.ownershipClass !== "user-owned") {
+      if (record.ownershipClass === "engine-owned") {
         const content = await request.fileSystem.readFile(record.path);
         const expected = record.installedBaseIdentity;
         if (
@@ -310,13 +353,26 @@ export async function diagnoseManagedProject(
             "managed_project.file_modified",
             record.path,
             "An Engine-owned managed file differs from its installed base identity.",
-            "Restore the installed content or use a future SayHi update repair plan.",
+            "Restore the installed content or create a conflict-aware update plan.",
+          );
+        }
+      } else if (
+        record.ownershipClass === "managed-customizable" &&
+        record.markerIds.length > 0
+      ) {
+        const content = await request.fileSystem.readFile(record.path);
+        if (!hasUnambiguousManagedBlocks(content, record.markerIds)) {
+          return corrupt(
+            "managed_project.file_modified",
+            record.path,
+            "A Managed-customizable file has missing, duplicated, or overlapping Managed Blocks.",
+            "Restore unambiguous Managed Block markers or resolve the file through an update plan.",
           );
         }
       }
     }
 
-    for (const path of [PROJECT_CONFIG_PATH, RUNTIME_IGNORE_PATH]) {
+    for (const path of [MANAGED_PROJECT_CONFIG_PATH, MANAGED_PROJECT_RUNTIME_IGNORE_PATH]) {
       if (!recordedPaths.has(path)) {
         return corrupt(
           "managed_project.corrupt",
@@ -346,18 +402,18 @@ function buildGeneratedProject(
   const managedFiles: readonly ManagedFileRecord[] = Object.freeze([
     Object.freeze({
       schemaVersion: 1,
-      path: PROJECT_CONFIG_PATH,
+      path: MANAGED_PROJECT_CONFIG_PATH,
       ownershipClass: "user-owned",
       generatedSourceVersion: request.installation.templates,
       markerIds: Object.freeze([]),
     }),
     Object.freeze({
       schemaVersion: 1,
-      path: RUNTIME_IGNORE_PATH,
+      path: MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
       ownershipClass: "engine-owned",
       installedBaseIdentity: Object.freeze({
         algorithm: "sha256-lf-v1",
-        digest: hashLf(RUNTIME_IGNORE_CONTENT),
+        digest: hashLf(MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT),
       }),
       generatedSourceVersion: request.installation.templates,
       markerIds: Object.freeze([]),
@@ -392,8 +448,8 @@ function buildGeneratedProject(
   return Object.freeze({
     ok: true,
     files: new Map([
-      [PROJECT_CONFIG_PATH, PROJECT_CONFIG_CONTENT],
-      [RUNTIME_IGNORE_PATH, RUNTIME_IGNORE_CONTENT],
+      [MANAGED_PROJECT_CONFIG_PATH, MANAGED_PROJECT_CONFIG_CONTENT],
+      [MANAGED_PROJECT_RUNTIME_IGNORE_PATH, MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT],
       [OWNERSHIP_MANIFEST_PATH, prettyJson(ownershipManifest)],
       [PROJECT_MANIFEST_PATH, prettyJson(manifest)],
     ]),
@@ -428,7 +484,7 @@ function isOwnershipManifest(value: unknown): value is OwnershipManifest {
 function invalidRequiredDirectory(
   path: string,
   kind: ManagedProjectPathKind,
-): DiagnoseManagedProjectResult {
+): ManagedProjectFailure<"corrupt"> {
   return corrupt(
     kind === "symlink"
       ? "managed_project.path_unsafe"
@@ -442,7 +498,7 @@ function invalidRequiredDirectory(
 function invalidRequiredFile(
   path: string,
   kind: ManagedProjectPathKind,
-): DiagnoseManagedProjectResult {
+): ManagedProjectFailure<"corrupt"> {
   return corrupt(
     kind === "symlink"
       ? "managed_project.path_unsafe"

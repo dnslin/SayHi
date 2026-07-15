@@ -3,12 +3,26 @@ import { homedir } from "node:os";
 import { resolve } from "node:path";
 
 import {
+  applyManagedProjectPlan,
   coreContract,
+  MANAGED_PROJECT_CONFIG_CONTENT,
+  MANAGED_PROJECT_CONFIG_PATH,
+  MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+  MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+  MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
+  planManagedProjectUninstall,
+  planManagedProjectUpdate,
+  recoverManagedProjectOperation,
+  type ApplyManagedProjectPlanResult,
   type ContractIdentity,
   type DiagnoseManagedProjectResult,
   type InitializeManagedProjectResult,
   type InstalledProjectVersions,
   type ManagedProjectDiagnostic,
+  type ManagedProjectInstalledFile,
+  type ManagedProjectUpdateFile,
+  type PlanManagedProjectUninstallResult,
+  type PlanManagedProjectUpdateResult,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -29,6 +43,36 @@ export const CLI_MANAGED_PROJECT_INSTALLATION: InstalledProjectVersions =
     templates: "0.0.0",
     skillLockDigest: EMPTY_SKILL_LOCK_DIGEST,
   });
+
+const CLI_MANAGED_PROJECT_UPDATE_FILES = Object.freeze([
+  Object.freeze({
+    path: MANAGED_PROJECT_CONFIG_PATH,
+    ownershipClass: "user-owned",
+    installedContent: MANAGED_PROJECT_CONFIG_CONTENT,
+    incomingContent: MANAGED_PROJECT_CONFIG_CONTENT,
+    generatedSourceVersion: CLI_MANAGED_PROJECT_INSTALLATION.templates,
+    markerIds: Object.freeze([]),
+  }),
+  Object.freeze({
+    path: MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
+    ownershipClass: "engine-owned",
+    installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+    incomingContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+    generatedSourceVersion: CLI_MANAGED_PROJECT_INSTALLATION.templates,
+    markerIds: Object.freeze([]),
+  }),
+]) satisfies readonly ManagedProjectUpdateFile[];
+
+const CLI_MANAGED_PROJECT_INSTALLED_FILES = Object.freeze([
+  Object.freeze({
+    path: MANAGED_PROJECT_CONFIG_PATH,
+    installedContent: MANAGED_PROJECT_CONFIG_CONTENT,
+  }),
+  Object.freeze({
+    path: MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
+    installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+  }),
+]) satisfies readonly ManagedProjectInstalledFile[];
 
 export interface CliRunResult {
   readonly exitCode: number;
@@ -61,13 +105,15 @@ export interface CliJsonEnvelope {
   readonly version: CliJsonVersion;
 }
 
-type CliCommand = "init" | "doctor";
+type CliCommand = "init" | "doctor" | "update" | "uninstall";
+type CliMutationMode = "dry-run" | "apply";
 
 interface ParsedCliArguments {
   readonly ok: true;
   readonly command: CliCommand;
   readonly cwd: string;
   readonly json: boolean;
+  readonly mode?: CliMutationMode;
 }
 
 interface InvalidCliArguments {
@@ -78,7 +124,10 @@ interface InvalidCliArguments {
 type CliArgumentResult = ParsedCliArguments | InvalidCliArguments;
 type ManagedProjectOperationResult =
   | DiagnoseManagedProjectResult
-  | InitializeManagedProjectResult;
+  | InitializeManagedProjectResult
+  | PlanManagedProjectUpdateResult
+  | PlanManagedProjectUninstallResult
+  | ApplyManagedProjectPlanResult;
 
 export async function runCli(args: readonly string[]): Promise<CliRunResult> {
   const parsed = parseArguments(args);
@@ -87,7 +136,7 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
       "cli.arguments",
       2,
       parsed.message,
-      "Run sayhi init or sayhi doctor with an optional --cwd path.",
+      "Run sayhi init, doctor, update --dry-run|--apply, or uninstall --dry-run|--apply.",
       args.includes("--json"),
     );
   }
@@ -124,26 +173,92 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
   }
 
   const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
-  const result =
-    parsed.command === "init"
-      ? await coreContract.initializeManagedProject({
-          fileSystem,
-          projectId: randomUUID(),
-          timestamp: new Date().toISOString(),
-          installation: CLI_MANAGED_PROJECT_INSTALLATION,
-        })
-      : await coreContract.diagnoseManagedProject({
-          fileSystem,
-          installation: CLI_MANAGED_PROJECT_INSTALLATION,
-        });
-
+  const timestamp = new Date().toISOString();
+  let result: ManagedProjectOperationResult;
+  switch (parsed.command) {
+    case "init":
+      result = await coreContract.initializeManagedProject({
+        fileSystem,
+        projectId: randomUUID(),
+        timestamp,
+        installation: CLI_MANAGED_PROJECT_INSTALLATION,
+      });
+      break;
+    case "doctor":
+      result = await coreContract.diagnoseManagedProject({
+        fileSystem,
+        installation: CLI_MANAGED_PROJECT_INSTALLATION,
+      });
+      break;
+    case "update":
+      result = await executeCliUpdate(fileSystem, parsed.mode ?? "dry-run", timestamp);
+      break;
+    case "uninstall":
+      result = await executeCliUninstall(
+        fileSystem,
+        parsed.mode ?? "dry-run",
+        timestamp,
+      );
+      break;
+  }
   return renderManagedProjectResult(parsed.command, result, parsed.json);
+}
+
+async function executeCliUpdate(
+  fileSystem: NodeManagedProjectFileSystem,
+  mode: CliMutationMode,
+  timestamp: string,
+): Promise<ManagedProjectOperationResult> {
+  const recovery = await recoverPendingOperation(fileSystem, mode);
+  if (recovery !== null) {
+    return recovery;
+  }
+  const planned = await planManagedProjectUpdate({
+    fileSystem,
+    installation: CLI_MANAGED_PROJECT_INSTALLATION,
+    files: CLI_MANAGED_PROJECT_UPDATE_FILES,
+  });
+  return mode === "apply" && planned.ok
+    ? applyManagedProjectPlan({ fileSystem, plan: planned.plan, timestamp })
+    : planned;
+}
+
+async function executeCliUninstall(
+  fileSystem: NodeManagedProjectFileSystem,
+  mode: CliMutationMode,
+  timestamp: string,
+): Promise<ManagedProjectOperationResult> {
+  const recovery = await recoverPendingOperation(fileSystem, mode);
+  if (recovery !== null) {
+    return recovery;
+  }
+  const planned = await planManagedProjectUninstall({
+    fileSystem,
+    files: CLI_MANAGED_PROJECT_INSTALLED_FILES,
+  });
+  return mode === "apply" && planned.ok
+    ? applyManagedProjectPlan({ fileSystem, plan: planned.plan, timestamp })
+    : planned;
+}
+
+async function recoverPendingOperation(
+  fileSystem: NodeManagedProjectFileSystem,
+  mode: CliMutationMode,
+): Promise<ApplyManagedProjectPlanResult | null> {
+  if (mode !== "apply") {
+    return null;
+  }
+  const journal = await fileSystem.inspect(MANAGED_PROJECT_OPERATION_JOURNAL_PATH);
+  return journal.kind === "missing"
+    ? null
+    : recoverManagedProjectOperation({ fileSystem });
 }
 
 function parseArguments(args: readonly string[]): CliArgumentResult {
   let command: CliCommand | undefined;
   let cwd = process.cwd();
   let json = false;
+  let modeFlag: "--check" | "--dry-run" | "--apply" | undefined;
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -158,6 +273,17 @@ function parseArguments(args: readonly string[]): CliArgumentResult {
     ) {
       continue;
     }
+    if (
+      argument === "--check" ||
+      argument === "--dry-run" ||
+      argument === "--apply"
+    ) {
+      if (modeFlag !== undefined) {
+        return { ok: false, message: "Specify exactly one lifecycle mode." };
+      }
+      modeFlag = argument;
+      continue;
+    }
     if (argument === "--cwd") {
       const value = args[index + 1];
       if (value === undefined || value.startsWith("--")) {
@@ -167,7 +293,12 @@ function parseArguments(args: readonly string[]): CliArgumentResult {
       index += 1;
       continue;
     }
-    if (argument === "init" || argument === "doctor") {
+    if (
+      argument === "init" ||
+      argument === "doctor" ||
+      argument === "update" ||
+      argument === "uninstall"
+    ) {
       if (command !== undefined) {
         return { ok: false, message: "Specify exactly one command." };
       }
@@ -177,9 +308,27 @@ function parseArguments(args: readonly string[]): CliArgumentResult {
     return { ok: false, message: `Unknown argument: ${String(argument)}` };
   }
 
-  return command === undefined
-    ? { ok: false, message: "A command is required." }
-    : { ok: true, command, cwd, json };
+  if (command === undefined) {
+    return { ok: false, message: "A command is required." };
+  }
+  if (command === "init" || command === "doctor") {
+    return modeFlag === undefined
+      ? { ok: true, command, cwd, json }
+      : { ok: false, message: `${command} does not accept a lifecycle mode.` };
+  }
+  if (modeFlag === undefined) {
+    return { ok: false, message: `${command} requires --dry-run or --apply.` };
+  }
+  if (command === "uninstall" && modeFlag === "--check") {
+    return { ok: false, message: "uninstall does not accept --check." };
+  }
+  return {
+    ok: true,
+    command,
+    cwd,
+    json,
+    mode: modeFlag === "--apply" ? "apply" : "dry-run",
+  };
 }
 
 function renderManagedProjectResult(
@@ -195,6 +344,13 @@ function renderManagedProjectResult(
     if (result.ok) {
       resultRecord.paths = result.paths;
     }
+  }
+  if ("plan" in result && result.ok) {
+    resultRecord.hasConflicts = result.plan.hasConflicts;
+    resultRecord.actions = summarizeActions(result.plan.actions);
+  }
+  if ("results" in result) {
+    resultRecord.actions = summarizeActions(result.results);
   }
 
   const envelope: CliJsonEnvelope = {
@@ -216,12 +372,20 @@ function renderManagedProjectResult(
     };
   }
   if (result.ok) {
-    const message =
-      command === "doctor"
-        ? "SayHi Project Store is healthy.\n"
-        : "created" in result && result.created
+    let message: string;
+    if (command === "doctor") {
+      message = "SayHi Project Store is healthy.\n";
+    } else if (command === "init") {
+      message =
+        "created" in result && result.created
           ? "Initialized SayHi Project Store.\n"
           : "SayHi Project Store is already initialized.\n";
+    } else {
+      message =
+        result.state === "planned"
+          ? `Planned SayHi project ${command}.\n`
+          : `Applied SayHi project ${command}.\n`;
+    }
     return { exitCode, stdout: message, stderr: "" };
   }
 
@@ -236,6 +400,26 @@ function renderManagedProjectResult(
   };
 }
 
+function summarizeActions(
+  actions: readonly Readonly<{
+    path: string;
+    result: string;
+    variants?: Readonly<{ local: string; base: string; incoming?: string }>;
+  }>[],
+): readonly Readonly<Record<string, unknown>>[] {
+  return Object.freeze(
+    actions.map((action) =>
+      Object.freeze({
+        path: action.path,
+        result: action.result,
+        ...(action.variants === undefined
+          ? {}
+          : { variants: action.variants }),
+      }),
+    ),
+  );
+}
+
 function managedProjectExitCode(result: ManagedProjectOperationResult): number {
   if (result.ok) {
     return 0;
@@ -244,11 +428,14 @@ function managedProjectExitCode(result: ManagedProjectOperationResult): number {
     return 8;
   }
   switch (result.state) {
+    case "conflict":
+      return 4;
     case "missing":
       return 6;
     case "incompatible":
       return 7;
     case "corrupt":
+    case "invalid":
       return 3;
   }
 }
