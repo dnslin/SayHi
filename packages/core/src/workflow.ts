@@ -231,12 +231,24 @@ export interface BaselineAdoptedEvent extends WorkflowEventBase {
   readonly baselineIdentity: ContractIdentity;
   readonly adopted: readonly BaselineAdoptedPath[];
 }
+export type ContextManifestChange = "added" | "refreshed" | "removed" | "frozen";
+
+export interface ContextManifestChangedEvent extends WorkflowEventBase {
+  readonly type: "context_manifest_changed";
+  readonly from: WorkflowPosition;
+  readonly phase: WorkflowPhase;
+  readonly manifestPath: string;
+  readonly manifestIdentity: ContractIdentity;
+  readonly change: ContextManifestChange;
+}
+
 
 
 export type WorkflowEvent =
   | TaskCreatedEvent
   | WorkflowTransitionedEvent
-  | BaselineAdoptedEvent;
+  | BaselineAdoptedEvent
+  | ContextManifestChangedEvent;
 
 export interface WorkflowState {
   readonly events: readonly WorkflowEvent[];
@@ -269,6 +281,17 @@ export interface AdoptWorkflowBaselineRequest {
   readonly adopted: readonly BaselineAdoptedPath[];
   readonly event: WorkflowEventMetadata;
 }
+export interface RecordContextManifestChangeRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly phase: WorkflowPhase;
+  readonly manifestPath: string;
+  readonly manifestIdentity: ContractIdentity;
+  readonly change: ContextManifestChange;
+  readonly event: WorkflowEventMetadata;
+}
+
 
 
 export type WorkflowDiagnosticCode = DependencyGraphDiagnosticCode
@@ -336,6 +359,20 @@ export type AdoptWorkflowBaselineResult =
       state: WorkflowState;
       diagnostics: readonly WorkflowDiagnostic[];
     }>;
+export type RecordContextManifestChangeResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: ContextManifestChangedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+
 
 export type ReplayWorkflowEventsResult =
   | Readonly<{
@@ -695,6 +732,89 @@ export function adoptWorkflowBaseline(
     event,
   });
 }
+export function recordContextManifestChange(
+  state: WorkflowState,
+  request: RecordContextManifestChangeRequest,
+): RecordContextManifestChangeResult {
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "context_manifest_changed" &&
+      matchesContextManifestChangeIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return contextManifestChangeFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Context Manifest intent.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+
+  const requestDiagnostic = validateContextManifestChangeRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return contextManifestChangeFailure(state, requestDiagnostic);
+  }
+
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "context_manifest_changed" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    phase: request.phase,
+    manifestPath: request.manifestPath,
+    manifestIdentity: request.manifestIdentity,
+    change: request.change,
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectContextManifestChangedEvent(state.projection, event);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: freezeState([...state.events, event], projection),
+    event,
+  });
+}
+
 
 export function replayWorkflowEvents(
   events: readonly unknown[],
@@ -811,6 +931,32 @@ export function replayWorkflowEvents(
       acceptedEvents.push(event);
       continue;
     }
+    if (projection !== null && sourceEvent.type === "context_manifest_changed") {
+      if (
+        sourceEvent.taskId !== projection.id ||
+        sourceEvent.route !== projection.route ||
+        !positionsEqual(sourceEvent.from, positionOf(projection)) ||
+        !positionsEqual(sourceEvent.to, positionOf(projection)) ||
+        sourceEvent.gates.length !== 0 ||
+        sourceEvent.initiativeGraph !== null ||
+        stableJson(sourceEvent.blockers) !== stableJson(projection.blockers) ||
+        sourceEvent.manifestPath !== `context/${sourceEvent.phase}.jsonl`
+      ) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Context Manifest change must preserve the accepted Workflow position.",
+            "Restore the Context Manifest Event that records the current Task position without Gates or graph changes.",
+          ),
+        );
+      }
+      const event = copyContextManifestChangedEvent(sourceEvent);
+      projection = projectContextManifestChangedEvent(projection, event);
+      acceptedEvents.push(event);
+      continue;
+    }
+
 
     if (
       projection === null ||
@@ -1202,6 +1348,64 @@ function validateBaselineAdoptionRequest(
   }
   return validateEventMetadata(request.event, "$.event");
 }
+function validateContextManifestChangeRequest(
+  state: WorkflowState,
+  request: RecordContextManifestChangeRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (request.taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Context Manifest Task id does not match the current Projection.",
+      "Reload the intended Task and submit its stable id.",
+    );
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (request.expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${request.expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Projection and reconsider the Context Manifest change.",
+    );
+  }
+  if (!isWorkflowPhase(request.phase)) {
+    return invalidRequest("$.phase", "Context Manifest Phase is not supported.");
+  }
+  if (request.manifestPath !== `context/${request.phase}.jsonl`) {
+    return invalidRequest(
+      "$.manifestPath",
+      "Context Manifest path must be the Task-local JSONL path for its Phase.",
+    );
+  }
+  if (!isContractIdentity(request.manifestIdentity)) {
+    return invalidRequest(
+      "$.manifestIdentity",
+      "Context Manifest change requires a SHA-256 Manifest identity.",
+    );
+  }
+  if (!isContextManifestChange(request.change)) {
+    return invalidRequest("$.change", "Context Manifest change kind is not supported.");
+  }
+  return validateEventMetadata(request.event, "$.event");
+}
+
 
 function validateInitiativeGraphTransition(
   projection: TaskProjection,
@@ -1357,6 +1561,24 @@ function matchesBaselineAdoptionIntent(
     event.actor.sessionRef === request.event.actor.sessionRef
   );
 }
+function matchesContextManifestChangeIntent(
+  event: ContextManifestChangedEvent,
+  request: RecordContextManifestChangeRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    event.phase === request.phase &&
+    event.manifestPath === request.manifestPath &&
+    event.manifestIdentity === request.manifestIdentity &&
+    event.change === request.change &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
+
 
 
 function validateReplayEvent(
@@ -1425,7 +1647,9 @@ function validateReplayEvent(
         ? !isWorkflowPosition(event.from)
         : event.type === "baseline_adopted"
           ? !isBaselineAdoptedEventPayload(event)
-          : true
+          : event.type === "context_manifest_changed"
+            ? !isContextManifestChangedEventPayload(event)
+            : true
   ) {
     return diagnostic(
       "workflow.event.invalid",
@@ -1508,6 +1732,19 @@ function isBaselineAdoptedEventPayload(
     isBaselineAdoptedPaths(event.adopted)
   );
 }
+function isContextManifestChangedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    isWorkflowPhase(event.phase) &&
+    event.manifestPath === `context/${event.phase}.jsonl` &&
+    isContractIdentity(event.manifestIdentity) &&
+    isContextManifestChange(event.change)
+  );
+}
+
 
 function isBaselineAdoptedPaths(
   value: unknown,
@@ -1760,6 +1997,22 @@ function projectBaselineAdoptedEvent(
     updatedAt: event.occurredAt,
   });
 }
+function projectContextManifestChangedEvent(
+  projection: TaskProjection,
+  event: ContextManifestChangedEvent,
+): TaskProjection {
+  return Object.freeze({
+    ...projection,
+    contexts: Object.freeze({
+      ...projection.contexts,
+      [event.phase]: event.manifestPath,
+    }),
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    updatedAt: event.occurredAt,
+  });
+}
+
 
 
 function copyTaskDefinition(task: WorkflowTaskDefinition): WorkflowTaskDefinition {
@@ -1828,6 +2081,20 @@ function copyBaselineAdoptedEvent(
     adopted: copyBaselineAdoptedPaths(event.adopted),
   });
 }
+function copyContextManifestChangedEvent(
+  event: ContextManifestChangedEvent,
+): ContextManifestChangedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph: null,
+  });
+}
+
 
 
 
@@ -1936,6 +2203,7 @@ function digestEvent(
     | Omit<TaskCreatedEvent, "chainDigest">
     | Omit<WorkflowTransitionedEvent, "chainDigest">
     | Omit<BaselineAdoptedEvent, "chainDigest">
+    | Omit<ContextManifestChangedEvent, "chainDigest">
     | WorkflowEvent,
 ): string {
   const payload: Record<string, unknown> = {
@@ -1962,6 +2230,11 @@ function digestEvent(
   } else if (event.type === "baseline_adopted") {
     payload.baselineIdentity = event.baselineIdentity;
     payload.adopted = event.adopted;
+  } else if (event.type === "context_manifest_changed") {
+    payload.phase = event.phase;
+    payload.manifestPath = event.manifestPath;
+    payload.manifestIdentity = event.manifestIdentity;
+    payload.change = event.change;
   }
   return hashCanonicalJson(payload);
 }
@@ -1972,6 +2245,15 @@ function digestEvent(
 function isWorkflowRoute(value: unknown): value is WorkflowRoute {
   return value === "quick" || value === "build" || value === "initiative";
 }
+function isContextManifestChange(value: unknown): value is ContextManifestChange {
+  return (
+    value === "added" ||
+    value === "refreshed" ||
+    value === "removed" ||
+    value === "frozen"
+  );
+}
+
 
 function invalidRequest(path: string, message: string): WorkflowDiagnostic {
   return diagnostic(
@@ -2022,6 +2304,18 @@ function baselineAdoptionFailure(
     diagnostics: Object.freeze([diagnosticValue]),
   });
 }
+function contextManifestChangeFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): RecordContextManifestChangeResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+
 
 function replayFailure(
   diagnosticValue: WorkflowDiagnostic,
