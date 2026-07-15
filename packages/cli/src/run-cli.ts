@@ -110,6 +110,7 @@ export interface CliJsonEnvelope {
 }
 
 type CliCommand = "init" | "doctor" | "update" | "uninstall";
+type CliMutationCommand = "update" | "uninstall";
 type CliMutationMode = "dry-run" | "apply";
 
 interface ParsedCliArguments {
@@ -195,11 +196,10 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
       });
       break;
     case "update":
-      result = await executeCliUpdate(fileSystem, parsed.mode ?? "dry-run", timestamp);
-      break;
     case "uninstall":
-      result = await executeCliUninstall(
+      result = await executeCliMutation(
         fileSystem,
+        parsed.command,
         parsed.mode ?? "dry-run",
         timestamp,
       );
@@ -208,8 +208,9 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
   return renderManagedProjectResult(parsed.command, result, parsed.json);
 }
 
-async function executeCliUpdate(
+async function executeCliMutation(
   fileSystem: NodeManagedProjectFileSystem,
+  command: CliMutationCommand,
   mode: CliMutationMode,
   timestamp: string,
 ): Promise<ManagedProjectOperationResult> {
@@ -217,29 +218,17 @@ async function executeCliUpdate(
   if (recovery !== null) {
     return recovery;
   }
-  const planned = await planManagedProjectUpdate({
-    fileSystem,
-    installation: CLI_MANAGED_PROJECT_INSTALLATION,
-    files: CLI_MANAGED_PROJECT_UPDATE_FILES,
-  });
-  return mode === "apply" && planned.ok
-    ? applyManagedProjectPlan({ fileSystem, plan: planned.plan, timestamp })
-    : planned;
-}
-
-async function executeCliUninstall(
-  fileSystem: NodeManagedProjectFileSystem,
-  mode: CliMutationMode,
-  timestamp: string,
-): Promise<ManagedProjectOperationResult> {
-  const recovery = await recoverPendingOperation(fileSystem, mode);
-  if (recovery !== null) {
-    return recovery;
-  }
-  const planned = await planManagedProjectUninstall({
-    fileSystem,
-    files: CLI_MANAGED_PROJECT_INSTALLED_FILES,
-  });
+  const planned =
+    command === "update"
+      ? await planManagedProjectUpdate({
+          fileSystem,
+          installation: CLI_MANAGED_PROJECT_INSTALLATION,
+          files: CLI_MANAGED_PROJECT_UPDATE_FILES,
+        })
+      : await planManagedProjectUninstall({
+          fileSystem,
+          files: CLI_MANAGED_PROJECT_INSTALLED_FILES,
+        });
   return mode === "apply" && planned.ok
     ? applyManagedProjectPlan({ fileSystem, plan: planned.plan, timestamp })
     : planned;

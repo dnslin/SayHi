@@ -627,6 +627,42 @@ function operationIoFailure(): ManagedProjectMutationFailure {
   );
 }
 
+type ManagedProjectMutationAction =
+  | ManagedProjectUpdateAction
+  | ManagedProjectUninstallAction;
+
+type ManagedProjectActionState =
+  | "retain"
+  | "expected"
+  | "completed"
+  | "stale";
+
+async function observeManagedProjectAction(
+  fileSystem: ManagedProjectMutationFileSystem,
+  action: ManagedProjectMutationAction,
+): Promise<ManagedProjectActionState> {
+  if (action.result === "retain") {
+    return "retain";
+  }
+  const entry = await fileSystem.inspect(action.path);
+  if (action.result === "remove" && entry.kind === "missing") {
+    return "completed";
+  }
+  if (entry.kind !== "file") {
+    return "stale";
+  }
+  const localIdentity = contentIdentity(
+    await fileSystem.readFile(action.path),
+  );
+  if (sameIdentity(localIdentity, action.expectedLocalIdentity)) {
+    return "expected";
+  }
+  return action.result === "update" &&
+    sameIdentity(localIdentity, contentIdentity(action.content))
+    ? "completed"
+    : "stale";
+}
+
 async function applyManagedProjectUpdate(
   fileSystem: ManagedProjectMutationFileSystem,
   plan: ManagedProjectUpdatePlan,
@@ -636,33 +672,21 @@ async function applyManagedProjectUpdate(
     plan.currentRecords.map((record) => [record.path, record]),
   );
   for (const action of plan.actions) {
-    if (action.result === "retain") {
+    const state = await observeManagedProjectAction(fileSystem, action);
+    if (state === "retain") {
       continue;
     }
-    const localContent = await fileSystem.readFile(action.path);
-    const localIdentity = contentIdentity(localContent);
-    const matchesExpected = sameIdentity(
-      localIdentity,
-      action.expectedLocalIdentity,
-    );
+    if (state === "stale") {
+      return stalePlan(action.path);
+    }
     if (action.result === "update") {
-      if (!matchesExpected) {
-        if (!sameIdentity(localIdentity, contentIdentity(action.content))) {
-          return stalePlan(action.path);
-        }
-        recordsByPath.set(action.path, action.record);
-        continue;
+      if (state === "expected") {
+        await fileSystem.writeFile(action.path, action.content);
       }
-      await fileSystem.writeFile(action.path, action.content);
       recordsByPath.set(action.path, action.record);
-    } else {
-      if (!matchesExpected) {
-        return stalePlan(action.path);
-      }
-      if (action.result === "conflict") {
-        await writeConflictVariants(fileSystem, action);
-        recordsByPath.set(action.path, action.record);
-      }
+    } else if (action.result === "conflict") {
+      await writeConflictVariants(fileSystem, action);
+      recordsByPath.set(action.path, action.record);
     }
   }
 
@@ -695,38 +719,22 @@ async function applyManagedProjectUninstall(
     plan.currentRecords.map((record) => [record.path, record]),
   );
   for (const action of plan.actions) {
-    if (action.result === "retain") {
+    const state = await observeManagedProjectAction(fileSystem, action);
+    if (state === "retain") {
       continue;
     }
-    const entry = await fileSystem.inspect(action.path);
-    if (action.result === "remove" && entry.kind === "missing") {
-      recordsByPath.delete(action.path);
-      continue;
-    }
-    if (entry.kind !== "file") {
-      return stalePlan(action.path);
-    }
-    const localContent = await fileSystem.readFile(action.path);
-    const localIdentity = contentIdentity(localContent);
-    const matchesExpected = sameIdentity(
-      localIdentity,
-      action.expectedLocalIdentity,
-    );
-    if (action.result === "update" && !matchesExpected) {
-      if (!sameIdentity(localIdentity, contentIdentity(action.content))) {
-        return stalePlan(action.path);
-      }
-      recordsByPath.delete(action.path);
-      continue;
-    }
-    if (!matchesExpected) {
+    if (state === "stale") {
       return stalePlan(action.path);
     }
     if (action.result === "remove") {
-      await fileSystem.removeFile(action.path);
+      if (state === "expected") {
+        await fileSystem.removeFile(action.path);
+      }
       recordsByPath.delete(action.path);
     } else if (action.result === "update") {
-      await fileSystem.writeFile(action.path, action.content);
+      if (state === "expected") {
+        await fileSystem.writeFile(action.path, action.content);
+      }
       recordsByPath.delete(action.path);
     } else if (action.result === "conflict") {
       await writeConflictVariants(fileSystem, action);
