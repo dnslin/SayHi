@@ -16,9 +16,9 @@ import {
   type ApplyManagedProjectPlanResult,
   type ContractIdentity,
   type DiagnoseManagedProjectResult,
+  type DiagnoseDurableTasksResult,
   type InitializeManagedProjectResult,
   type InstalledProjectVersions,
-  type ManagedProjectDiagnostic,
   type ManagedProjectInstalledFile,
   type ManagedProjectUpdateFile,
   type PlanManagedProjectUninstallResult,
@@ -128,6 +128,7 @@ interface InvalidCliArguments {
 
 type CliArgumentResult = ParsedCliArguments | InvalidCliArguments;
 type ManagedProjectOperationResult =
+  | DiagnoseDurableTasksResult
   | DiagnoseManagedProjectResult
   | InitializeManagedProjectResult
   | PlanManagedProjectUpdateResult
@@ -189,12 +190,16 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
         installation: CLI_MANAGED_PROJECT_INSTALLATION,
       });
       break;
-    case "doctor":
-      result = await coreContract.diagnoseManagedProject({
+    case "doctor": {
+      const projectDiagnosis = await coreContract.diagnoseManagedProject({
         fileSystem,
         installation: CLI_MANAGED_PROJECT_INSTALLATION,
       });
+      result = projectDiagnosis.ok
+        ? await coreContract.diagnoseDurableTasks({ fileSystem })
+        : projectDiagnosis;
       break;
+    }
     case "update":
     case "uninstall":
       result = await executeCliMutation(
@@ -345,6 +350,9 @@ function renderManagedProjectResult(
   if ("results" in result) {
     resultRecord.actions = summarizeActions(result.results);
   }
+  if ("taskCount" in result) {
+    resultRecord.taskCount = result.taskCount;
+  }
 
   const envelope: CliJsonEnvelope = {
     ok: result.ok,
@@ -421,7 +429,12 @@ function managedProjectExitCode(result: ManagedProjectOperationResult): number {
   if (result.ok) {
     return 0;
   }
-  if (result.diagnostics.some(({ code }) => code === "managed_project.io_failed")) {
+  if (
+    result.diagnostics.some(
+      ({ code }) =>
+        code === "managed_project.io_failed" || code === "task_lifecycle.io_failed",
+    )
+  ) {
     return 8;
   }
   switch (result.state) {
@@ -472,7 +485,7 @@ function cliFailure(
 }
 
 function diagnosticError(
-  diagnostic: ManagedProjectDiagnostic | undefined,
+  diagnostic: CliJsonDiagnostic | undefined,
 ): CliJsonError {
   return diagnostic === undefined
     ? Object.freeze({
