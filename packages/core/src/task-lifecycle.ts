@@ -591,7 +591,7 @@ export async function inspectDurableContextManifest(
     }
     const diagnostics: ContextManifestDiagnostic[] = [];
     for (const entry of parsed.entries) {
-      if (!entry.required || entry.source.type !== "project-path") {
+      if (entry.source.type !== "project-path") {
         continue;
       }
       try {
@@ -600,8 +600,8 @@ export async function inspectDurableContextManifest(
           diagnostics.push(
             contextManifestDiagnostic(
               entry.source.value,
-              "Required Context Manifest content no longer matches its identity.",
-              "Refresh and approve the phase Manifest before dispatch.",
+              "Context Manifest content no longer matches its identity.",
+              "Restore the source or refresh the phase Manifest before dispatch.",
             ),
           );
         }
@@ -813,9 +813,24 @@ async function refreshDurableContextManifestLocked(
     paths,
     loaded.state.projection,
     request.phase,
+    request.acceptRequiredApprovedSpecChanges,
   );
   if (!manifest.ok) {
     return manifest;
+  }
+  const approvals = manifest.entries.some(
+    (entry) => entry.trust === "approved-spec",
+  )
+    ? await readApprovedSpecs(request.fileSystem)
+    : null;
+  if (approvals !== null && approvals.ok === false) {
+    const diagnostic = approvals.diagnostics[0]!;
+    return contextLifecycleFailure(
+      "context_manifest.invalid",
+      diagnostic.path,
+      diagnostic.message,
+      diagnostic.remediation,
+    );
   }
   let approvalRequired = false;
   const approvedSpecUpdates: ContextManifestEntry[] = [];
@@ -842,8 +857,10 @@ async function refreshDurableContextManifestLocked(
     }
     const identity = hashTextContent(content);
     const approvedSpecChanged =
-      !contentMatchesIdentity(content, entry.identity) &&
-      entry.trust === "approved-spec";
+      entry.trust === "approved-spec" &&
+      (!contentMatchesIdentity(content, entry.identity) ||
+        (approvals !== null &&
+          isApprovedSpec(approvals.approvals, entry.source.value, identity) === false));
     approvalRequired ||= approvedSpecChanged;
     const nextEntry = Object.freeze({
       ...entry,
@@ -879,6 +896,19 @@ async function refreshDurableContextManifestLocked(
   if (!changed.ok) {
     return failure(changed.diagnostics);
   }
+  const persisted = await persistContextManifestChange({
+    fileSystem: request.fileSystem,
+    paths,
+    manifestPath: manifest.manifestPath,
+    entries: frozenEntries,
+    previousEventCount: loaded.state.events.length,
+    state: changed.state,
+    event: changed.event,
+    persist: request.persist ?? true,
+  });
+  if (persisted !== null) {
+    return persisted;
+  }
   if (request.persist !== false) {
     for (const entry of approvedSpecUpdates) {
       const approval = await approveSpec(request.fileSystem, {
@@ -896,19 +926,6 @@ async function refreshDurableContextManifestLocked(
         );
       }
     }
-  }
-  const persisted = await persistContextManifestChange({
-    fileSystem: request.fileSystem,
-    paths,
-    manifestPath: manifest.manifestPath,
-    entries: frozenEntries,
-    previousEventCount: loaded.state.events.length,
-    state: changed.state,
-    event: changed.event,
-    persist: request.persist ?? true,
-  });
-  if (persisted !== null) {
-    return persisted;
   }
   return Object.freeze({
     ok: true,
@@ -1078,6 +1095,7 @@ async function loadContextManifestForMutation(
   paths: TaskPaths,
   projection: TaskProjection,
   phase: WorkflowPhase,
+  allowApprovalMismatch = false,
 ): Promise<LoadedContextManifest | TaskLifecycleFailure> {
   const manifestReference =
     projection.contexts[phase] ?? `context/${phase}.jsonl`;
@@ -1121,7 +1139,7 @@ async function loadContextManifestForMutation(
       fileSystem,
       parsed.entries,
     );
-    if (approvalDiagnostics.length > 0) {
+    if (approvalDiagnostics.length > 0 && !allowApprovalMismatch) {
       const diagnostic = approvalDiagnostics[0]!;
       return contextLifecycleFailure(
         "context_manifest.invalid",

@@ -149,15 +149,6 @@ export async function createSpec(
   }
   try {
     return await request.fileSystem.withSharedCheckoutWriterLock(async () => {
-      const existing = await request.fileSystem.inspect(path.path);
-      if (existing.kind !== "missing") {
-        return specFailure(
-          "spec.exists",
-          path.path,
-          "A Spec already exists at this path.",
-          "Choose a new Spec path or update the User-owned Spec outside this create command.",
-        );
-      }
       let content: string;
       try {
         content = await request.fileSystem.readRepositoryFile(request.source);
@@ -178,6 +169,30 @@ export async function createSpec(
         );
       }
       const identity = hashTextContent(content);
+      const existing = await request.fileSystem.inspect(path.path);
+      if (existing.kind === "file") {
+        const existingIdentity = hashTextContent(
+          await request.fileSystem.readFile(path.path),
+        );
+        if (
+          existingIdentity.algorithm !== identity.algorithm ||
+          existingIdentity.digest.toLowerCase() !== identity.digest.toLowerCase()
+        ) {
+          return specFailure(
+            "spec.exists",
+            path.path,
+            "A different Spec already exists at this path.",
+            "Choose a new Spec path or update the User-owned Spec outside this create command.",
+          );
+        }
+      } else if (existing.kind !== "missing") {
+        return specFailure(
+          "spec.exists",
+          path.path,
+          "A Spec path already exists and is not a regular file.",
+          "Replace the unsafe path before creating the Spec.",
+        );
+      }
       const directory = path.path.slice(0, path.path.lastIndexOf("/"));
       const directoryFailure = await prepareSpecDirectories(
         request.fileSystem,
@@ -196,6 +211,9 @@ export async function createSpec(
           planned: true,
         });
       }
+      if (existing.kind === "missing") {
+        await request.fileSystem.writeFile(path.path, content);
+      }
       const approval = await approveSpec(request.fileSystem, {
         path: path.path,
         identity,
@@ -210,7 +228,6 @@ export async function createSpec(
           diagnostic.remediation,
         );
       }
-      await request.fileSystem.writeFile(path.path, content);
       return Object.freeze({
         ok: true,
         contractVersion: SPEC_CONTRACT_VERSION,

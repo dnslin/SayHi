@@ -40,6 +40,8 @@ class MemoryContextManifestFileSystem implements ContextManifestFileSystem {
   readonly files = new Map<string, string>();
   failNextAppend = false;
   failNextApprovalWrite = false;
+  failNextSpecWrite = false;
+  failNextContextManifestWrite = false;
 
   async inspect(path: string) {
     if (this.directories.has(path)) {
@@ -100,6 +102,17 @@ class MemoryContextManifestFileSystem implements ContextManifestFileSystem {
       this.failNextApprovalWrite = false;
       throw new Error("Injected approval write failure.");
     }
+    if (path === SPEC_PATH && this.failNextSpecWrite) {
+      this.failNextSpecWrite = false;
+      throw new Error("Injected Spec write failure.");
+    }
+    if (
+      path.startsWith(`${TASK_DIRECTORY}/context/`) &&
+      this.failNextContextManifestWrite
+    ) {
+      this.failNextContextManifestWrite = false;
+      throw new Error("Injected Context Manifest write failure.");
+    }
     this.files.set(path, content);
   }
 
@@ -136,7 +149,7 @@ async function createApprovedSpec(
   assert.equal(created.ok, true);
 }
 
-test("Core does not create a Spec when approval state cannot persist", async () => {
+test("Core leaves an unapproved Spec retriable when approval state cannot persist", async () => {
   const fileSystem = new MemoryContextManifestFileSystem();
   fileSystem.files.set("docs/api-source.md", "Approved behavior.\n");
   fileSystem.failNextApprovalWrite = true;
@@ -146,10 +159,136 @@ test("Core does not create a Spec when approval state cannot persist", async () 
     source: "docs/api-source.md",
   });
   assert.equal(created.ok, false);
-  if (!created.ok) {
-    assert.equal(created.diagnostics[0]?.code, "spec.approval.invalid");
-  }
+  assert.equal(fileSystem.files.has(SPEC_PATH), true);
+  assert.equal(fileSystem.files.has(".sayhi/spec/approvals.json"), false);
+  const retried = await createSpec({
+    fileSystem,
+    path: "api.md",
+    source: "docs/api-source.md",
+  });
+  assert.equal(retried.ok, true);
+  assert.equal(fileSystem.files.has(".sayhi/spec/approvals.json"), true);
+});
+
+test("Core does not retain approval after a Spec write failure", async () => {
+  const fileSystem = new MemoryContextManifestFileSystem();
+  fileSystem.files.set("docs/api-source.md", "Approved behavior.\n");
+  fileSystem.failNextSpecWrite = true;
+  const created = await createSpec({
+    fileSystem,
+    path: "api.md",
+    source: "docs/api-source.md",
+  });
+  assert.equal(created.ok, false);
   assert.equal(fileSystem.files.has(SPEC_PATH), false);
+  assert.equal(fileSystem.files.has(".sayhi/spec/approvals.json"), false);
+});
+
+test("Core does not advance approval when Context persistence fails", async () => {
+  const fileSystem = new MemoryContextManifestFileSystem();
+  await createApprovedSpec(fileSystem, "Accepted API behavior.\n");
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(FIXTURE, "2026-07-15T08:05:00Z"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const added = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: created.state.projection.version,
+    phase: "implement",
+    source: SPEC_PATH,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-ADD-PERSIST", "2026-07-15T08:06:00Z"),
+  });
+  assert.equal(added.ok, true);
+  if (!added.ok) {
+    return;
+  }
+  const approvalBefore = fileSystem.files.get(".sayhi/spec/approvals.json");
+  const manifestPath = `${TASK_DIRECTORY}/context/implement.jsonl`;
+  const manifestBefore = fileSystem.files.get(manifestPath);
+  fileSystem.files.set(SPEC_PATH, "Changed API behavior.\n");
+  fileSystem.failNextContextManifestWrite = true;
+  const refreshed = await refreshDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: added.state.projection.version,
+    phase: "implement",
+    acceptRequiredApprovedSpecChanges: true,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-REFRESH-PERSIST", "2026-07-15T08:07:00Z"),
+  });
+
+  assert.equal(refreshed.ok, false);
+  assert.equal(fileSystem.files.get(".sayhi/spec/approvals.json"), approvalBefore);
+  assert.equal(fileSystem.files.get(manifestPath), manifestBefore);
+});
+
+test("Core repairs Context approval after its registry write fails", async () => {
+  const fileSystem = new MemoryContextManifestFileSystem();
+  await createApprovedSpec(fileSystem, "Accepted API behavior.\n");
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(FIXTURE, "2026-07-15T08:08:00Z"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const added = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: created.state.projection.version,
+    phase: "implement",
+    source: SPEC_PATH,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-ADD-REPAIR", "2026-07-15T08:09:00Z"),
+  });
+  assert.equal(added.ok, true);
+  if (!added.ok) {
+    return;
+  }
+  fileSystem.files.set(SPEC_PATH, "Changed API behavior.\n");
+  fileSystem.failNextApprovalWrite = true;
+  const failed = await refreshDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: added.state.projection.version,
+    phase: "implement",
+    acceptRequiredApprovedSpecChanges: true,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-REFRESH-APPROVAL-FAIL", "2026-07-15T08:10:00Z"),
+  });
+  assert.equal(failed.ok, false);
+  const invalid = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    phase: "implement",
+  });
+  assert.equal(invalid.ok, false);
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const repaired = await refreshDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: recovered.state.projection.version,
+    phase: "implement",
+    acceptRequiredApprovedSpecChanges: true,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-REFRESH-REPAIRED", "2026-07-15T08:11:00Z"),
+  });
+  assert.equal(repaired.ok, true);
+  const inspected = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    phase: "implement",
+  });
+  assert.equal(inspected.ok, true);
+  if (inspected.ok) {
+    assert.equal(inspected.state, "valid");
+  }
 });
 
 
@@ -305,6 +444,48 @@ test("Core visibly invalidates stale Approved Spec bindings and requires explici
   assert.equal(refreshedInspection.ok, true);
   if (refreshedInspection.ok) {
     assert.equal(refreshedInspection.state, "valid");
+  }
+});
+
+test("Core marks an optional Context source stale when its identity changes", async () => {
+  const fileSystem = new MemoryContextManifestFileSystem();
+  const source = "research/optional.md";
+  fileSystem.files.set(source, "Original optional Context.\n");
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(FIXTURE, "2026-07-15T08:14:00Z"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const added = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: created.state.projection.version,
+    phase: "explore",
+    source,
+    event: taskLifecycleEventMetadata(FIXTURE, "CONTEXT-ADD-OPTIONAL", "2026-07-15T08:15:00Z"),
+  });
+  assert.equal(added.ok, true);
+  if (!added.ok) {
+    return;
+  }
+  const manifestPath = `${TASK_DIRECTORY}/context/explore.jsonl`;
+  const optionalEntry = {
+    ...JSON.parse(fileSystem.files.get(manifestPath) ?? "{}"),
+    required: false,
+  };
+  fileSystem.files.set(manifestPath, `${JSON.stringify(optionalEntry)}\n`);
+  fileSystem.files.set(source, "Changed optional Context.\n");
+  const inspected = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    phase: "explore",
+  });
+  assert.equal(inspected.ok, true);
+  if (inspected.ok) {
+    assert.equal(inspected.state, "stale");
   }
 });
 
