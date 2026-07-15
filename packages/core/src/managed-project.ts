@@ -28,7 +28,8 @@ const OWNERSHIP_MANIFEST_PATH = ".sayhi/managed-files.json";
 export const MANAGED_PROJECT_CONFIG_PATH = ".sayhi/config.yaml";
 export const MANAGED_PROJECT_RUNTIME_IGNORE_PATH = ".sayhi/.gitignore";
 export const MANAGED_PROJECT_CONFIG_CONTENT = "schemaVersion: 1\n";
-export const MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
+export const MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT =
+  "# SayHi local runtime state\n/.runtime/\n";
 
 export type ManagedProjectState =
   | "healthy"

@@ -6,6 +6,7 @@ import {
   applyManagedProjectPlan,
   diagnoseManagedProject,
   initializeManagedProject,
+  MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
   recoverManagedProjectOperation,
   planManagedProjectUninstall,
   planManagedProjectUpdate,
@@ -25,6 +26,11 @@ const NEXT_INSTALLATION = {
   ...INSTALLATION,
   templates: "1.0.0",
 } as const;
+
+const NEXT_RUNTIME_IGNORE_CONTENT =
+  `${MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT}/.cache/\n`;
+const MODIFIED_RUNTIME_IGNORE_CONTENT =
+  `${MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT}user-local-change\n`;
 
 const REQUIRED_DIRECTORIES = [
   ".sayhi",
@@ -217,8 +223,8 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
       {
         path: ".sayhi/.gitignore",
         ownershipClass: "engine-owned",
-        installedContent: "/.runtime/\n",
-        incomingContent: "/.runtime/\n/.cache/\n",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: NEXT_RUNTIME_IGNORE_CONTENT,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
       },
@@ -247,7 +253,7 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
   assert.equal(applied.state, "applied");
   assert.equal(
     fileSystem.files.get(".sayhi/.gitignore"),
-    "/.runtime/\n/.cache/\n",
+    NEXT_RUNTIME_IGNORE_CONTENT,
   );
   assert.equal(
     fileSystem.files.get(".sayhi/config.yaml"),
@@ -262,7 +268,7 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
   assert.equal(
     ownership.files.find(({ path }: { path: string }) => path === ".sayhi/.gitignore")
       .installedBaseIdentity.digest,
-    "1fa68eb73ee4e5e174e045b710cbf3cd87f05008bff419218ab994ad82b1ecd1",
+    "553f2e49fea32f6b914b2a47b6fb5ac111bf953947333df27004896d3f3ce0d2",
   );
 });
 
@@ -274,8 +280,8 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
     timestamp: "2026-07-14T08:00:00Z",
     installation: INSTALLATION,
   });
-  const localContent = "/.runtime/\nuser-local-change\n";
-  const incomingContent = "/.runtime/\n/.cache/\n";
+  const localContent = MODIFIED_RUNTIME_IGNORE_CONTENT;
+  const incomingContent = NEXT_RUNTIME_IGNORE_CONTENT;
   fileSystem.files.set(".sayhi/.gitignore", localContent);
 
   const planned = await planManagedProjectUpdate({
@@ -293,7 +299,7 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
       {
         path: ".sayhi/.gitignore",
         ownershipClass: "engine-owned",
-        installedContent: "/.runtime/\n",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
         incomingContent,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
@@ -325,7 +331,7 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
   assert.equal(fileSystem.files.get(conflict.variants.local), localContent);
   assert.equal(
     fileSystem.files.get(conflict.variants.base),
-    "/.runtime/\n",
+    MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
   );
   assert.equal(
     fileSystem.files.get(conflict.variants.incoming),
@@ -339,7 +345,7 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
   assert.equal(
     ownership.files.find(({ path }: { path: string }) => path === ".sayhi/.gitignore")
       .incomingUpdateIdentity.digest,
-    "1fa68eb73ee4e5e174e045b710cbf3cd87f05008bff419218ab994ad82b1ecd1",
+    "553f2e49fea32f6b914b2a47b6fb5ac111bf953947333df27004896d3f3ce0d2",
   );
 });
 
@@ -357,7 +363,7 @@ test("Core uninstalls matching Engine-owned files and retains User-owned content
   const planned = await planManagedProjectUninstall({
     fileSystem,
     files: [
-      { path: ".sayhi/.gitignore", installedContent: "/.runtime/\n" },
+      { path: ".sayhi/.gitignore", installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT },
       { path: ".sayhi/config.yaml", installedContent: "schemaVersion: 1\n" },
     ],
   });
@@ -454,7 +460,7 @@ test("Core updates and uninstalls Managed Blocks without changing surrounding us
   const uninstall = await planManagedProjectUninstall({
     fileSystem,
     files: [
-      { path: ".sayhi/.gitignore", installedContent: "/.runtime/\n" },
+      { path: ".sayhi/.gitignore", installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT },
       { path, installedContent: incoming },
     ],
   });
@@ -503,8 +509,8 @@ test("Core recovers a partially applied mixed-ownership update from its journal"
       {
         path: ".sayhi/.gitignore",
         ownershipClass: "engine-owned",
-        installedContent: "/.runtime/\n",
-        incomingContent: "/.runtime/\n/.cache/\n",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: NEXT_RUNTIME_IGNORE_CONTENT,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
       },
@@ -545,7 +551,7 @@ test("Core recovers a partially applied mixed-ownership update from its journal"
   );
   assert.equal(
     fileSystem.files.get(".sayhi/.gitignore"),
-    "/.runtime/\n/.cache/\n",
+    NEXT_RUNTIME_IGNORE_CONTENT,
   );
   assert.equal(fileSystem.files.get(path), local);
   assert.equal(
@@ -645,12 +651,12 @@ test("Core preserves a divergent Engine-owned file during uninstall", async () =
     timestamp: "2026-07-14T08:00:00Z",
     installation: INSTALLATION,
   });
-  const localContent = "/.runtime/\nuser-local-change\n";
+  const localContent = MODIFIED_RUNTIME_IGNORE_CONTENT;
   fileSystem.files.set(".sayhi/.gitignore", localContent);
   const planned = await planManagedProjectUninstall({
     fileSystem,
     files: [
-      { path: ".sayhi/.gitignore", installedContent: "/.runtime/\n" },
+      { path: ".sayhi/.gitignore", installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT },
       { path: ".sayhi/config.yaml", installedContent: "schemaVersion: 1\n" },
     ],
   });
@@ -675,7 +681,7 @@ test("Core preserves a divergent Engine-owned file during uninstall", async () =
   assert.equal(applied.state, "conflict");
   assert.equal(fileSystem.files.get(".sayhi/.gitignore"), localContent);
   assert.equal(fileSystem.files.get(conflict.variants.local), localContent);
-  assert.equal(fileSystem.files.get(conflict.variants.base), "/.runtime/\n");
+  assert.equal(fileSystem.files.get(conflict.variants.base), MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT);
   assert.equal(fileSystem.files.has(".sayhi/manifest.json"), true);
   assert.equal(fileSystem.files.has(".sayhi/managed-files.json"), true);
 });
@@ -695,8 +701,8 @@ test("Core rejects stale plans before creating an operation journal", async () =
       {
         path: ".sayhi/.gitignore",
         ownershipClass: "engine-owned",
-        installedContent: "/.runtime/\n",
-        incomingContent: "/.runtime/\n/.cache/\n",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: NEXT_RUNTIME_IGNORE_CONTENT,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
       },
@@ -736,8 +742,8 @@ test("Core rejects an invalid apply timestamp before writing files or a journal"
       {
         path: ".sayhi/.gitignore",
         ownershipClass: "engine-owned",
-        installedContent: "/.runtime/\n",
-        incomingContent: "/.runtime/\n/.cache/\n",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: NEXT_RUNTIME_IGNORE_CONTENT,
         generatedSourceVersion: "1.0.0",
         markerIds: [],
       },
@@ -757,6 +763,89 @@ test("Core rejects an invalid apply timestamp before writing files or a journal"
 
   assert.equal(applied.state, "invalid");
   assert.deepEqual(fileSystem.files, before);
+});
+
+test("Core retains a deleted User-owned path while mixed lifecycle actions continue", async () => {
+  const fileSystem = new MemoryManagedProjectFileSystem();
+  await initializeManagedProject({
+    fileSystem,
+    projectId: "PROJECT-9-DELETED-USER-FILE",
+    timestamp: "2026-07-14T08:00:00Z",
+    installation: INSTALLATION,
+  });
+  await fileSystem.removeFile(".sayhi/config.yaml");
+  const incomingEngineContent = NEXT_RUNTIME_IGNORE_CONTENT;
+
+  const update = await planManagedProjectUpdate({
+    fileSystem,
+    installation: NEXT_INSTALLATION,
+    files: [
+      {
+        path: ".sayhi/config.yaml",
+        ownershipClass: "user-owned",
+        installedContent: "schemaVersion: 1\n",
+        incomingContent: "schemaVersion: 2\n",
+        generatedSourceVersion: "1.0.0",
+        markerIds: [],
+      },
+      {
+        path: ".sayhi/.gitignore",
+        ownershipClass: "engine-owned",
+        installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: incomingEngineContent,
+        generatedSourceVersion: "1.0.0",
+        markerIds: [],
+      },
+    ],
+  });
+  assert.equal(update.ok, true);
+  if (!update.ok) {
+    return;
+  }
+  const updateRetention = update.plan.actions.find(
+    (action) => action.path === ".sayhi/config.yaml",
+  );
+  assert.equal(updateRetention?.result, "retain");
+  if (updateRetention?.result === "retain") {
+    assert.equal(updateRetention.observedKind, "missing");
+  }
+  const updated = await applyManagedProjectPlan({
+    fileSystem,
+    plan: update.plan,
+    timestamp: "2026-07-14T09:00:00Z",
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(fileSystem.files.has(".sayhi/config.yaml"), false);
+  assert.equal(
+    fileSystem.files.get(".sayhi/.gitignore"),
+    incomingEngineContent,
+  );
+
+  const uninstall = await planManagedProjectUninstall({
+    fileSystem,
+    files: [
+      { path: ".sayhi/.gitignore", installedContent: incomingEngineContent },
+      { path: ".sayhi/config.yaml", installedContent: "schemaVersion: 1\n" },
+    ],
+  });
+  assert.equal(uninstall.ok, true);
+  if (!uninstall.ok) {
+    return;
+  }
+  const uninstallRetention = uninstall.plan.actions.find(
+    (action) => action.path === ".sayhi/config.yaml",
+  );
+  assert.equal(uninstallRetention?.result, "retain");
+  if (uninstallRetention?.result === "retain") {
+    assert.equal(uninstallRetention.observedKind, "missing");
+  }
+  const uninstalled = await applyManagedProjectPlan({
+    fileSystem,
+    plan: uninstall.plan,
+    timestamp: "2026-07-14T10:00:00Z",
+  });
+  assert.equal(uninstalled.ok, true);
+  assert.equal(fileSystem.files.has(".sayhi/config.yaml"), false);
 });
 
 test("Core doctor reports missing Project Store state without writing", async () => {

@@ -16,6 +16,7 @@ import {
 import type {
   ManagedProjectDiagnostic,
   ManagedProjectFileSystem,
+  ManagedProjectPathKind,
 } from "./managed-project.js";
 import { validateDomainValue, type ContentHash } from "./validation.js";
 
@@ -33,6 +34,7 @@ export interface ManagedProjectUpdateFile {
   readonly path: string;
   readonly ownershipClass: ManagedFileOwnershipClass;
   readonly installedContent: string;
+  readonly installedAlternatives?: readonly string[];
   readonly incomingContent: string;
   readonly generatedSourceVersion: string;
   readonly markerIds: readonly string[];
@@ -48,6 +50,7 @@ export interface PlanManagedProjectUpdateRequest {
 export interface ManagedProjectInstalledFile {
   readonly path: string;
   readonly installedContent: string;
+  readonly installedAlternatives?: readonly string[];
 }
 
 export interface PlanManagedProjectUninstallRequest {
@@ -68,20 +71,30 @@ export interface ManagedProjectUninstallConflictVariants {
 
 interface ManagedProjectActionBase {
   readonly path: string;
-  readonly expectedLocalIdentity: ContentHash;
   readonly record: ManagedFileRecord;
 }
 
+interface ExistingManagedProjectActionBase extends ManagedProjectActionBase {
+  readonly expectedLocalIdentity: ContentHash;
+}
+
+type ManagedProjectRetentionAction = Readonly<
+  ManagedProjectActionBase & {
+    readonly result: "retain";
+    readonly observedKind: ManagedProjectPathKind;
+  }
+>;
+
 export type ManagedProjectUpdateAction =
-  | Readonly<ManagedProjectActionBase & { readonly result: "retain" }>
+  | ManagedProjectRetentionAction
   | Readonly<
-      ManagedProjectActionBase & {
+      ExistingManagedProjectActionBase & {
         readonly result: "update";
         readonly content: string;
       }
     >
   | Readonly<
-      ManagedProjectActionBase & {
+      ExistingManagedProjectActionBase & {
         readonly result: "conflict";
         readonly variants: ManagedProjectConflictVariants;
         readonly localContent: string;
@@ -91,16 +104,18 @@ export type ManagedProjectUpdateAction =
     >;
 
 export type ManagedProjectUninstallAction =
-  | Readonly<ManagedProjectActionBase & { readonly result: "retain" }>
-  | Readonly<ManagedProjectActionBase & { readonly result: "remove" }>
+  | ManagedProjectRetentionAction
   | Readonly<
-      ManagedProjectActionBase & {
+      ExistingManagedProjectActionBase & { readonly result: "remove" }
+    >
+  | Readonly<
+      ExistingManagedProjectActionBase & {
         readonly result: "update";
         readonly content: string;
       }
     >
   | Readonly<
-      ManagedProjectActionBase & {
+      ExistingManagedProjectActionBase & {
         readonly result: "conflict";
         readonly variants: ManagedProjectUninstallConflictVariants;
         readonly localContent: string;
@@ -238,28 +253,41 @@ export async function planManagedProjectUpdate(
         );
       }
 
-      const localContent = await request.fileSystem.readFile(file.path);
-      const expectedLocalIdentity = contentIdentity(localContent);
+      const entry = await request.fileSystem.inspect(file.path);
       if (file.ownershipClass === "user-owned") {
         actions.push(
           Object.freeze({
             path: file.path,
             result: "retain",
-            expectedLocalIdentity,
+            observedKind: entry.kind,
             record: current,
           }),
         );
         continue;
       }
-
-      const installedIdentity = contentIdentity(file.installedContent);
-      if (!sameIdentity(current.installedBaseIdentity, installedIdentity)) {
+      if (entry.kind !== "file") {
         return invalidMutation(
           file.path,
-          "The supplied installed template does not match the recorded base identity.",
-          "Use the template version named by the ownership manifest.",
+          "A generated managed file is unavailable for update planning.",
+          "Restore the recorded generated file or resolve its ownership conflict.",
         );
       }
+      const localContent = await request.fileSystem.readFile(file.path);
+      const expectedLocalIdentity = contentIdentity(localContent);
+
+      const installedContent = matchingInstalledContent(
+        current,
+        file.installedContent,
+        file.installedAlternatives,
+      );
+      if (installedContent === null) {
+        return invalidMutation(
+          file.path,
+          "No supplied installed template matches the recorded base identity.",
+          "Include the historical template selected by the ownership manifest hash.",
+        );
+      }
+      const installedIdentity = contentIdentity(installedContent);
       const record = buildIncomingRecord(file);
       const validation = validateContractRecord({
         contractVersion: RECORD_CONTRACT_VERSION,
@@ -283,7 +311,7 @@ export async function planManagedProjectUpdate(
         }
         const mergedContent = replaceManagedBlocks(
           localContent,
-          file.installedContent,
+          installedContent,
           file.incomingContent,
           file.markerIds,
         );
@@ -324,7 +352,7 @@ export async function planManagedProjectUpdate(
           record: pendingRecord,
           variants: conflictVariantPaths(operationId, file.path),
           localContent,
-          baseContent: file.installedContent,
+          baseContent: installedContent,
           incomingContent: file.incomingContent,
         }),
       );
@@ -362,43 +390,56 @@ export async function planManagedProjectUninstall(
     }
 
     const installedByPath = new Map(
-      request.files.map((file) => [file.path, file.installedContent]),
+      request.files.map((file) => [file.path, file]),
     );
     const operationId = uninstallMutationId(projectManifest, request.files);
     const actions: ManagedProjectUninstallAction[] = [];
     for (const record of [...currentRecords].sort((left, right) =>
       left.path.localeCompare(right.path),
     )) {
-      const localContent = await request.fileSystem.readFile(record.path);
-      const expectedLocalIdentity = contentIdentity(localContent);
+      const entry = await request.fileSystem.inspect(record.path);
       if (record.ownershipClass === "user-owned") {
         actions.push(
           Object.freeze({
             path: record.path,
             result: "retain",
-            expectedLocalIdentity,
+            observedKind: entry.kind,
             record,
           }),
         );
         continue;
       }
+      if (entry.kind !== "file") {
+        return invalidMutation(
+          record.path,
+          "A generated managed file is unavailable for uninstall planning.",
+          "Restore the recorded generated file or resolve its ownership conflict.",
+        );
+      }
+      const localContent = await request.fileSystem.readFile(record.path);
+      const expectedLocalIdentity = contentIdentity(localContent);
 
-      const installedContent = installedByPath.get(record.path);
-      if (installedContent === undefined) {
+      const installedFile = installedByPath.get(record.path);
+      if (installedFile === undefined) {
         return invalidMutation(
           record.path,
           "The installed template required for uninstall is unavailable.",
           "Use the template version named by the ownership manifest.",
         );
       }
-      const installedIdentity = contentIdentity(installedContent);
-      if (!sameIdentity(record.installedBaseIdentity, installedIdentity)) {
+      const installedContent = matchingInstalledContent(
+        record,
+        installedFile.installedContent,
+        installedFile.installedAlternatives,
+      );
+      if (installedContent === null) {
         return invalidMutation(
           record.path,
-          "The supplied installed template does not match the recorded base identity.",
-          "Use the template version named by the ownership manifest.",
+          "No supplied installed template matches the recorded base identity.",
+          "Include the historical template selected by the ownership manifest hash.",
         );
       }
+      const installedIdentity = contentIdentity(installedContent);
       if (record.ownershipClass === "managed-customizable") {
         const retainedContent = removeManagedBlocks(
           localContent,
@@ -562,6 +603,9 @@ async function validatePlanSnapshot(
   plan: ManagedProjectMutationPlan,
 ): Promise<ManagedProjectMutationFailure | null> {
   for (const action of plan.actions) {
+    if (action.result === "retain") {
+      continue;
+    }
     const entry = await fileSystem.inspect(action.path);
     if (entry.kind !== "file") {
       return stalePlan(action.path);
@@ -592,6 +636,9 @@ async function applyManagedProjectUpdate(
     plan.currentRecords.map((record) => [record.path, record]),
   );
   for (const action of plan.actions) {
+    if (action.result === "retain") {
+      continue;
+    }
     const localContent = await fileSystem.readFile(action.path);
     const localIdentity = contentIdentity(localContent);
     const matchesExpected = sameIdentity(
@@ -648,6 +695,9 @@ async function applyManagedProjectUninstall(
     plan.currentRecords.map((record) => [record.path, record]),
   );
   for (const action of plan.actions) {
+    if (action.result === "retain") {
+      continue;
+    }
     const entry = await fileSystem.inspect(action.path);
     if (action.result === "remove" && entry.kind === "missing") {
       recordsByPath.delete(action.path);
@@ -679,7 +729,7 @@ async function applyManagedProjectUninstall(
       await fileSystem.writeFile(action.path, action.content);
       recordsByPath.delete(action.path);
     } else if (action.result === "conflict") {
-      await writeUninstallConflictVariants(fileSystem, action);
+      await writeConflictVariants(fileSystem, action);
     }
   }
 
@@ -783,10 +833,9 @@ function conflictResult(
   });
 }
 
-type ManagedProjectConflictAction = Extract<
-  ManagedProjectUpdateAction,
-  { result: "conflict" }
->;
+type ManagedProjectConflictAction =
+  | Extract<ManagedProjectUpdateAction, { result: "conflict" }>
+  | Extract<ManagedProjectUninstallAction, { result: "conflict" }>;
 
 async function writeConflictVariants(
   fileSystem: ManagedProjectMutationFileSystem,
@@ -799,25 +848,9 @@ async function writeConflictVariants(
   );
   await fileSystem.writeFile(action.variants.local, action.localContent);
   await fileSystem.writeFile(action.variants.base, action.baseContent);
-  await fileSystem.writeFile(action.variants.incoming, action.incomingContent);
-}
-
-type ManagedProjectUninstallConflictAction = Extract<
-  ManagedProjectUninstallAction,
-  { result: "conflict" }
->;
-
-async function writeUninstallConflictVariants(
-  fileSystem: ManagedProjectMutationFileSystem,
-  action: ManagedProjectUninstallConflictAction,
-): Promise<void> {
-  await ensureDirectory(fileSystem, ".sayhi/.runtime/conflicts");
-  await ensureDirectory(
-    fileSystem,
-    `.sayhi/.runtime/conflicts/${conflictOperationDirectory(action.variants.local)}`,
-  );
-  await fileSystem.writeFile(action.variants.local, action.localContent);
-  await fileSystem.writeFile(action.variants.base, action.baseContent);
+  if ("incomingContent" in action) {
+    await fileSystem.writeFile(action.variants.incoming, action.incomingContent);
+  }
 }
 
 async function ensureDirectory(
@@ -876,6 +909,19 @@ function conflictVariantPaths(
 
 function conflictOperationDirectory(path: string): string {
   return path.split("/")[3]!;
+}
+
+function matchingInstalledContent(
+  record: ManagedFileRecord,
+  installedContent: string,
+  alternatives: readonly string[] | undefined,
+): string | null {
+  for (const candidate of [installedContent, ...(alternatives ?? [])]) {
+    if (sameIdentity(record.installedBaseIdentity, contentIdentity(candidate))) {
+      return candidate;
+    }
+  }
+  return null;
 }
 
 async function readProjectManifest(
@@ -1063,13 +1109,15 @@ function isJournalAction(
     typeof value.path !== "string" ||
     !currentPaths.has(value.path) ||
     !isManagedFileRecord(value.record) ||
-    value.record.path !== value.path ||
-    !isContentIdentity(value.expectedLocalIdentity)
+    value.record.path !== value.path
   ) {
     return false;
   }
   if (value.result === "retain") {
-    return true;
+    return isManagedProjectPathKind(value.observedKind);
+  }
+  if (!isContentIdentity(value.expectedLocalIdentity)) {
+    return false;
   }
   if (value.result === "update") {
     return typeof value.content === "string";
@@ -1088,6 +1136,18 @@ function isJournalAction(
     return false;
   }
   return operation === "uninstall" || typeof value.incomingContent === "string";
+}
+
+function isManagedProjectPathKind(
+  value: unknown,
+): value is ManagedProjectPathKind {
+  return (
+    value === "missing" ||
+    value === "file" ||
+    value === "directory" ||
+    value === "symlink" ||
+    value === "other"
+  );
 }
 
 function isManagedFileRecord(value: unknown): value is ManagedFileRecord {

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -138,7 +139,34 @@ test("CLI dry-runs updates read-only and preserves modified Engine-owned files",
     (await runCli(["init", "--cwd", repository, "--json"])).exitCode,
     0,
   );
-  const initialized = await snapshotFiles(repository);
+  const runtimeIgnorePath = join(repository, ".sayhi", ".gitignore");
+  const ownershipPath = join(repository, ".sayhi", "managed-files.json");
+  const manifestPath = join(repository, ".sayhi", "manifest.json");
+  const legacyContent = "/.runtime/\n";
+  const currentContent = "# SayHi local runtime state\n/.runtime/\n";
+  await writeFile(runtimeIgnorePath, legacyContent, "utf8");
+  const ownership = JSON.parse(await readFile(ownershipPath, "utf8")) as {
+    files: Array<{
+      path: string;
+      installedBaseIdentity?: { digest: string };
+      generatedSourceVersion: string;
+    }>;
+  };
+  const runtimeRecord = ownership.files.find(
+    (record) => record.path === ".sayhi/.gitignore",
+  );
+  assert.ok(runtimeRecord?.installedBaseIdentity);
+  runtimeRecord.installedBaseIdentity.digest = createHash("sha256")
+    .update(legacyContent)
+    .digest("hex");
+  runtimeRecord.generatedSourceVersion = "0.0.0";
+  await writeFile(ownershipPath, `${JSON.stringify(ownership, null, 2)}\n`, "utf8");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    installed: { templates: string };
+  };
+  manifest.installed.templates = "0.0.0";
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  const legacySnapshot = await snapshotFiles(repository);
 
   const dryRun = await runCli([
     "update",
@@ -153,15 +181,33 @@ test("CLI dry-runs updates read-only and preserves modified Engine-owned files",
   assert.equal(dryRunEnvelope.ok, true);
   assert.equal(dryRunEnvelope.operation, "project.update");
   assert.equal(dryRunEnvelope.result?.state, "planned");
-  assert.deepEqual(await snapshotFiles(repository), initialized);
-
-  const localContent = "/.runtime/\nuser-local-change\n";
-  await writeFile(
-    join(repository, ".sayhi", ".gitignore"),
-    localContent,
-    "utf8",
+  const actions = dryRunEnvelope.result?.actions as readonly {
+    path: string;
+    result: string;
+  }[];
+  assert.equal(
+    actions.find((action) => action.path === ".sayhi/.gitignore")?.result,
+    "update",
   );
-  const applied = await runCli([
+  assert.deepEqual(await snapshotFiles(repository), legacySnapshot);
+
+  const safeApply = await runCli([
+    "update",
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(safeApply.exitCode, 0);
+  assert.equal(await readFile(runtimeIgnorePath, "utf8"), currentContent);
+  const updatedManifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    installed: { templates: string };
+  };
+  assert.equal(updatedManifest.installed.templates, "0.1.0");
+
+  const localContent = `${currentContent}user-local-change\n`;
+  await writeFile(runtimeIgnorePath, localContent, "utf8");
+  const conflictApply = await runCli([
     "update",
     "--apply",
     "--cwd",
@@ -169,8 +215,8 @@ test("CLI dry-runs updates read-only and preserves modified Engine-owned files",
     "--json",
   ]);
 
-  assert.equal(applied.exitCode, 4);
-  const appliedEnvelope = JSON.parse(applied.stdout) as CliJsonEnvelope;
+  assert.equal(conflictApply.exitCode, 4);
+  const appliedEnvelope = JSON.parse(conflictApply.stdout) as CliJsonEnvelope;
   assert.equal(appliedEnvelope.ok, false);
   assert.equal(appliedEnvelope.operation, "project.update");
   assert.equal(appliedEnvelope.result?.state, "conflict");
@@ -178,10 +224,7 @@ test("CLI dry-runs updates read-only and preserves modified Engine-owned files",
     appliedEnvelope.diagnostics[0]?.code,
     "managed_project.file_modified",
   );
-  assert.equal(
-    await readFile(join(repository, ".sayhi", ".gitignore"), "utf8"),
-    localContent,
-  );
+  assert.equal(await readFile(runtimeIgnorePath, "utf8"), localContent);
   const conflicted = await snapshotFiles(repository);
   assert.equal(
     [...conflicted.keys()].filter((path) =>

@@ -34,13 +34,15 @@ const EMPTY_SKILL_LOCK_DIGEST = `sha256:${createHash("sha256")
   .update('{"skills":[]}')
   .digest("hex")}` as ContractIdentity;
 
+const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
+
 export const CLI_MANAGED_PROJECT_INSTALLATION: InstalledProjectVersions =
   Object.freeze({
     core: "0.0.0",
     cli: "0.0.0",
     ompPlugin: "0.0.0",
     projectSchema: 1,
-    templates: "0.0.0",
+    templates: "0.1.0",
     skillLockDigest: EMPTY_SKILL_LOCK_DIGEST,
   });
 
@@ -57,6 +59,7 @@ const CLI_MANAGED_PROJECT_UPDATE_FILES = Object.freeze([
     path: MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
     ownershipClass: "engine-owned",
     installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+    installedAlternatives: Object.freeze([LEGACY_RUNTIME_IGNORE_CONTENT]),
     incomingContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
     generatedSourceVersion: CLI_MANAGED_PROJECT_INSTALLATION.templates,
     markerIds: Object.freeze([]),
@@ -71,6 +74,7 @@ const CLI_MANAGED_PROJECT_INSTALLED_FILES = Object.freeze([
   Object.freeze({
     path: MANAGED_PROJECT_RUNTIME_IGNORE_PATH,
     installedContent: MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
+    installedAlternatives: Object.freeze([LEGACY_RUNTIME_IGNORE_CONTENT]),
   }),
 ]) satisfies readonly ManagedProjectInstalledFile[];
 
@@ -404,6 +408,7 @@ function summarizeActions(
   actions: readonly Readonly<{
     path: string;
     result: string;
+    observedKind?: string;
     variants?: Readonly<{ local: string; base: string; incoming?: string }>;
   }>[],
 ): readonly Readonly<Record<string, unknown>>[] {
@@ -412,6 +417,9 @@ function summarizeActions(
       Object.freeze({
         path: action.path,
         result: action.result,
+        ...(action.observedKind === undefined
+          ? {}
+          : { observedKind: action.observedKind }),
         ...(action.variants === undefined
           ? {}
           : { variants: action.variants }),
