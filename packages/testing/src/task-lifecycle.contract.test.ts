@@ -2,15 +2,24 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  archiveDurableTask,
   advanceDurableTask,
   createDurableTask,
+  diagnoseDurableTasks,
   recoverDurableTask,
-  type TaskLifecycleFileSystem,
+  type TaskArchiveFileSystem,
+  type TransitionWorkflowRequest,
+  type WorkflowLifecycle,
+  type WorkflowPhase,
+  type WorkflowState,
 } from "@dnslin/sayhi-core";
 
 import {
+  createCompletedDurableTask,
+  taskLifecycleEventMetadata,
   taskLifecycleExploreTransition,
   taskLifecycleStartRequest,
+  taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
 
@@ -28,14 +37,19 @@ const TASK_DIRECTORY = `.sayhi/tasks/${TASK_ID}`;
 const EVENTS_PATH = `${TASK_DIRECTORY}/events.jsonl`;
 const PROJECTION_PATH = `${TASK_DIRECTORY}/task.json`;
 
-class MemoryTaskLifecycleFileSystem implements TaskLifecycleFileSystem {
+class MemoryTaskLifecycleFileSystem implements TaskArchiveFileSystem {
   readonly directories = new Set([".sayhi", ".sayhi/tasks"]);
   readonly files = new Map<string, string>();
   #failNextWritePath: string | null = null;
+  #failNextMove = false;
   readonly #lockTails = new Map<string, Promise<void>>();
 
   failNextWrite(path: string): void {
     this.#failNextWritePath = path;
+  }
+
+  failNextMove(): void {
+    this.#failNextMove = true;
   }
 
   async inspect(path: string) {
@@ -90,6 +104,33 @@ class MemoryTaskLifecycleFileSystem implements TaskLifecycleFileSystem {
       throw new Error(`Injected write failure: ${path}`);
     }
     this.files.set(path, content);
+  }
+  async moveDirectory(source: string, target: string): Promise<void> {
+    if (this.#failNextMove) {
+      this.#failNextMove = false;
+      throw new Error(`Injected move failure: ${source}`);
+    }
+    if (!this.directories.has(source) || this.directories.has(target)) {
+      throw new Error(`Cannot move ${source} to ${target}.`);
+    }
+    const directories = [...this.directories].filter(
+      (path) => path === source || path.startsWith(`${source}/`),
+    );
+    const files = [...this.files.entries()].filter(([path]) =>
+      path.startsWith(`${source}/`),
+    );
+    for (const path of directories) {
+      this.directories.delete(path);
+    }
+    for (const [path] of files) {
+      this.files.delete(path);
+    }
+    for (const path of directories) {
+      this.directories.add(`${target}${path.slice(source.length)}`);
+    }
+    for (const [path, content] of files) {
+      this.files.set(`${target}${path.slice(source.length)}`, content);
+    }
   }
 
   async withTaskMutationLock<Result>(
@@ -202,6 +243,16 @@ test("durable Task recovery rebuilds the authoritative Projection from Events", 
     JSON.parse(fileSystem.files.get(PROJECTION_PATH)!),
     advanced.state.projection,
   );
+
+  const snapshot = new Map(fileSystem.files);
+  const retried = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(retried.ok, true);
+  if (!retried.ok) {
+    return;
+  }
+  assert.equal(retried.recovered, false);
+  assert.deepEqual(retried.state, recovered.state);
+  assert.deepEqual(fileSystem.files, snapshot);
 });
 
 test("truncated Event history fails with a diagnostic and no mutation", async () => {
@@ -454,4 +505,151 @@ function parseJsonObject(source: string): object {
 
 function startRequest() {
   return taskLifecycleStartRequest(TASK_FIXTURE, "2026-07-14T10:00:00Z");
+}
+
+test("archiving removes a completed Task from active Task listing without losing audit history", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  fileSystem.directories.add(".sayhi/tasks/archive");
+  const completed = await createCompletedDurableTask(
+    fileSystem,
+    TASK_FIXTURE,
+    "2026-07-14T10:00:00Z",
+    "2026-07-15T12:00:00Z",
+  );
+  fileSystem.directories.add(`${TASK_DIRECTORY}/evidence`);
+  fileSystem.files.set(
+    `${TASK_DIRECTORY}/evidence/provenance.json`,
+    "{\"source\":\"issue-13\"}\n",
+  );
+
+  const archiveTransition = transitionForFixture(
+    completed,
+    "archived",
+    "finish",
+    "ARCHIVE",
+  );
+  const archived = await archiveDurableTask({ fileSystem, transition: archiveTransition });
+
+  assert.equal(archived.ok, true);
+  if (!archived.ok) {
+    return;
+  }
+  assert.equal(archived.moved, true);
+  assert.equal(archived.state.projection.lifecycle, "archived");
+  const archivedDirectory = `.sayhi/tasks/archive/${TASK_ID}`;
+  const archivedEventsPath = `${archivedDirectory}/events.jsonl`;
+  const archivedProjectionPath = `${archivedDirectory}/task.json`;
+  assert.equal(fileSystem.files.has(EVENTS_PATH), false);
+  assert.equal(fileSystem.files.get(`${archivedDirectory}/evidence/provenance.json`), "{\"source\":\"issue-13\"}\n");
+  assert.equal(
+    fileSystem.files.get(archivedEventsPath)?.split("\n").filter(Boolean).length,
+    completed.events.length + 1,
+  );
+  assert.deepEqual(
+    JSON.parse(fileSystem.files.get(archivedProjectionPath)!),
+    archived.state.projection,
+  );
+
+  const diagnosed = await diagnoseDurableTasks({ fileSystem });
+  assert.equal(diagnosed.ok, true);
+  if (!diagnosed.ok) {
+    return;
+  }
+  assert.equal(diagnosed.taskCount, 0);
+
+  const archiveHistory = fileSystem.files.get(archivedEventsPath);
+
+  const identical = await archiveDurableTask({
+    fileSystem,
+    transition: archiveTransition,
+  });
+  assert.equal(identical.ok, true);
+  if (!identical.ok) {
+    return;
+  }
+  assert.equal(identical.moved, false);
+
+  const conflicting = await archiveDurableTask({
+    fileSystem,
+    transition: { ...archiveTransition, gates: [] },
+  });
+  assert.equal(conflicting.ok, false);
+  if (conflicting.ok) {
+    return;
+  }
+  assert.equal(
+    conflicting.diagnostics[0]?.code,
+    "workflow.event.idempotency_conflict",
+  );
+  assert.equal(fileSystem.files.get(archivedEventsPath), archiveHistory);
+  const retried = await archiveDurableTask({
+    fileSystem,
+    transition: transitionForFixture(completed, "archived", "finish", "ARCHIVE-RETRY"),
+  });
+  assert.equal(retried.ok, true);
+  if (!retried.ok) {
+    return;
+  }
+  assert.equal(retried.moved, false);
+  assert.deepEqual(retried.state, archived.state);
+  assert.equal(fileSystem.files.get(archivedEventsPath), archiveHistory);
+});
+
+test("an interrupted archive move resumes without appending another archive Event", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  fileSystem.directories.add(".sayhi/tasks/archive");
+  const completed = await createCompletedDurableTask(
+    fileSystem,
+    TASK_FIXTURE,
+    "2026-07-14T10:00:00Z",
+    "2026-07-15T12:00:00Z",
+  );
+  fileSystem.failNextMove();
+
+  const interrupted = await archiveDurableTask({
+    fileSystem,
+    transition: transitionForFixture(completed, "archived", "finish", "ARCHIVE-INTERRUPTED"),
+  });
+  assert.equal(interrupted.ok, false);
+  if (interrupted.ok) {
+    return;
+  }
+  assert.equal(interrupted.diagnostics[0]?.code, "task_lifecycle.io_failed");
+  assert.equal(
+    fileSystem.files.get(EVENTS_PATH)?.split("\n").filter(Boolean).length,
+    completed.events.length + 1,
+  );
+
+  const resumed = await archiveDurableTask({
+    fileSystem,
+    transition: transitionForFixture(completed, "archived", "finish", "ARCHIVE-RESUMED"),
+  });
+  assert.equal(resumed.ok, true);
+  if (!resumed.ok) {
+    return;
+  }
+  assert.equal(resumed.moved, true);
+  const archivedEvents = fileSystem.files.get(
+    `.sayhi/tasks/archive/${TASK_ID}/events.jsonl`,
+  );
+  assert.equal(
+    archivedEvents?.split("\n").filter(Boolean).length,
+    completed.events.length + 1,
+  );
+});
+
+function transitionForFixture(
+  state: WorkflowState,
+  lifecycle: WorkflowLifecycle,
+  phase: WorkflowPhase,
+  suffix: string,
+): TransitionWorkflowRequest {
+  return taskLifecycleTransition(
+    TASK_FIXTURE,
+    state,
+    lifecycle,
+    phase,
+    suffix,
+    "2026-07-15T12:00:00Z",
+  );
 }

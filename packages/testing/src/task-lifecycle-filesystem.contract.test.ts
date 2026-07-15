@@ -9,21 +9,25 @@ import test from "node:test";
 
 import { NodeManagedProjectFileSystem, runCli } from "@dnslin/sayhi-cli";
 import {
+  archiveDurableTask,
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  diagnoseDurableTasks,
   initializeManagedProject,
   recoverDurableTask,
   withDurableTaskWriter,
-  type ContractIdentity,
   type BaselineRecord,
+  type ContractIdentity,
   type TaskScope,
 } from "@dnslin/sayhi-core";
 
 import {
+  createCompletedDurableTask,
   taskLifecycleExploreTransition,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
+  taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
 
@@ -121,6 +125,82 @@ test("Node filesystem persists and recovers a Task across adapter instances", as
     JSON.parse(await readFile(projectionPath, "utf8")),
     advanced.state.projection,
   );
+});
+
+test("Node filesystem archives a completed Task directory idempotently", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-archive-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const initialized = await initializeManagedProject({
+    fileSystem,
+    installation: INSTALLATION,
+    projectId: "PROJECT-13-ARCHIVE",
+    timestamp: "2026-07-15T12:30:00Z",
+  });
+  assert.equal(initialized.ok, true);
+  const completed = await createCompletedDurableTask(
+    fileSystem,
+    TASK_FIXTURE,
+    "2026-07-14T11:00:00Z",
+    "2026-07-15T12:30:00Z",
+  );
+  const activeDirectory = `.sayhi/tasks/${TASK_ID}`;
+  await fileSystem.createDirectory(`${activeDirectory}/evidence`);
+  await fileSystem.writeFile(
+    `${activeDirectory}/evidence/provenance.json`,
+    "{\"source\":\"issue-13\"}\n",
+  );
+
+  const archived = await archiveDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      completed,
+      "archived",
+      "finish",
+      "ARCHIVE",
+      "2026-07-15T12:30:00Z",
+    ),
+  });
+  assert.equal(archived.ok, true);
+  if (!archived.ok) {
+    return;
+  }
+  assert.equal(archived.moved, true);
+  const archivedDirectory = `.sayhi/tasks/archive/${TASK_ID}`;
+  assert.equal((await fileSystem.inspect(activeDirectory)).kind, "missing");
+  assert.equal(
+    await fileSystem.readFile(`${archivedDirectory}/evidence/provenance.json`),
+    "{\"source\":\"issue-13\"}\n",
+  );
+  const archivedEventsPath = `${archivedDirectory}/events.jsonl`;
+  const history = await fileSystem.readFile(archivedEventsPath);
+  assert.equal(history.split("\n").filter(Boolean).length, completed.events.length + 1);
+
+  const diagnosis = await diagnoseDurableTasks({ fileSystem });
+  assert.equal(diagnosis.ok, true);
+  if (!diagnosis.ok) {
+    return;
+  }
+  assert.equal(diagnosis.taskCount, 0);
+
+  const retried = await archiveDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      completed,
+      "archived",
+      "finish",
+      "ARCHIVE-RETRY",
+      "2026-07-15T12:30:00Z",
+    ),
+  });
+  assert.equal(retried.ok, true);
+  if (!retried.ok) {
+    return;
+  }
+  assert.equal(retried.moved, false);
+  assert.equal(await fileSystem.readFile(archivedEventsPath), history);
 });
 
 test("Node filesystem serializes concurrent Task advances across adapters", async (t) => {
@@ -555,3 +635,4 @@ function exploreTransition(
     occurredAt,
   );
 }
+

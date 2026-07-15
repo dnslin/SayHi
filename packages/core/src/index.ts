@@ -26,6 +26,7 @@ import {
 } from "./workflow.js";
 import {
   advanceDurableTask,
+  archiveDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
   diagnoseDurableTasks,
@@ -278,6 +279,7 @@ export type {
 export {
   TASK_LIFECYCLE_CONTRACT_VERSION,
   addDurableContextManifestEntry,
+  archiveDurableTask,
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
@@ -291,6 +293,8 @@ export {
   withDurableTaskWriter,
 } from "./task-lifecycle.js";
 export type {
+  ArchiveDurableTaskRequest,
+  ArchiveDurableTaskResult,
   AdvanceDurableTaskRequest,
   AddDurableContextManifestEntryRequest,
   AddDurableContextManifestEntryResult,
@@ -318,6 +322,7 @@ export type {
   TaskLifecycleDiagnosticCode,
   TaskLifecycleDirectoryEntry,
   TaskLifecycleFileSystem,
+  TaskArchiveFileSystem,
   TaskBaselineCaptureRequest,
   TaskBaselineFileSystem,
   TaskWriter,
@@ -352,6 +357,7 @@ export interface CoreContract {
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly createDurableTask: typeof createDurableTask;
   readonly advanceDurableTask: typeof advanceDurableTask;
+  readonly archiveDurableTask: typeof archiveDurableTask;
   readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
   readonly refreshDurableContextManifest: typeof refreshDurableContextManifest;
   readonly freezeDurableContextManifest: typeof freezeDurableContextManifest;
@@ -391,6 +397,7 @@ export const coreContract: CoreContract = Object.freeze({
   recordContextManifestChange,
   createDurableTask,
   advanceDurableTask,
+  archiveDurableTask,
   addDurableContextManifestEntry,
   refreshDurableContextManifest,
   freezeDurableContextManifest,
