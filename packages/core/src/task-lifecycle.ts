@@ -2317,6 +2317,7 @@ type PreparedDurableQuickResult = Readonly<{
 async function prepareDurableQuickResult(
   request: RecordDurableQuickResultRequest,
   paths: TaskPaths,
+  allowIdempotentCompletionRetry = false,
 ): Promise<
   | Readonly<{ ok: true; value: PreparedDurableQuickResult }>
   | TaskLifecycleFailure
@@ -2325,7 +2326,10 @@ async function prepareDurableQuickResult(
   if (!loaded.ok) {
     return loaded;
   }
-  if (loaded.state.projection.version !== request.expectedVersion) {
+  if (
+    !allowIdempotentCompletionRetry &&
+    loaded.state.projection.version !== request.expectedVersion
+  ) {
     return failure([
       diagnostic(
         "workflow.version.stale",
@@ -2475,7 +2479,7 @@ async function completeDurableQuickResultLocked(
       "Provide the accepted completed/finish transition for this Quick version.",
     );
   }
-  const prepared = await prepareDurableQuickResult(request, paths);
+  const prepared = await prepareDurableQuickResult(request, paths, true);
   if (!prepared.ok) {
     return prepared;
   }
@@ -2492,12 +2496,16 @@ async function completeDurableQuickResultLocked(
     projectionVersion: transitioned.state.projection.version,
     workflow: transitioned.state,
   });
+  const appended =
+    transitioned.state.events.length > prepared.value.loaded.state.events.length;
   let activePath = prepared.value.loaded.eventsPath;
   try {
-    await request.fileSystem.appendFile(
-      prepared.value.loaded.eventsPath,
-      serializeEvent(transitioned.event),
-    );
+    if (appended) {
+      await request.fileSystem.appendFile(
+        prepared.value.loaded.eventsPath,
+        serializeEvent(transitioned.event),
+      );
+    }
     activePath = prepared.value.loaded.projectionPath;
     await writeProjectionIfChanged(
       request.fileSystem,

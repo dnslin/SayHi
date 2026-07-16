@@ -1442,41 +1442,14 @@ test("packaged CLI completes and archives a changed Quick without committing", a
     eventNamespace: "17-CHANGED-QUICK",
     sessionRef: "session-17-changed-quick",
   }) satisfies TaskLifecycleFixture;
-  const buildStart = taskLifecycleStartRequest(fixture, "2026-07-16T14:00:00Z");
-  const start = {
-    ...buildStart,
-    task: { ...buildStart.task, route: "quick" as const },
-  };
-  const created = coreContract.startWorkflowTask(start);
-  if (!created.ok) {
-    throw new Error(created.diagnostics[0]?.message ?? "Quick creation failed");
-  }
-  let expectedState = created.state;
-  const transitions = [];
-  for (const [lifecycle, phase, suffix] of [
-    ["active", "implement", "IMPLEMENT"],
-    ["active", "review", "REVIEW"],
-    ["active", "finish", "FINISH"],
-    ["completed", "finish", "COMPLETE"],
-  ] as const) {
-    const transition = taskLifecycleTransition(
-      fixture,
-      expectedState,
-      lifecycle,
-      phase,
-      suffix,
-      "2026-07-16T14:00:01Z",
-    );
-    transitions.push(transition);
-    const advanced = coreContract.transitionWorkflow(expectedState, transition);
-    if (!advanced.ok) {
-      throw new Error(advanced.diagnostics[0]?.message ?? "Quick transition failed");
-    }
-    expectedState = advanced.state;
-  }
+  const { start, transitions, completedState } = createChangedQuickCompletion(
+    fixture,
+    "2026-07-16T14:00:00Z",
+    "2026-07-16T14:00:01Z",
+  );
   const archive = taskLifecycleTransition(
     fixture,
-    expectedState,
+    completedState,
     "archived",
     "finish",
     "ARCHIVE",
@@ -1630,38 +1603,11 @@ test("packaged CLI stops a changed Quick write outside its approved scope", asyn
     eventNamespace: "17-OUTSIDE-SCOPE",
     sessionRef: "session-17-outside-scope",
   }) satisfies TaskLifecycleFixture;
-  const buildStart = taskLifecycleStartRequest(fixture, "2026-07-16T15:00:00Z");
-  const start = {
-    ...buildStart,
-    task: { ...buildStart.task, route: "quick" as const },
-  };
-  const created = coreContract.startWorkflowTask(start);
-  if (!created.ok) {
-    throw new Error(created.diagnostics[0]?.message ?? "Quick creation failed");
-  }
-  let expectedState = created.state;
-  const transitions = [];
-  for (const [lifecycle, phase, suffix] of [
-    ["active", "implement", "IMPLEMENT"],
-    ["active", "review", "REVIEW"],
-    ["active", "finish", "FINISH"],
-    ["completed", "finish", "COMPLETE"],
-  ] as const) {
-    const transition = taskLifecycleTransition(
-      fixture,
-      expectedState,
-      lifecycle,
-      phase,
-      suffix,
-      "2026-07-16T15:00:01Z",
-    );
-    transitions.push(transition);
-    const advanced = coreContract.transitionWorkflow(expectedState, transition);
-    if (!advanced.ok) {
-      throw new Error(advanced.diagnostics[0]?.message ?? "Quick transition failed");
-    }
-    expectedState = advanced.state;
-  }
+  const { start, transitions } = createChangedQuickCompletion(
+    fixture,
+    "2026-07-16T15:00:00Z",
+    "2026-07-16T15:00:01Z",
+  );
   await writeTaskRequest(repository, "outside-scope-quick.json", {
     start,
     transitions,
@@ -1670,7 +1616,17 @@ test("packaged CLI stops a changed Quick write outside its approved scope", asyn
       { path: "outside-scope.txt", content: "must not be written\n" },
     ],
   });
-  await runGit(repository, "add", "outside-scope-quick.json");
+  await writeTaskRequest(repository, "outside-scope-retry-quick.json", {
+    start,
+    transitions,
+    writes: [{ path: "README.md", content: "recovered by Quick\n" }],
+  });
+  await runGit(
+    repository,
+    "add",
+    "outside-scope-quick.json",
+    "outside-scope-retry-quick.json",
+  );
   await runGit(repository, "commit", "--quiet", "-m", "Quick request");
 
   const headBefore = await readGitHead(repository);
@@ -1691,14 +1647,23 @@ test("packaged CLI stops a changed Quick write outside its approved scope", asyn
   assert.equal(await readFile(join(repository, "README.md"), "utf8"), "scoped Quick fixture\n");
   await assert.rejects(readFile(join(repository, "outside-scope.txt"), "utf8"));
   assert.equal(await readGitHead(repository), headBefore);
-  const activeProjection = JSON.parse(
-    await readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "task.json"), "utf8"),
-  ) as { lifecycle: string; phase: string };
-  assert.equal(activeProjection.lifecycle, "active");
-  assert.equal(activeProjection.phase, "implement");
   await assert.rejects(
-    readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "quick.json"), "utf8"),
+    readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "task.json"), "utf8"),
   );
+  const recovered = await executeCliResult(
+    "quick",
+    "complete",
+    "--from",
+    "outside-scope-retry-quick.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(recovered.exitCode, 0);
+  const recoveredEnvelope = JSON.parse(recovered.stdout) as CliJsonEnvelope;
+  assert.equal(recoveredEnvelope.result?.outcome, "changed");
+  assertQuickProjection(recoveredEnvelope.result?.projection, "completed");
+  assert.equal(await readFile(join(repository, "README.md"), "utf8"), "recovered by Quick\n");
 });
 async function showTaskState(repository: string): Promise<WorkflowState> {
   const shown = await executeCliResult(
@@ -1715,6 +1680,50 @@ async function showTaskState(repository: string): Promise<WorkflowState> {
     projection: envelope.result?.projection as WorkflowState["projection"],
     events: envelope.result?.events as WorkflowState["events"],
   };
+}
+
+function createChangedQuickCompletion(
+  fixture: TaskLifecycleFixture,
+  startTimestamp: string,
+  transitionTimestamp: string,
+) {
+  const buildStart = taskLifecycleStartRequest(fixture, startTimestamp);
+  const start = {
+    ...buildStart,
+    task: { ...buildStart.task, route: "quick" as const },
+  };
+  const created = coreContract.startWorkflowTask(start);
+  if (!created.ok) {
+    throw new Error(created.diagnostics[0]?.message ?? "Quick creation failed");
+  }
+  let completedState = created.state;
+  const transitions = [];
+  for (const [lifecycle, phase, suffix] of [
+    ["active", "implement", "IMPLEMENT"],
+    ["active", "review", "REVIEW"],
+    ["active", "finish", "FINISH"],
+    ["completed", "finish", "COMPLETE"],
+  ] as const) {
+    const transition = taskLifecycleTransition(
+      fixture,
+      completedState,
+      lifecycle,
+      phase,
+      suffix,
+      transitionTimestamp,
+    );
+    transitions.push(transition);
+    const advanced = coreContract.transitionWorkflow(completedState, transition);
+    if (!advanced.ok) {
+      throw new Error(advanced.diagnostics[0]?.message ?? "Quick transition failed");
+    }
+    completedState = advanced.state;
+  }
+  return Object.freeze({
+    start,
+    transitions: Object.freeze(transitions),
+    completedState,
+  });
 }
 
 async function writeTaskRequest(
