@@ -55,6 +55,7 @@ export const TASK_LIFECYCLE_CONTRACT_VERSION = 1 as const;
 
 const TASKS_DIRECTORY = ".sayhi/tasks";
 const TASK_ARCHIVE_DIRECTORY = `${TASKS_DIRECTORY}/archive`;
+const QUICK_RESULT_FILE_NAME = "quick.json";
 
 export interface TaskLifecycleDirectoryEntry {
   readonly name: string;
@@ -87,6 +88,9 @@ export interface TaskBaselineCaptureRequest {
 export interface TaskWriter {
   writeFile(path: string, content: string): Promise<void>;
 }
+export interface ScopedTaskWriter extends TaskWriter {
+  assertWritablePath(path: string): void;
+}
 
 export interface TaskBaselineFileSystem extends TaskLifecycleFileSystem {
   captureBaseline(request: TaskBaselineCaptureRequest): Promise<BaselineRecord>;
@@ -118,6 +122,8 @@ export type TaskLifecycleDiagnosticCode =
   | "context_manifest.entry.missing"
   | "context_manifest.stale"
   | "task_lifecycle.handoff.invalid"
+  | "task_lifecycle.quick_result.invalid"
+  | "task_lifecycle.quick_result.missing"
   | "initiative_graph.record.missing"
   | "initiative_graph.record.invalid"
   | "initiative_graph.record.conflict"
@@ -171,6 +177,33 @@ export interface DurableTaskHandoff {
   readonly repositoryFingerprint: string;
   readonly artifactReferences: readonly string[];
   readonly createdAt: string;
+}
+export type DurableQuickRecordLocation = "active" | "archive";
+export interface DurableQuickResult {
+  readonly schemaVersion: 1;
+  readonly taskId: string;
+  readonly projectionVersion: number;
+  readonly baselineBefore: BaselineRecord;
+  readonly baselineAfter: BaselineRecord;
+  readonly changedPaths: readonly string[];
+  readonly commit: null;
+  readonly workflow: WorkflowState;
+}
+export interface RecordDurableQuickResultRequest {
+  readonly fileSystem: TaskBaselineFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly baselineAfter: BaselineRecord;
+  readonly changedPaths: readonly string[];
+}
+export interface CompleteDurableQuickResultRequest
+  extends RecordDurableQuickResultRequest {
+  readonly transition: TransitionWorkflowRequest;
+}
+export interface ReadDurableQuickResultRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+  readonly location: DurableQuickRecordLocation;
 }
 export interface ReadDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
@@ -228,7 +261,7 @@ export interface WithDurableTaskWriterRequest<Value> {
   readonly fileSystem: TaskBaselineFileSystem;
   readonly taskId: string;
   readonly expectedVersion: number;
-  readonly operation: (writer: TaskWriter) => Promise<Value>;
+  readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
 }
 export interface AddDurableContextManifestEntryRequest {
   readonly fileSystem: ContextManifestFileSystem;
@@ -423,6 +456,31 @@ export type ArchiveDurableTaskResult =
       moved: boolean;
     }>
   | TaskLifecycleFailure;
+export type RecordDurableQuickResultResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      result: DurableQuickResult;
+    }>
+  | TaskLifecycleFailure;
+export type CompleteDurableQuickResultResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: WorkflowTransitionedEvent;
+      result: DurableQuickResult;
+    }>
+  | TaskLifecycleFailure;
+export type ReadDurableQuickResultResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      result: DurableQuickResult;
+      location: DurableQuickRecordLocation;
+    }>
+  | TaskLifecycleFailure;
 
 export type DiagnoseDurableTasksResult =
   | Readonly<{
@@ -447,6 +505,7 @@ interface TaskPaths {
   readonly graphPath: string;
   readonly handoffPath: string;
   readonly lockPath: string;
+  readonly quickResultPath: string;
 }
 
 type LoadTaskResult =
@@ -635,6 +694,79 @@ export async function withDurableTaskWriter<Value>(
   } catch {
     return writerUnavailable();
   }
+}
+export async function recordDurableQuickResult(
+  request: RecordDurableQuickResultRequest,
+): Promise<RecordDurableQuickResultResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await request.fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        recordDurableQuickResultLocked(request, paths),
+      ),
+    );
+  } catch {
+    return writerUnavailable();
+  }
+}
+export async function completeDurableQuickResult(
+  request: CompleteDurableQuickResultRequest,
+): Promise<CompleteDurableQuickResultResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await request.fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        completeDurableQuickResultLocked(request, paths),
+      ),
+    );
+  } catch {
+    return writerUnavailable();
+  }
+}
+export async function readDurableQuickResult(
+  request: ReadDurableQuickResultRequest,
+): Promise<ReadDurableQuickResultResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, async () => {
+    const taskDirectory =
+      request.location === "active"
+        ? paths.taskDirectory
+        : paths.archiveTaskDirectory;
+    const loaded = await loadTask(request.fileSystem, request.taskId, taskDirectory);
+    if (!loaded.ok) {
+      return loaded;
+    }
+    if (loaded.state.projection.route !== "quick") {
+      return quickResultInvalid(
+        taskDirectory,
+        "The durable Task is not a Quick.",
+        "Use the Task lifecycle commands for Build and Initiative records.",
+      );
+    }
+    const result = await loadDurableQuickResult(
+      request.fileSystem,
+      `${taskDirectory}/${QUICK_RESULT_FILE_NAME}`,
+      loaded.state,
+    );
+    return result.ok
+      ? Object.freeze({
+          ok: true as const,
+          contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+          state: loaded.state,
+          result: result.value,
+          location: request.location,
+        })
+      : result;
+  });
 }
 export async function readDurableTask(
   request: ReadDurableTaskRequest,
@@ -2143,7 +2275,7 @@ async function withDurableTaskWriterLocked<Value>(
   }
   try {
     const value = await request.operation(
-      new ScopedTaskWriter(writer, loaded.state.projection.scope),
+      new ScopedTaskWriterAdapter(writer, loaded.state.projection.scope),
     );
     const finalBaseline = await captureCurrentTaskBaseline(
       request.fileSystem,
@@ -2172,6 +2304,223 @@ async function withDurableTaskWriterLocked<Value>(
   }
 }
 
+type PreparedDurableQuickResult = Readonly<{
+  loaded: Extract<LoadTaskResult, Readonly<{ ok: true }>>;
+  baselineBefore: BaselineRecord;
+  baselineAfter: BaselineRecord;
+  changedPaths: readonly string[];
+}>;
+
+async function prepareDurableQuickResult(
+  request: RecordDurableQuickResultRequest,
+  paths: TaskPaths,
+): Promise<
+  | Readonly<{ ok: true; value: PreparedDurableQuickResult }>
+  | TaskLifecycleFailure
+> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  if (loaded.state.projection.version !== request.expectedVersion) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedVersion",
+        "The durable Quick changed before its result could be recorded.",
+        "Reload the current Quick Projection and retry completion.",
+      ),
+    ]);
+  }
+  if (loaded.state.projection.route !== "quick") {
+    return quickResultInvalid(
+      paths.quickResultPath,
+      "Only Quick Tasks can record a Quick result.",
+      "Use the Task lifecycle record for Build and Initiative results.",
+    );
+  }
+  const baselinePath = taskBaselinePath(paths, loaded.state.projection.baselineRef);
+  const baselineBefore = await loadTaskBaseline(request.fileSystem, baselinePath);
+  if (!baselineBefore.ok) {
+    return baselineBefore;
+  }
+  if (
+    stableJson(baselineBefore.baseline.declaredScope) !==
+      stableJson(loaded.state.projection.scope) ||
+    !hasExactAdoption(baselineBefore.baseline) ||
+    latestBaselineAdoption(loaded.state) === null
+  ) {
+    return quickResultInvalid(
+      baselinePath,
+      "Quick result recording requires an adopted Baseline for the declared scope.",
+      "Capture and adopt the current Baseline before recording the changed Quick result.",
+    );
+  }
+  const baselineAfter = validateBaselineRecord(request.baselineAfter, "$.baselineAfter");
+  if (!baselineAfter.ok) {
+    return baselineAfter;
+  }
+  if (
+    stableJson(baselineAfter.baseline.declaredScope) !==
+      stableJson(loaded.state.projection.scope) ||
+    stableJson(baselineAfter.baseline.adoptedPaths) !==
+      stableJson(baselineBefore.baseline.adoptedPaths)
+  ) {
+    return quickResultInvalid(
+      "$.baselineAfter",
+      "Quick result Baseline does not match the durable Quick scope.",
+      "Record the Writer's final Baseline for this Quick without modifying its adopted paths.",
+    );
+  }
+  const changedPaths = changedBaselinePaths(
+    baselineBefore.baseline,
+    baselineAfter.baseline,
+  );
+  if (
+    changedPaths.length === 0 ||
+    !sameStrings(request.changedPaths, changedPaths) ||
+    !changedPaths.every((path) =>
+      isWritableTaskPath(path, loaded.state.projection.scope.files),
+    )
+  ) {
+    return quickResultInvalid(
+      "$.changedPaths",
+      "Quick result paths must be the non-empty scoped diff between its Baselines.",
+      "Record the exact paths changed through the approved Quick Writer.",
+    );
+  }
+  const current = await captureCurrentTaskBaseline(
+    request.fileSystem,
+    request.taskId,
+    paths,
+    loaded.state.projection.scope,
+    baselineBefore.baseline.adoptedPaths,
+  );
+  if (!current.ok) {
+    return current;
+  }
+  if (!sameBaselineMaterial(baselineAfter.baseline, current.baseline)) {
+    return baselineDrift();
+  }
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      loaded,
+      baselineBefore: baselineBefore.baseline,
+      baselineAfter: baselineAfter.baseline,
+      changedPaths,
+    }),
+  });
+}
+
+async function recordDurableQuickResultLocked(
+  request: RecordDurableQuickResultRequest,
+  paths: TaskPaths,
+): Promise<RecordDurableQuickResultResult> {
+  const prepared = await prepareDurableQuickResult(request, paths);
+  if (!prepared.ok) {
+    return prepared;
+  }
+  if (
+    prepared.value.loaded.state.projection.lifecycle !== "completed" ||
+    prepared.value.loaded.state.projection.phase !== "finish"
+  ) {
+    return quickResultInvalid(
+      paths.quickResultPath,
+      "Quick results can be recorded only after the completed Finish transition.",
+      "Complete the Quick through Finish before recording its durable result.",
+    );
+  }
+  const result = Object.freeze({
+    schemaVersion: 1 as const,
+    taskId: prepared.value.loaded.state.projection.id,
+    projectionVersion: prepared.value.loaded.state.projection.version,
+    workflow: prepared.value.loaded.state,
+    baselineBefore: prepared.value.baselineBefore,
+    baselineAfter: prepared.value.baselineAfter,
+    changedPaths: prepared.value.changedPaths,
+    commit: null,
+  });
+  try {
+    await request.fileSystem.writeFile(
+      paths.quickResultPath,
+      serializeDurableQuickResult(result),
+    );
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      result,
+    });
+  } catch {
+    return ioFailure(paths.quickResultPath);
+  }
+}
+
+async function completeDurableQuickResultLocked(
+  request: CompleteDurableQuickResultRequest,
+  paths: TaskPaths,
+): Promise<CompleteDurableQuickResultResult> {
+  if (
+    request.transition.taskId !== request.taskId ||
+    request.transition.expectedVersion !== request.expectedVersion ||
+    request.transition.to.lifecycle !== "completed" ||
+    request.transition.to.phase !== "finish"
+  ) {
+    return quickResultInvalid(
+      "$.transition",
+      "Quick completion requires the current completed Finish transition.",
+      "Provide the accepted completed/finish transition for this Quick version.",
+    );
+  }
+  const prepared = await prepareDurableQuickResult(request, paths);
+  if (!prepared.ok) {
+    return prepared;
+  }
+  const transitioned = transitionWorkflow(
+    prepared.value.loaded.state,
+    request.transition,
+  );
+  if (!transitioned.ok) {
+    return failure(transitioned.diagnostics);
+  }
+  const result = Object.freeze({
+    schemaVersion: 1 as const,
+    taskId: transitioned.state.projection.id,
+    projectionVersion: transitioned.state.projection.version,
+    workflow: transitioned.state,
+    baselineBefore: prepared.value.baselineBefore,
+    baselineAfter: prepared.value.baselineAfter,
+    changedPaths: prepared.value.changedPaths,
+    commit: null,
+  });
+  let activePath = prepared.value.loaded.eventsPath;
+  try {
+    await request.fileSystem.appendFile(
+      prepared.value.loaded.eventsPath,
+      serializeEvent(transitioned.event),
+    );
+    activePath = prepared.value.loaded.projectionPath;
+    await writeProjectionIfChanged(
+      request.fileSystem,
+      prepared.value.loaded.projectionPath,
+      transitioned.state.projection,
+    );
+    activePath = paths.quickResultPath;
+    await request.fileSystem.writeFile(
+      paths.quickResultPath,
+      serializeDurableQuickResult(result),
+    );
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: transitioned.state,
+      event: transitioned.event,
+      result,
+    });
+  } catch {
+    return ioFailure(activePath);
+  }
+}
 async function runWithTaskLock<Result>(
   fileSystem: TaskLifecycleFileSystem,
   lockPath: string,
@@ -2428,6 +2777,149 @@ async function loadTaskBaseline(
     return ioFailure(path);
   }
 }
+async function loadDurableQuickResult(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  state: WorkflowState,
+): Promise<
+  | Readonly<{ ok: true; value: DurableQuickResult }>
+  | TaskLifecycleFailure
+> {
+  try {
+    const entry = await fileSystem.inspect(path);
+    if (entry.kind === "missing") {
+      return quickResultMissing(path);
+    }
+    if (entry.kind !== "file") {
+      return quickResultInvalid(
+        path,
+        "The durable Quick result is missing or unsafe.",
+        "Restore quick.json as a regular file before retrying.",
+      );
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(await fileSystem.readFile(path));
+    } catch {
+      return quickResultInvalid(
+        path,
+        "The durable Quick result is not valid JSON.",
+        "Restore a complete quick.json file before retrying.",
+      );
+    }
+    if (!isQuickResultRecord(value)) {
+      return quickResultInvalid(
+        path,
+        "The durable Quick result is structurally invalid.",
+        "Restore the Quick result recorded by Core before retrying.",
+      );
+    }
+    if (
+      value.schemaVersion !== 1 ||
+      typeof value.taskId !== "string" ||
+      typeof value.projectionVersion !== "number" ||
+      !Array.isArray(value.changedPaths) ||
+      value.commit !== null ||
+      !("baselineBefore" in value) ||
+      !("baselineAfter" in value) ||
+      !("workflow" in value)
+    ) {
+      return quickResultInvalid(
+        path,
+        "The durable Quick result is structurally invalid.",
+        "Restore the complete Quick result recorded by Core before retrying.",
+      );
+    }
+    const baselineBefore = validateBaselineRecord(value.baselineBefore, `${path}.baselineBefore`);
+    if (!baselineBefore.ok) {
+      return baselineBefore;
+    }
+    const baselineAfter = validateBaselineRecord(value.baselineAfter, `${path}.baselineAfter`);
+    if (!baselineAfter.ok) {
+      return baselineAfter;
+    }
+    const changedPaths = changedBaselinePaths(
+      baselineBefore.baseline,
+      baselineAfter.baseline,
+    );
+    const projectionVersion =
+      typeof value.projectionVersion === "number" ? value.projectionVersion : null;
+    const workflow = replayQuickResultWorkflow(value.workflow, path, state);
+    if (!workflow.ok) {
+      return workflow;
+    }
+    if (
+      value.schemaVersion !== 1 ||
+      value.taskId !== state.projection.id ||
+      projectionVersion === null ||
+      !Number.isSafeInteger(projectionVersion) ||
+      projectionVersion < 1 ||
+      projectionVersion > state.projection.version ||
+      workflow.state.projection.version !== projectionVersion ||
+      value.commit !== null ||
+      changedPaths.length === 0 ||
+      !sameStrings(value.changedPaths, changedPaths) ||
+      !changedPaths.every((path) =>
+        isWritableTaskPath(path, state.projection.scope.files),
+      )
+    ) {
+      return quickResultInvalid(
+        path,
+        "The durable Quick result does not match its Quick Task.",
+        "Restore the Quick result recorded for this Task and its accepted scope.",
+      );
+    }
+    return Object.freeze({
+      ok: true,
+      value: Object.freeze({
+        schemaVersion: 1 as const,
+        taskId: state.projection.id,
+        projectionVersion,
+        workflow: workflow.state,
+        baselineBefore: baselineBefore.baseline,
+        baselineAfter: baselineAfter.baseline,
+        changedPaths: Object.freeze([...changedPaths]),
+        commit: null,
+      }),
+    });
+  } catch {
+    return ioFailure(path);
+  }
+}
+function replayQuickResultWorkflow(
+  value: unknown,
+  path: string,
+  current: WorkflowState,
+): Readonly<{ ok: true; state: WorkflowState }> | TaskLifecycleFailure {
+  if (!isQuickResultRecord(value) || !Array.isArray(value.events)) {
+    return quickResultInvalid(
+      `${path}.workflow`,
+      "The durable Quick result is missing its workflow audit.",
+      "Restore the workflow Projection and Events recorded for this Quick.",
+    );
+  }
+  const replayed = replayWorkflowEvents(value.events);
+  if (!replayed.ok) {
+    return quickResultInvalid(
+      `${path}.workflow.events`,
+      "The durable Quick workflow audit cannot be replayed.",
+      "Restore the accepted Quick Events before retrying.",
+    );
+  }
+  if (
+    replayed.state.projection.lifecycle !== "completed" ||
+    replayed.state.projection.phase !== "finish" ||
+    replayed.state.projection.id !== current.projection.id ||
+    !isWorkflowEventPrefix(replayed.state.events, current.events)
+  ) {
+    return quickResultInvalid(
+      `${path}.workflow`,
+      "The durable Quick workflow audit does not belong to this Task history.",
+      "Restore the workflow snapshot recorded from this Quick Task.",
+    );
+  }
+  return Object.freeze({ ok: true, state: replayed.state });
+}
 
 function validateBaselineRecord(
   record: unknown,
@@ -2575,7 +3067,16 @@ function changedBaselinePaths(
 
 
 }
-class ScopedTaskWriter implements TaskWriter {
+function isWorkflowEventPrefix(
+  prefix: readonly WorkflowEvent[],
+  current: readonly WorkflowEvent[],
+): boolean {
+  return (
+    prefix.length <= current.length &&
+    prefix.every((event, index) => stableJson(event) === stableJson(current[index]))
+  );
+}
+class ScopedTaskWriterAdapter implements ScopedTaskWriter {
   readonly #writer: TaskWriter;
   readonly #scope: TaskScope;
 
@@ -2584,10 +3085,14 @@ class ScopedTaskWriter implements TaskWriter {
     this.#scope = scope;
   }
 
-  async writeFile(path: string, content: string): Promise<void> {
+  assertWritablePath(path: string): void {
     if (!isWritableTaskPath(path, this.#scope.files)) {
       throw new TaskWriterScopeError(path);
     }
+  }
+
+  async writeFile(path: string, content: string): Promise<void> {
+    this.assertWritablePath(path);
     await this.#writer.writeFile(path, content);
   }
 }
@@ -2717,6 +3222,7 @@ function taskPaths(taskId: unknown):
     graphPath: `${taskDirectory}/graph.json`,
     lockPath: `.sayhi/.runtime/task-${taskId}.lock`,
     handoffPath: `${taskDirectory}/handoff.json`,
+    quickResultPath: `${taskDirectory}/${QUICK_RESULT_FILE_NAME}`,
   });
 }
 
@@ -2744,6 +3250,9 @@ function serializeInitiativeGraph(graph: DependencyGraph): string {
 
 function serializeHandoff(handoff: DurableTaskHandoff): string {
   return `${JSON.stringify(handoff, null, 2)}\n`;
+}
+function serializeDurableQuickResult(result: DurableQuickResult): string {
+  return `${JSON.stringify(result, null, 2)}\n`;
 }
 
 async function loadDurableTaskHandoff(
@@ -2858,6 +3367,9 @@ function validateHandoffInput(
 function isHandoffRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+function isQuickResultRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function sameStrings(value: unknown, expected: readonly string[]): boolean {
   return (
@@ -2889,6 +3401,25 @@ function invalidHandoff(
 ): TaskLifecycleFailure {
   return failure([
     diagnostic("task_lifecycle.handoff.invalid", path, message, remediation),
+  ]);
+}
+function quickResultInvalid(
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([
+    diagnostic("task_lifecycle.quick_result.invalid", path, message, remediation),
+  ]);
+}
+function quickResultMissing(path: string): TaskLifecycleFailure {
+  return failure([
+    diagnostic(
+      "task_lifecycle.quick_result.missing",
+      path,
+      "The durable Quick result was not found.",
+      "Complete the changed Quick before showing or archiving it.",
+    ),
   ]);
 }
 

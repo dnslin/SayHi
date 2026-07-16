@@ -18,6 +18,7 @@ import {
   initializeManagedProject,
   recoverDurableTask,
   withDurableTaskWriter,
+  recordDurableQuickResult,
   type BaselineRecord,
   type ContractIdentity,
   type TaskScope,
@@ -403,6 +404,124 @@ test("Writer rejects Baseline drift before changing project files", async (t) =>
   );
 });
 
+test("Quick result rejects drift after the scoped Writer completes", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-result-drift-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await mkdir(join(repository, "packages", "core"), { recursive: true });
+  await writeFile(
+    join(repository, "packages", "core", "existing.ts"),
+    "export const state = 'clean';\n",
+    "utf8",
+  );
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const initialized = await initializeManagedProject({
+    fileSystem,
+    installation: INSTALLATION,
+    projectId: "PROJECT-17-QUICK-DRIFT",
+    timestamp: "2026-07-16T15:30:00Z",
+  });
+  assert.equal(initialized.ok, true);
+  await runGit(repository, "add", "--all");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  const fixture = Object.freeze({
+    ...TASK_FIXTURE,
+    taskId: "TASK-17-QUICK-DRIFT",
+    eventNamespace: "17-QUICK-DRIFT",
+  });
+  const buildStart = taskLifecycleStartRequest(fixture, "2026-07-16T15:30:01Z");
+  const created = await createDurableTask({
+    fileSystem,
+    start: { ...buildStart, task: { ...buildStart.task, route: "quick" } },
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const implementing = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      fixture,
+      created.state,
+      "active",
+      "implement",
+      "IMPLEMENT",
+      "2026-07-16T15:30:02Z",
+    ),
+  });
+  assert.equal(implementing.ok, true);
+  if (!implementing.ok) {
+    return;
+  }
+  const baseline = await fileSystem.captureBaseline({
+    taskId: fixture.taskId,
+    declaredScope: implementing.state.projection.scope,
+    adoptedPaths: [],
+  });
+  const adopted = await adoptDurableTaskBaseline({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: implementing.state.projection.version,
+    baseline,
+    event: taskLifecycleEventMetadata(
+      fixture,
+      "BASELINE",
+      "2026-07-16T15:30:03Z",
+    ),
+  });
+  assert.equal(adopted.ok, true);
+  if (!adopted.ok) {
+    return;
+  }
+  const written = await withDurableTaskWriter({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: adopted.state.projection.version,
+    operation: async (writer) => {
+      await writer.writeFile("packages/core/quick-change.ts", "export const changed = true;\n");
+    },
+  });
+  assert.equal(written.ok, true);
+  if (!written.ok) {
+    return;
+  }
+  const premature = await recordDurableQuickResult({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: adopted.state.projection.version,
+    baselineAfter: written.finalBaseline,
+    changedPaths: written.changedPaths,
+  });
+  assert.equal(premature.ok, false);
+  if (!premature.ok) {
+    assert.equal(premature.diagnostics[0]?.code, "task_lifecycle.quick_result.invalid");
+  }
+  await assert.rejects(
+    readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "quick.json"), "utf8"),
+  );
+  await writeFile(
+    join(repository, "packages", "core", "existing.ts"),
+    "export const state = 'drifted';\n",
+    "utf8",
+  );
+  const recorded = await recordDurableQuickResult({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: adopted.state.projection.version,
+    baselineAfter: written.finalBaseline,
+    changedPaths: written.changedPaths,
+  });
+  assert.equal(recorded.ok, false);
+  if (!recorded.ok) {
+    assert.equal(recorded.diagnostics[0]?.code, "task_lifecycle.baseline.drift");
+  }
+  await assert.rejects(
+    readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "quick.json"), "utf8"),
+  );
+});
 test("Node Writer serializes concurrent mutation attempts", async (t) => {
   const { repository, fileSystem, created } = await createTaskRepository();
   t.after(async () => rm(repository, { recursive: true, force: true }));

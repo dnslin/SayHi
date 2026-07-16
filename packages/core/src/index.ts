@@ -31,6 +31,9 @@ import {
   adoptDurableTaskBaseline,
   createDurableTask,
   createDurableTaskHandoff,
+  completeDurableQuickResult,
+  readDurableQuickResult,
+  recordDurableQuickResult,
   diagnoseDurableTasks,
   listDurableTasks,
   recoverDurableTask,
@@ -289,9 +292,12 @@ export {
   adoptDurableTaskBaseline,
   createDurableTask,
   createDurableTaskHandoff,
+  completeDurableQuickResult,
   diagnoseDurableTasks,
   listDurableTasks,
   recoverDurableTask,
+  readDurableQuickResult,
+  recordDurableQuickResult,
   readDurableTask,
   refreshDurableContextManifest,
   freezeDurableContextManifest,
@@ -333,6 +339,14 @@ export type {
   ListDurableTasksResult,
   RecoverDurableTaskRequest,
   RecoverDurableTaskResult,
+  DurableQuickRecordLocation,
+  DurableQuickResult,
+  ReadDurableQuickResultRequest,
+  ReadDurableQuickResultResult,
+  RecordDurableQuickResultRequest,
+  RecordDurableQuickResultResult,
+  CompleteDurableQuickResultRequest,
+  CompleteDurableQuickResultResult,
   ReadDurableTaskRequest,
   ReadDurableTaskResult,
   TaskLifecycleDiagnostic,
@@ -343,6 +357,7 @@ export type {
   TaskBaselineCaptureRequest,
   TaskBaselineFileSystem,
   TaskWriter,
+  ScopedTaskWriter,
   WithDurableTaskWriterRequest,
   WithDurableTaskWriterResult,
 } from "./task-lifecycle.js";
@@ -374,6 +389,9 @@ export interface CoreContract {
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
+  readonly readDurableQuickResult: typeof readDurableQuickResult;
+  readonly recordDurableQuickResult: typeof recordDurableQuickResult;
+  readonly completeDurableQuickResult: typeof completeDurableQuickResult;
   readonly advanceDurableTask: typeof advanceDurableTask;
   readonly archiveDurableTask: typeof archiveDurableTask;
   readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
@@ -417,6 +435,9 @@ export const coreContract: CoreContract = Object.freeze({
   recordContextManifestChange,
   createDurableTask,
   createDurableTaskHandoff,
+  readDurableQuickResult,
+  recordDurableQuickResult,
+  completeDurableQuickResult,
   advanceDurableTask,
   archiveDurableTask,
   addDurableContextManifestEntry,
