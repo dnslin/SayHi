@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 
 import { NodeManagedProjectFileSystem } from "@dnslin/sayhi-cli";
 import {
+  coreContract,
   withDurableTaskWriter,
   type WorkflowLifecycle,
   type WorkflowPhase,
@@ -1201,6 +1202,225 @@ test("packaged CLI doctor fails closed on corrupt durable Event history", async 
   assert.equal(await readFile(projectionPath, "utf8"), projection);
 });
 
+test("packaged CLI completes an auditable no-change Quick without repository writes", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-no-change-"));
+  const auditRoot = await mkdtemp(join(tmpdir(), "sayhi-quick-audit-"));
+  const nestedAuditRoot = await mkdtemp(join(tmpdir(), "sayhi-quick-nested-audit-"));
+  t.after(async () =>
+    Promise.all([
+      rm(repository, { recursive: true, force: true }),
+      rm(auditRoot, { recursive: true, force: true }),
+      rm(nestedAuditRoot, { recursive: true, force: true }),
+    ]),
+  );
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await writeFile(join(repository, "README.md"), "no-change Quick fixture\n", "utf8");
+  await runGit(repository, "add", "README.md");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  const fixture = Object.freeze({
+    taskId: "TASK-16-NO-CHANGE-QUICK",
+    title: "Complete a packaged no-change Quick",
+    goal: "Determine that no project change is needed",
+    acceptanceCriterion: "The Quick records a no-change result without repository writes",
+    files: Object.freeze([]),
+    eventNamespace: "16-NO-CHANGE-QUICK",
+    sessionRef: "session-16-no-change-quick",
+  }) satisfies TaskLifecycleFixture;
+  const buildStart = taskLifecycleStartRequest(fixture, "2026-07-16T13:00:00Z");
+  const start = {
+    ...buildStart,
+    task: { ...buildStart.task, route: "quick" as const },
+  };
+  const created = coreContract.startWorkflowTask(start);
+  if (!created.ok) {
+    throw new Error(created.diagnostics[0]?.message ?? "Quick creation failed");
+  }
+  let expectedState = created.state;
+  const transitions = [];
+  for (const [lifecycle, phase, suffix] of [
+    ["active", "implement", "IMPLEMENT"],
+    ["active", "review", "REVIEW"],
+    ["active", "finish", "FINISH"],
+    ["completed", "finish", "COMPLETE"],
+  ] as const) {
+    const transition = taskLifecycleTransition(
+      fixture,
+      expectedState,
+      lifecycle,
+      phase,
+      suffix,
+      "2026-07-16T13:00:01Z",
+    );
+    transitions.push(transition);
+    const advanced = coreContract.transitionWorkflow(expectedState, transition);
+    if (!advanced.ok) {
+      throw new Error(advanced.diagnostics[0]?.message ?? "Quick transition failed");
+    }
+    expectedState = advanced.state;
+  }
+  const archive = taskLifecycleTransition(
+    fixture,
+    expectedState,
+    "archived",
+    "finish",
+    "ARCHIVE",
+    "2026-07-16T13:00:02Z",
+  );
+  await writeTaskRequest(repository, "quick-complete.json", { start, transitions });
+  await writeTaskRequest(repository, "quick-archive.json", archive);
+
+  const repositoryBefore = await snapshotRepositoryFiles(repository);
+  const headBefore = await readGitHead(repository);
+  const environment = { ...process.env, SAYHI_QUICK_AUDIT_DIR: auditRoot };
+  const completed = await executeCliWithEnvironment(
+    environment,
+    "quick",
+    "complete",
+    "--from",
+    "quick-complete.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  const completedEnvelope = JSON.parse(completed.stdout) as CliJsonEnvelope;
+  assert.equal(completedEnvelope.operation, "quick.complete");
+  assert.equal(completedEnvelope.result?.taskId, fixture.taskId);
+  assert.equal(completedEnvelope.result?.outcome, "no-change");
+  assertQuickProjection(completedEnvelope.result?.projection, "completed");
+  assert.deepEqual(
+    quickEventPhases(completedEnvelope.result?.events),
+    ["triage", "implement", "review", "finish", "finish"],
+  );
+  assert.deepEqual(await snapshotRepositoryFiles(repository), repositoryBefore);
+  assert.equal(await readGitHead(repository), headBefore);
+
+  const shown = await executeCliWithEnvironment(
+    environment,
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  const shownEnvelope = JSON.parse(shown.stdout) as CliJsonEnvelope;
+  assert.equal(shownEnvelope.operation, "quick.show");
+  assertQuickProjection(shownEnvelope.result?.projection, "completed");
+  assert.equal(shownEnvelope.result?.outcome, "no-change");
+  const activeAuditPath = await locateQuickAuditFile(auditRoot, "active");
+
+
+  const archived = await executeCliWithEnvironment(
+    environment,
+    "quick",
+    "archive",
+    fixture.taskId,
+    "--from",
+    "quick-archive.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  const archivedEnvelope = JSON.parse(archived.stdout) as CliJsonEnvelope;
+  assert.equal(archivedEnvelope.operation, "quick.archive");
+  assertQuickProjection(archivedEnvelope.result?.projection, "archived");
+  assert.equal(archivedEnvelope.result?.outcome, "no-change");
+  const archiveAuditPath = await locateQuickAuditFile(auditRoot, "archive");
+  const interruptedArchiveAudit = await readFile(archiveAuditPath, "utf8");
+  await rm(archiveAuditPath);
+  await writeFile(activeAuditPath, interruptedArchiveAudit, "utf8");
+  const staleLockDirectory = join(dirname(dirname(activeAuditPath)), "locks");
+  await mkdir(staleLockDirectory, { recursive: true });
+  await writeFile(
+    join(staleLockDirectory, `${basename(activeAuditPath)}.lock`),
+    "interrupted\n",
+    "utf8",
+  );
+  const recoveredArchive = await executeCliWithEnvironment(
+    environment,
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assertQuickProjection(readCliProjection(JSON.parse(recoveredArchive.stdout)), "archived");
+  const retriedArchive = await executeCliWithEnvironment(
+    environment,
+    "quick",
+    "archive",
+    fixture.taskId,
+    "--from",
+    "quick-archive.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assertQuickProjection(readCliProjection(JSON.parse(retriedArchive.stdout)), "archived");
+  const duplicateCompletion = await executeCliResultWithEnvironment(
+    environment,
+    "quick",
+    "complete",
+    "--from",
+    "quick-complete.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(duplicateCompletion.exitCode, 4);
+  const archivedAuditPath = await locateQuickAuditFile(auditRoot, "archive");
+  await writeFile(
+    archivedAuditPath,
+    withoutQuickOutcome(await readFile(archivedAuditPath, "utf8")),
+    "utf8",
+  );
+  const missingOutcome = await executeCliResultWithEnvironment(
+    environment,
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(missingOutcome.exitCode, 3);
+
+
+  const unsafeAuditRoot = join(auditRoot, "repository-link");
+  await symlink(repository, unsafeAuditRoot, "junction");
+  const unsafeCompletion = await executeCliResultWithEnvironment(
+    { ...process.env, SAYHI_QUICK_AUDIT_DIR: unsafeAuditRoot },
+    "quick",
+    "complete",
+    "--from",
+    "quick-complete.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(unsafeCompletion.exitCode, 4);
+
+  await symlink(repository, join(nestedAuditRoot, "quick"), "junction");
+  const nestedUnsafeCompletion = await executeCliResultWithEnvironment(
+    { ...process.env, SAYHI_QUICK_AUDIT_DIR: nestedAuditRoot },
+    "quick",
+    "complete",
+    "--from",
+    "quick-complete.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(nestedUnsafeCompletion.exitCode, 4);
+  assert.deepEqual(await snapshotRepositoryFiles(repository), repositoryBefore);
+
+  assert.equal(await readGitHead(repository), headBefore);
+});
+
 async function showTaskState(repository: string): Promise<WorkflowState> {
   const shown = await executeCliResult(
     "task",
@@ -1268,25 +1488,46 @@ async function advanceFoundationTask(
 }
 
 async function executeCli(...args: readonly string[]) {
-  return executeFile(process.execPath, [CLI_BINARY, ...args]);
+  return executeCliWithEnvironment(process.env, ...args);
 }
 
 async function runGit(repository: string, ...args: readonly string[]) {
   await executeFile("git", args, { cwd: repository, windowsHide: true });
 }
 
+interface CliProcessOutput {
+  readonly stdout: string;
+  readonly stderr: string;
+}
+
 async function executeCliResult(...args: readonly string[]) {
+  return executeCliResultFor(() => executeCli(...args));
+}
+
+async function executeCliWithEnvironment(
+  environment: NodeJS.ProcessEnv,
+  ...args: readonly string[]
+) {
+  return executeFile(process.execPath, [CLI_BINARY, ...args], { env: environment });
+}
+
+async function executeCliResultWithEnvironment(
+  environment: NodeJS.ProcessEnv,
+  ...args: readonly string[]
+) {
+  return executeCliResultFor(() => executeCliWithEnvironment(environment, ...args));
+}
+
+async function executeCliResultFor(
+  execute: () => Promise<CliProcessOutput>,
+) {
   try {
-    const result = await executeCli(...args);
-    return Object.freeze({
-      exitCode: 0,
-      stdout: result.stdout,
-      stderr: result.stderr,
-    });
+    const result = await execute();
+    return Object.freeze({ exitCode: 0, stdout: result.stdout, stderr: result.stderr });
   } catch (error: unknown) {
     if (
-      typeof error === "object" &&
       error !== null &&
+      typeof error === "object" &&
       "code" in error &&
       "stdout" in error &&
       "stderr" in error &&
@@ -1302,4 +1543,91 @@ async function executeCliResult(...args: readonly string[]) {
     }
     throw error;
   }
+}
+
+
+async function readGitHead(repository: string): Promise<string> {
+  const result = await executeFile("git", ["rev-parse", "HEAD"], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  return result.stdout.trim();
+}
+
+async function snapshotRepositoryFiles(repository: string): Promise<ReadonlyMap<string, string>> {
+  const files = new Map<string, string>();
+  await collectRepositoryFiles(repository, repository, files);
+  return files;
+}
+
+async function collectRepositoryFiles(
+  repository: string,
+  directory: string,
+  files: Map<string, string>,
+): Promise<void> {
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      await collectRepositoryFiles(repository, path, files);
+      continue;
+    }
+    if (entry.isFile()) {
+      files.set(path.slice(repository.length + 1), await readFile(path, "utf8"));
+    }
+  }
+}
+
+function assertQuickProjection(value: unknown, lifecycle: "completed" | "archived"): void {
+  assert.ok(value !== null && typeof value === "object");
+  assert.ok("route" in value && "lifecycle" in value && "phase" in value);
+  assert.equal(value.route, "quick");
+  assert.equal(value.lifecycle, lifecycle);
+  assert.equal(value.phase, "finish");
+}
+
+function quickEventPhases(value: unknown): readonly string[] {
+  assert.ok(Array.isArray(value));
+  return value.map((event) => {
+    assert.ok(event !== null && typeof event === "object");
+    assert.ok("to" in event);
+    const to = event.to;
+    assert.ok(to !== null && typeof to === "object" && "phase" in to);
+    assert.equal(typeof to.phase, "string");
+    return to.phase;
+  });
+}
+
+
+function readCliResult(value: unknown): unknown {
+  assert.ok(value !== null && typeof value === "object" && "result" in value);
+  return value.result;
+}
+
+function readCliProjection(value: unknown): unknown {
+  const result = readCliResult(value);
+  assert.ok(result !== null && typeof result === "object" && "projection" in result);
+  return result.projection;
+}
+
+function withoutQuickOutcome(source: string): string {
+  const value: unknown = JSON.parse(source);
+  assert.ok(value !== null && typeof value === "object" && "outcome" in value);
+  delete value.outcome;
+  return `${JSON.stringify(value)}\n`;
+}
+
+async function locateQuickAuditFile(
+  auditRoot: string,
+  location: "active" | "archive",
+): Promise<string> {
+  const repositoryDirectories = await readdir(join(auditRoot, "quick"), {
+    withFileTypes: true,
+  });
+  const repositoryDirectory = repositoryDirectories.find((entry) => entry.isDirectory());
+  assert.ok(repositoryDirectory);
+  const auditDirectory = join(auditRoot, "quick", repositoryDirectory.name, location);
+  const auditFiles = await readdir(auditDirectory, { withFileTypes: true });
+  const auditFile = auditFiles.find((entry) => entry.isFile());
+  assert.ok(auditFile);
+  return join(auditDirectory, auditFile.name);
 }

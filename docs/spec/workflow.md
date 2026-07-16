@@ -235,7 +235,7 @@ archived
 
 1. Create local Quick identity and Baseline.
 2. Execute Triage, Implement, and Review in runtime state.
-3. If no project change exists, close runtime state without Project Store artifacts.
+3. If no project change exists, close runtime state without Project Store artifacts while retaining a compact external runtime audit that remains inspectable and archivable after restart.
 4. If a project change exists, Finish creates a Quick Record containing intent, route reason, scope, acceptance criteria, evidence, review, changed paths, and commit/fingerprint state.
 5. If escalation is required, create a full Task using the same identity, import valid Quick evidence, and enter Explore or Plan. Prior code changes become explicit Baseline state requiring review.
 

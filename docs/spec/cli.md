@@ -87,9 +87,16 @@ sayhi task unblock <task-id> --from <transition-request.json>
 sayhi task complete <task-id> --from <transition-request.json>
 sayhi task archive <task-id> --from <transition-request.json>
 sayhi task recover <task-id> --apply
+
+sayhi quick complete --from <completion-request.json>
+sayhi quick show <task-id>
+sayhi quick archive <task-id> --from <transition-request.json>
 ```
 
 Commands that imply a transition MUST use the same transition service as the OMP `workflow_advance` Tool. Administrative commands cannot skip Gates unless a specific, audited override operation exists.
+
+`quick complete` transports a Start request plus every gated Quick transition to Core, then retains the completed no-change audit outside the repository. `quick show` replays that audit through Core after restart; `quick archive` transports a Core-valid archive transition. The external audit root defaults to the local user runtime directory and MAY be set with `SAYHI_QUICK_AUDIT_DIR`, which MUST remain outside the repository.
+Every persisted no-change audit MUST record `outcome: "no-change"`; `quick complete`, `quick show`, and `quick archive` return that validated outcome in their JSON result.
 
 `task create`, `task advance`, `task block`, `task unblock`, `task complete`, and `task archive` read their request JSON from a regular, repository-relative file. The CLI transports that request to Core; Core remains the sole validator of Task state, versions, Gates, Events, and archive eligibility.
 
@@ -190,7 +197,7 @@ These commands inspect the installed Skill Lock, sidecars, Agent contracts, gene
 
 ## 5. Mutation protocol
 
-Every mutating CLI command MUST:
+Every CLI command that mutates the Project Store MUST:
 
 1. resolve repository root and Project Store;
 2. verify version compatibility;
@@ -202,6 +209,8 @@ Every mutating CLI command MUST:
 8. atomically apply projections/files where possible;
 9. verify postconditions;
 10. release the lock and report the durable result.
+
+No-change Quick audit mutations are the exception: they MUST NOT create a Project Store Task directory. They MUST resolve the Git root and a real audit root outside the repository, capture and compare the Baseline, require either an absent audit or a Core-validated expected version, use atomic per-Task record creation and archived-state replacement/move, retry an interrupted move from that archived Event, replay the persisted Events as a postcondition, and report the durable result.
 
 An interrupt signal propagates through the operation. Cancellation leaves existing durable state valid and reports any external side effect whose result is unknown.
 
