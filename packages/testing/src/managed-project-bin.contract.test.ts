@@ -43,19 +43,6 @@ const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
 
-const FOUNDATION_TASK = Object.freeze({
-  taskId: "TASK-15-FOUNDATION",
-  title: "Demonstrate the recoverable Foundation CLI",
-  goal: "Recover a durable Task through the packaged CLI scenario",
-  acceptanceCriterion:
-    "The packaged CLI preserves recoverable Foundation state",
-  files: Object.freeze(["packages/core/**"]),
-  eventNamespace: "15-FOUNDATION",
-  sessionRef: "session-15-foundation",
-}) satisfies TaskLifecycleFixture;
-const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
-const CURRENT_RUNTIME_IGNORE_CONTENT =
-  "# SayHi local runtime state\n/.runtime/\n";
 
 test("packaged CLI binary executes Managed Project lifecycle commands", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-cli-binary-"));
