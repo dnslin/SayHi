@@ -32,6 +32,7 @@ import {
   createDurableTask,
   createDurableTaskHandoff,
   diagnoseDurableTasks,
+  listDurableTasks,
   recoverDurableTask,
   readDurableTask,
   refreshDurableContextManifest,
@@ -289,6 +290,7 @@ export {
   createDurableTask,
   createDurableTaskHandoff,
   diagnoseDurableTasks,
+  listDurableTasks,
   recoverDurableTask,
   readDurableTask,
   refreshDurableContextManifest,
@@ -327,6 +329,8 @@ export type {
   CreateDurableTaskResult,
   DiagnoseDurableTasksRequest,
   DiagnoseDurableTasksResult,
+  ListDurableTasksRequest,
+  ListDurableTasksResult,
   RecoverDurableTaskRequest,
   RecoverDurableTaskResult,
   ReadDurableTaskRequest,
@@ -380,6 +384,7 @@ export interface CoreContract {
   readonly readDurableTask: typeof readDurableTask;
   readonly adoptDurableTaskBaseline: typeof adoptDurableTaskBaseline;
   readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
+  readonly listDurableTasks: typeof listDurableTasks;
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
@@ -422,6 +427,7 @@ export const coreContract: CoreContract = Object.freeze({
   readDurableTask,
   adoptDurableTaskBaseline,
   diagnoseDurableTasks,
+  listDurableTasks,
   withDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,

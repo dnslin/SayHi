@@ -77,18 +77,21 @@ sayhi flow resume <task-id>
 sayhi flow pause [--reason <text>]
 sayhi flow abort [--reason <text>]
 
-sayhi task create
+sayhi task create --from <start-request.json>
 sayhi task show <task-id>
 sayhi task list
 sayhi task events <task-id>
-sayhi task block <task-id>
-sayhi task unblock <task-id>
-sayhi task complete <task-id>
-sayhi task archive <task-id>
-sayhi task recover <task-id> --plan|--apply
+sayhi task advance <task-id> --from <transition-request.json>
+sayhi task block <task-id> --from <transition-request.json>
+sayhi task unblock <task-id> --from <transition-request.json>
+sayhi task complete <task-id> --from <transition-request.json>
+sayhi task archive <task-id> --from <transition-request.json>
+sayhi task recover <task-id> --apply
 ```
 
 Commands that imply a transition MUST use the same transition service as the OMP `workflow_advance` Tool. Administrative commands cannot skip Gates unless a specific, audited override operation exists.
+
+`task create`, `task advance`, `task block`, `task unblock`, `task complete`, and `task archive` read their request JSON from a regular, repository-relative file. The CLI transports that request to Core; Core remains the sole validator of Task state, versions, Gates, Events, and archive eligibility.
 
 ### 4.3 Baseline and Git
 
@@ -99,7 +102,7 @@ sayhi task commit-plan <task-id>
 sayhi task commit <task-id>
 ```
 
-`adopt` MUST display or output the exact pre-existing changes entering task scope. `commit-plan` is read-only and lists Gate state, paths, existing index content, proposed message, and exclusions. The CLI MUST refuse to stage unknown pre-existing content.
+`adopt` MUST display or output every pre-existing dirty path captured in the shared checkout Baseline, including paths outside the declared Task Scope; it MUST refuse incomplete adoption. `commit-plan` is read-only and lists Gate state, paths, existing index content, proposed message, and exclusions. The CLI MUST refuse to stage unknown pre-existing content.
 
 No V1 command performs push, reset, stash, rebase, revert, or forced checkout.
 
