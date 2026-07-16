@@ -27,7 +27,9 @@ import {
   type StartWorkflowTaskRequest,
   type TransitionWorkflowRequest,
   type BaselineRecord,
+  type DurableQuickResult,
   type WorkflowState,
+  type TaskBaselineFileSystem,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -45,6 +47,9 @@ const EMPTY_SKILL_LOCK_DIGEST = `sha256:${createHash("sha256")
   .digest("hex")}` as ContractIdentity;
 
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
+const QUICK_RUNTIME_TASKS_DIRECTORY = ".sayhi/.runtime/quicks";
+const QUICK_TASKS_DIRECTORY = ".sayhi/tasks";
+
 
 export const CLI_MANAGED_PROJECT_INSTALLATION: InstalledProjectVersions =
   Object.freeze({
@@ -224,8 +229,9 @@ interface ParsedQuickArguments {
 }
 type QuickArgumentResult = ParsedQuickArguments | InvalidCliArguments;
 
-type QuickAuditOutcome = "no-change";
-const NO_CHANGE_QUICK_OUTCOME: QuickAuditOutcome = "no-change";
+type QuickOutcome = "no-change" | "changed";
+const NO_CHANGE_QUICK_OUTCOME: QuickOutcome = "no-change";
+const CHANGED_QUICK_OUTCOME: QuickOutcome = "changed";
 
 
 
@@ -624,45 +630,42 @@ async function runQuickCli(parsed: ParsedQuickArguments): Promise<CliRunResult> 
   if (typeof repositoryRoot !== "string") {
     return repositoryRoot;
   }
-  let auditStore: NodeQuickAuditStore;
-  try {
-    auditStore = await NodeQuickAuditStore.open(repositoryRoot);
-  } catch (error) {
-    return cliQuickAuditFailure(operation, error, parsed.json);
-  }
   const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
   switch (parsed.subcommand) {
     case "complete":
-      return completeNoChangeQuick(fileSystem, auditStore, parsed);
-    case "show": {
-      const recovered = await recoverQuickAudit(
-        auditStore,
-        parsed.taskId!,
-        operation,
-        parsed.json,
-      );
-      return recovered.ok
-        ? cliSuccess(
-            operation,
-            Object.freeze({
-              taskId: recovered.state.projection.id,
-              projection: recovered.state.projection,
-              events: recovered.state.events,
-              outcome: recovered.outcome,
-              archived: recovered.archived,
-            }),
-            parsed.json,
-          )
-        : recovered.result;
-    }
+      return completeQuick(fileSystem, repositoryRoot, parsed);
+    case "show":
+      return showQuick(fileSystem, repositoryRoot, parsed);
     case "archive":
-      return archiveNoChangeQuick(fileSystem, auditStore, parsed);
+      return archiveQuick(fileSystem, repositoryRoot, parsed);
+  }
+}
+type QuickAuditStoreOpen =
+  | Readonly<{ ok: true; value: NodeQuickAuditStore }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+
+async function openQuickAuditStore(
+  repositoryRoot: string,
+  operation: string,
+  json: boolean,
+): Promise<QuickAuditStoreOpen> {
+  try {
+    return Object.freeze({
+      ok: true as const,
+      value: await NodeQuickAuditStore.open(repositoryRoot),
+    });
+  } catch (error) {
+    return Object.freeze({
+      ok: false as const,
+      result: cliQuickAuditFailure(operation, error, json),
+    });
   }
 }
 
-async function completeNoChangeQuick(
+
+async function completeQuick(
   fileSystem: NodeManagedProjectFileSystem,
-  auditStore: NodeQuickAuditStore,
+  repositoryRoot: string,
   parsed: ParsedQuickArguments,
 ): Promise<CliRunResult> {
   const operation = "quick.complete";
@@ -675,13 +678,27 @@ async function completeNoChangeQuick(
   if (!request.ok) {
     return request.result;
   }
-  const startValue = request.value.start;
-  const transitionsValue = request.value.transitions;
   if (
-    !isStartWorkflowTaskRequestCandidate(startValue) ||
-    !Array.isArray(transitionsValue) ||
-    !transitionsValue.every(isTransitionWorkflowRequestCandidate)
+    request.value.writes !== undefined &&
+    (!Array.isArray(request.value.writes) || request.value.writes.length > 0)
   ) {
+    return completeChangedQuick(fileSystem, request.value, parsed);
+  }
+  const auditStore = await openQuickAuditStore(repositoryRoot, operation, parsed.json);
+  return auditStore.ok
+    ? completeNoChangeQuick(fileSystem, auditStore.value, parsed, request.value)
+    : auditStore.result;
+}
+
+async function completeNoChangeQuick(
+  fileSystem: NodeManagedProjectFileSystem,
+  auditStore: NodeQuickAuditStore,
+  parsed: ParsedQuickArguments,
+  request: Readonly<Record<string, unknown>>,
+): Promise<CliRunResult> {
+  const operation = "quick.complete";
+  const completion = parseQuickCompletionRequest(request);
+  if (completion === null) {
     return cliDomainFailure(
       operation,
       Object.freeze({
@@ -692,6 +709,7 @@ async function completeNoChangeQuick(
       parsed.json,
     );
   }
+  const { start: startValue, transitions: transitionsValue } = completion;
   const created = coreContract.startWorkflowTask(startValue);
   if (!created.ok) {
     return cliDomainFailure(operation, created.diagnostics[0], parsed.json);
@@ -713,14 +731,11 @@ async function completeNoChangeQuick(
   } catch {
     return quickBaselineFailure(operation, parsed.json);
   }
-  let state = created.state;
-  for (const transition of transitionsValue) {
-    const advanced = coreContract.transitionWorkflow(state, transition);
-    if (!advanced.ok) {
-      return cliDomainFailure(operation, advanced.diagnostics[0], parsed.json);
-    }
-    state = advanced.state;
+  const completed = replayQuickTransitions(created.state, transitionsValue);
+  if (!completed.ok) {
+    return cliDomainFailure(operation, completed.diagnostic, parsed.json);
   }
+  const state = completed.state;
   if (
     state.projection.lifecycle !== "completed" ||
     state.projection.phase !== "finish"
@@ -784,6 +799,424 @@ async function completeNoChangeQuick(
         parsed.json,
       )
     : persisted.result;
+}
+function replayQuickTransitions(
+  initialState: WorkflowState,
+  transitions: readonly TransitionWorkflowRequest[],
+) {
+  let state = initialState;
+  for (const transition of transitions) {
+    const advanced = coreContract.transitionWorkflow(state, transition);
+    if (!advanced.ok) {
+      return Object.freeze({ ok: false as const, diagnostic: advanced.diagnostics[0] });
+    }
+    state = advanced.state;
+  }
+  return Object.freeze({ ok: true as const, state });
+}
+interface QuickCompletionRequest {
+  readonly start: StartWorkflowTaskRequest;
+  readonly transitions: readonly TransitionWorkflowRequest[];
+}
+
+function parseQuickCompletionRequest(
+  request: Readonly<Record<string, unknown>>,
+): QuickCompletionRequest | null {
+  return isStartWorkflowTaskRequestCandidate(request.start) &&
+    Array.isArray(request.transitions) &&
+    request.transitions.every(isTransitionWorkflowRequestCandidate)
+    ? Object.freeze({ start: request.start, transitions: request.transitions })
+    : null;
+}
+type QuickRuntimeFileSystemOpen =
+  | Readonly<{ ok: true; value: TaskBaselineFileSystem }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+
+async function openQuickRuntimeFileSystem(
+  fileSystem: NodeManagedProjectFileSystem,
+  operation: string,
+  json: boolean,
+): Promise<QuickRuntimeFileSystemOpen> {
+  try {
+    const runtimeTasks = await fileSystem.inspect(QUICK_RUNTIME_TASKS_DIRECTORY);
+    if (runtimeTasks.kind === "missing") {
+      await fileSystem.createDirectory(QUICK_RUNTIME_TASKS_DIRECTORY);
+    } else if (runtimeTasks.kind !== "directory") {
+      return Object.freeze({
+        ok: false as const,
+        result: cliDomainFailure(
+          operation,
+          Object.freeze({
+            code: "quick.runtime.invalid",
+            message: "Quick runtime task storage is unavailable.",
+            remediation: "Restore .sayhi/.runtime/quicks as a directory and retry.",
+          }),
+          json,
+        ),
+      });
+    }
+  } catch {
+    return Object.freeze({
+      ok: false as const,
+      result: cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "quick.runtime.unavailable",
+          message: "Quick runtime task storage could not be prepared.",
+          remediation: "Repair the local .sayhi runtime directory and retry.",
+        }),
+        json,
+      ),
+    });
+  }
+  const runtimeFileSystem: TaskBaselineFileSystem = Object.freeze({
+    inspect: (path: string) => fileSystem.inspect(runtimeQuickTaskPath(path)),
+    listDirectory: (path: string) => fileSystem.listDirectory(runtimeQuickTaskPath(path)),
+    readFile: (path: string) => fileSystem.readFile(runtimeQuickTaskPath(path)),
+    createDirectory: (path: string) => fileSystem.createDirectory(runtimeQuickTaskPath(path)),
+    writeFile: (path: string, content: string) =>
+      fileSystem.writeFile(runtimeQuickTaskPath(path), content),
+    appendFile: (path: string, content: string) =>
+      fileSystem.appendFile(runtimeQuickTaskPath(path), content),
+    withTaskMutationLock: fileSystem.withTaskMutationLock.bind(fileSystem),
+    captureBaseline: fileSystem.captureBaseline.bind(fileSystem),
+    withWriterMutationLock: fileSystem.withWriterMutationLock.bind(fileSystem),
+  });
+  return Object.freeze({ ok: true as const, value: runtimeFileSystem });
+}
+
+function runtimeQuickTaskPath(path: string): string {
+  return path === QUICK_TASKS_DIRECTORY
+    ? QUICK_RUNTIME_TASKS_DIRECTORY
+    : path.startsWith(`${QUICK_TASKS_DIRECTORY}/`)
+      ? `${QUICK_RUNTIME_TASKS_DIRECTORY}/${path.slice(QUICK_TASKS_DIRECTORY.length + 1)}`
+      : path;
+}
+
+async function promoteQuickRuntimeTask(
+  fileSystem: NodeManagedProjectFileSystem,
+  taskId: string,
+): Promise<void> {
+  await fileSystem.withTaskMutationLock(`.sayhi/.runtime/task-${taskId}.lock`, () =>
+    fileSystem.moveDirectory(
+      `${QUICK_RUNTIME_TASKS_DIRECTORY}/${taskId}`,
+      `${QUICK_TASKS_DIRECTORY}/${taskId}`,
+    ),
+  );
+}
+
+
+interface ChangedQuickWork {
+  readonly baselineAfter: BaselineRecord;
+  readonly changedPaths: readonly string[];
+}
+type ChangedQuickImplementation =
+  | Readonly<{
+      ok: true;
+      state: WorkflowState;
+      work: ChangedQuickWork;
+    }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+type ChangedQuickExecution =
+  | Readonly<{
+      ok: true;
+      state: WorkflowState;
+      result: DurableQuickResult;
+    }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+async function completeChangedQuick(
+  fileSystem: NodeManagedProjectFileSystem,
+  request: Readonly<Record<string, unknown>>,
+  parsed: ParsedQuickArguments,
+): Promise<CliRunResult> {
+  const operation = "quick.complete";
+  const completion = parseQuickCompletionRequest(request);
+  const writesValue = request.writes;
+  if (completion === null || !isQuickWriteArray(writesValue)) {
+    return cliDomainFailure(
+      operation,
+      Object.freeze({
+        code: "quick.request.invalid",
+        message: "Changed Quick completion requires a start request, transitions, and file writes.",
+        remediation: "Provide Core Quick transitions and non-empty scoped writes with string paths and content.",
+      }),
+      parsed.json,
+    );
+  }
+  const { start: startValue, transitions: transitionsValue } = completion;
+  const virtualCreated = coreContract.startWorkflowTask(startValue);
+  if (!virtualCreated.ok) {
+    return cliDomainFailure(operation, virtualCreated.diagnostics[0], parsed.json);
+  }
+  if (virtualCreated.state.projection.route !== "quick") {
+    return cliDomainFailure(
+      operation,
+      Object.freeze({
+        code: "quick.route.invalid",
+        message: "Changed completion accepts only Quick Tasks.",
+        remediation: "Provide a StartWorkflowTaskRequest whose Task Route is quick.",
+      }),
+      parsed.json,
+    );
+  }
+  const completed = replayQuickTransitions(virtualCreated.state, transitionsValue);
+  if (!completed.ok) {
+    return cliDomainFailure(operation, completed.diagnostic, parsed.json);
+  }
+  const virtualState = completed.state;
+  if (
+    virtualState.projection.lifecycle !== "completed" ||
+    virtualState.projection.phase !== "finish"
+  ) {
+    return cliDomainFailure(
+      operation,
+      Object.freeze({
+        code: "quick.completion.incomplete",
+        message: "Changed Quick completion must end at completed/finish.",
+        remediation: "Supply every permitted Quick transition through the Finish Gate.",
+      }),
+      parsed.json,
+    );
+  }
+  const runtime = await openQuickRuntimeFileSystem(fileSystem, operation, parsed.json);
+  if (!runtime.ok) {
+    return runtime.result;
+  }
+  const runtimeFileSystem = runtime.value;
+  const created = await coreContract.createDurableTask({
+    fileSystem: runtimeFileSystem,
+    start: startValue,
+  });
+  let initialState: WorkflowState;
+  if (created.ok) {
+    initialState = created.state;
+  } else {
+    if (created.diagnostics[0]?.code !== "task_lifecycle.task.exists") {
+      return cliDomainFailure(operation, created.diagnostics[0], parsed.json);
+    }
+    const existing = await coreContract.readDurableTask({
+      fileSystem: runtimeFileSystem,
+      taskId: virtualCreated.state.projection.id,
+    });
+    if (!existing.ok) {
+      return cliDomainFailure(operation, existing.diagnostics[0], parsed.json);
+    }
+    if (
+      existing.state.projection.route !== "quick" ||
+      existing.state.events[0]?.eventId !== virtualCreated.state.events[0]?.eventId ||
+      existing.state.projection.lifecycle !== "active" ||
+      (existing.state.projection.phase !== "triage" &&
+        existing.state.projection.phase !== "implement")
+    ) {
+      return cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "quick.recovery.invalid",
+          message: "The existing Task cannot resume this changed Quick completion.",
+          remediation: "Inspect the existing Quick Task and provide its original completion request while it is active.",
+        }),
+        parsed.json,
+      );
+    }
+    initialState = existing.state;
+  }
+  const [implementationTransition, ...finishTransitions] = transitionsValue;
+  if (implementationTransition === undefined) {
+    return cliDomainFailure(
+      operation,
+      Object.freeze({
+        code: "quick.completion.incomplete",
+        message: "Changed Quick completion requires an Implement transition.",
+        remediation: "Supply every permitted Quick transition through the Finish Gate.",
+      }),
+      parsed.json,
+    );
+  }
+  const implemented = await enterChangedQuickImplementation(
+    runtimeFileSystem,
+    initialState,
+    implementationTransition,
+    writesValue,
+    parsed.json,
+  );
+  if (!implemented.ok) {
+    return implemented.result;
+  }
+  const finished = await finishChangedQuick(
+    runtimeFileSystem,
+    implemented.state,
+    implemented.work,
+    finishTransitions,
+    parsed.json,
+  );
+  if (!finished.ok) {
+    return finished.result;
+  }
+  try {
+    await promoteQuickRuntimeTask(fileSystem, finished.state.projection.id);
+  } catch {
+    return cliDomainFailure(
+      operation,
+      Object.freeze({
+        code: "quick.runtime.promote_failed",
+        message: "The completed Quick Record could not enter the Project Store.",
+        remediation: "Retry the same Quick completion after repairing local runtime storage.",
+      }),
+      parsed.json,
+    );
+  }
+  return cliSuccess(
+    operation,
+    Object.freeze({
+      taskId: finished.state.projection.id,
+      projection: finished.state.projection,
+      events: finished.state.events,
+      outcome: CHANGED_QUICK_OUTCOME,
+      changedPaths: finished.result.changedPaths,
+      commit: finished.result.commit,
+    }),
+    parsed.json,
+  );
+}
+
+async function enterChangedQuickImplementation(
+  fileSystem: TaskBaselineFileSystem,
+  state: WorkflowState,
+  transition: TransitionWorkflowRequest,
+  writes: readonly QuickWrite[],
+  json: boolean,
+): Promise<ChangedQuickImplementation> {
+  const operation = "quick.complete";
+  let implementingState: WorkflowState;
+  if (
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "implement"
+  ) {
+    implementingState = state;
+  } else {
+    const implementing = await coreContract.advanceDurableTask({
+      fileSystem,
+      transition: Object.freeze({ ...transition, expectedVersion: state.projection.version }),
+    });
+    if (!implementing.ok) {
+      return Object.freeze({
+        ok: false,
+        result: cliDomainFailure(operation, implementing.diagnostics[0], json),
+      });
+    }
+    implementingState = implementing.state;
+  }
+  let writerState = implementingState;
+  if (!writerState.events.some((event) => event.type === "baseline_adopted")) {
+    let baseline: BaselineRecord;
+    try {
+      baseline = await captureQuickBaseline(fileSystem, writerState);
+    } catch {
+      return Object.freeze({ ok: false, result: quickBaselineFailure(operation, json) });
+    }
+    const adopted = await coreContract.adoptDurableTaskBaseline({
+      fileSystem,
+      taskId: writerState.projection.id,
+      expectedVersion: writerState.projection.version,
+      baseline,
+      event: createCliTaskEvent("Adopted the changing Quick Baseline."),
+    });
+    if (!adopted.ok) {
+      return Object.freeze({
+        ok: false,
+        result: cliDomainFailure(operation, adopted.diagnostics[0], json),
+      });
+    }
+    writerState = adopted.state;
+  }
+  const written = await coreContract.withDurableTaskWriter({
+    fileSystem,
+    taskId: writerState.projection.id,
+    expectedVersion: writerState.projection.version,
+    operation: async (writer) => {
+      for (const write of writes) {
+        writer.assertWritablePath(write.path);
+      }
+      for (const write of writes) {
+        await writer.writeFile(write.path, write.content);
+      }
+    },
+  });
+  if (!written.ok) {
+    return Object.freeze({
+      ok: false,
+      result: cliDomainFailure(operation, written.diagnostics[0], json),
+    });
+  }
+  return Object.freeze({
+    ok: true,
+    state: writerState,
+    work: Object.freeze({
+      baselineAfter: written.finalBaseline,
+      changedPaths: written.changedPaths,
+    }),
+  });
+}
+
+async function finishChangedQuick(
+  fileSystem: TaskBaselineFileSystem,
+  initialState: WorkflowState,
+  initialWork: ChangedQuickWork,
+  transitions: readonly TransitionWorkflowRequest[],
+  json: boolean,
+): Promise<ChangedQuickExecution> {
+  const operation = "quick.complete";
+  let state = initialState;
+  let result: DurableQuickResult | null = null;
+  for (const transition of transitions) {
+    if (transition.to.lifecycle === "completed") {
+      const completed = await coreContract.completeDurableQuickResult({
+        fileSystem,
+        taskId: state.projection.id,
+        expectedVersion: state.projection.version,
+        transition: Object.freeze({
+          ...transition,
+          expectedVersion: state.projection.version,
+        }),
+        baselineAfter: initialWork.baselineAfter,
+        changedPaths: initialWork.changedPaths,
+      });
+      if (!completed.ok) {
+        return Object.freeze({
+          ok: false,
+          result: cliDomainFailure(operation, completed.diagnostics[0], json),
+        });
+      }
+      state = completed.state;
+      result = completed.result;
+      continue;
+    }
+    const advanced = await coreContract.advanceDurableTask({
+      fileSystem,
+      transition: Object.freeze({ ...transition, expectedVersion: state.projection.version }),
+    });
+    if (!advanced.ok) {
+      return Object.freeze({
+        ok: false,
+        result: cliDomainFailure(operation, advanced.diagnostics[0], json),
+      });
+    }
+    state = advanced.state;
+  }
+  return result === null
+    ? Object.freeze({
+        ok: false as const,
+        result: cliDomainFailure(
+          operation,
+          Object.freeze({
+            code: "quick.completion.incomplete",
+            message: "Changed Quick completion requires a completed Finish transition.",
+            remediation: "Supply every permitted Quick transition through the Finish Gate.",
+          }),
+          json,
+        ),
+      })
+    : Object.freeze({ ok: true as const, state, result });
 }
 
 async function archiveNoChangeQuick(
@@ -872,6 +1305,185 @@ async function archiveNoChangeQuick(
       )
     : persisted.result;
 }
+async function showQuick(
+  fileSystem: NodeManagedProjectFileSystem,
+  repositoryRoot: string,
+  parsed: ParsedQuickArguments,
+): Promise<CliRunResult> {
+  const operation = "quick.show";
+  const changed = await readChangedQuick(
+    fileSystem,
+    parsed.taskId!,
+    operation,
+    parsed.json,
+  );
+  if (changed.kind === "failure") {
+    return changed.result;
+  }
+  if (changed.kind === "found") {
+    return cliSuccess(
+      operation,
+      Object.freeze({
+        taskId: changed.value.state.projection.id,
+        projection: changed.value.state.projection,
+        events: changed.value.state.events,
+        outcome: CHANGED_QUICK_OUTCOME,
+        changedPaths: changed.value.result.changedPaths,
+        commit: changed.value.result.commit,
+        archived: changed.value.location === "archive",
+      }),
+      parsed.json,
+    );
+  }
+  const auditStore = await openQuickAuditStore(repositoryRoot, operation, parsed.json);
+  if (!auditStore.ok) {
+    return auditStore.result;
+  }
+  const recovered = await recoverQuickAudit(
+    auditStore.value,
+    parsed.taskId!,
+    operation,
+    parsed.json,
+  );
+  return recovered.ok
+    ? cliSuccess(
+        operation,
+        Object.freeze({
+          taskId: recovered.state.projection.id,
+          projection: recovered.state.projection,
+          events: recovered.state.events,
+          outcome: recovered.outcome,
+          archived: recovered.archived,
+        }),
+        parsed.json,
+      )
+    : recovered.result;
+}
+
+async function archiveQuick(
+  fileSystem: NodeManagedProjectFileSystem,
+  repositoryRoot: string,
+  parsed: ParsedQuickArguments,
+): Promise<CliRunResult> {
+  const operation = "quick.archive";
+  const changed = await readChangedQuick(
+    fileSystem,
+    parsed.taskId!,
+    operation,
+    parsed.json,
+  );
+  if (changed.kind === "failure") {
+    return changed.result;
+  }
+  if (changed.kind === "found") {
+    if (changed.value.location === "archive") {
+      return cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "quick.archive.completed",
+          message: "Quick record is already archived.",
+          remediation: "Inspect the archived Quick with sayhi quick show.",
+        }),
+        parsed.json,
+      );
+    }
+    const request = await readTaskJsonRequest(
+      fileSystem,
+      parsed.source!,
+      operation,
+      parsed.json,
+    );
+    if (!request.ok) {
+      return request.result;
+    }
+    if (!isTransitionWorkflowRequestCandidate(request.value)) {
+      return cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "quick.request.invalid",
+          message: "Quick archive requires a Core transition request.",
+          remediation: "Provide a TransitionWorkflowRequest to archive the completed Quick.",
+        }),
+        parsed.json,
+      );
+    }
+    const archived = await coreContract.archiveDurableTask({
+      fileSystem,
+      transition: Object.freeze({
+        ...request.value,
+        expectedVersion: changed.value.state.projection.version,
+      }),
+    });
+    return archived.ok
+      ? cliSuccess(
+          operation,
+          Object.freeze({
+            taskId: archived.state.projection.id,
+            projection: archived.state.projection,
+            outcome: CHANGED_QUICK_OUTCOME,
+            changedPaths: changed.value.result.changedPaths,
+            commit: changed.value.result.commit,
+            moved: archived.moved,
+          }),
+          parsed.json,
+        )
+      : cliDomainFailure(operation, archived.diagnostics[0], parsed.json);
+  }
+  const auditStore = await openQuickAuditStore(repositoryRoot, operation, parsed.json);
+  return auditStore.ok
+    ? archiveNoChangeQuick(fileSystem, auditStore.value, parsed)
+    : auditStore.result;
+}
+
+type RecoveredChangedQuick = Readonly<{
+  state: WorkflowState;
+  result: DurableQuickResult;
+  location: "active" | "archive";
+}>;
+type ChangedQuickRead =
+  | Readonly<{ kind: "found"; value: RecoveredChangedQuick }>
+  | Readonly<{ kind: "absent" }>
+  | Readonly<{ kind: "failure"; result: CliRunResult }>;
+
+async function readChangedQuick(
+  fileSystem: NodeManagedProjectFileSystem,
+  taskId: string,
+  operation: string,
+  json: boolean,
+): Promise<ChangedQuickRead> {
+  const taskStore = await fileSystem.inspect(".sayhi/tasks");
+  if (taskStore.kind === "missing") {
+    return Object.freeze({ kind: "absent" as const });
+  }
+  for (const location of ["active", "archive"] as const) {
+    const recovered = await coreContract.readDurableQuickResult({
+      fileSystem,
+      taskId,
+      location,
+    });
+    if (recovered.ok) {
+      return Object.freeze({
+        kind: "found" as const,
+        value: Object.freeze({
+          state: recovered.state,
+          result: recovered.result,
+          location,
+        }),
+      });
+    }
+    const code = recovered.diagnostics[0]?.code;
+    if (
+      code !== "task_lifecycle.history.missing" &&
+      code !== "task_lifecycle.quick_result.missing"
+    ) {
+      return Object.freeze({
+        kind: "failure" as const,
+        result: cliDomainFailure(operation, recovered.diagnostics[0], json),
+      });
+    }
+  }
+  return Object.freeze({ kind: "absent" as const });
+}
 
 type RecoveredQuickAudit =
   | Readonly<{
@@ -879,7 +1491,7 @@ type RecoveredQuickAudit =
       record: Record<string, unknown>;
       state: WorkflowState;
       location: "active" | "archive";
-      outcome: QuickAuditOutcome;
+      outcome: QuickOutcome;
       archived: boolean;
     }>
   | Readonly<{ ok: false; result: CliRunResult }>;
@@ -951,7 +1563,7 @@ async function recoverQuickAudit(
 }
 
 async function captureQuickBaseline(
-  fileSystem: NodeManagedProjectFileSystem,
+  fileSystem: TaskBaselineFileSystem,
   state: WorkflowState,
 ): Promise<BaselineRecord> {
   return fileSystem.captureBaseline({
@@ -1003,6 +1615,23 @@ function isTransitionWorkflowRequestCandidate(
     "to" in value &&
     "gates" in value &&
     "event" in value
+  );
+}
+interface QuickWrite {
+  readonly path: string;
+  readonly content: string;
+}
+
+function isQuickWriteArray(value: unknown): value is readonly QuickWrite[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (write) =>
+        isRecord(write) &&
+        typeof write.path === "string" &&
+        typeof write.content === "string",
+    )
   );
 }
 

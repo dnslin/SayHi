@@ -1269,7 +1269,7 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
     "ARCHIVE",
     "2026-07-16T13:00:02Z",
   );
-  await writeTaskRequest(repository, "quick-complete.json", { start, transitions });
+  await writeTaskRequest(repository, "quick-complete.json", { start, transitions, writes: [] });
   await writeTaskRequest(repository, "quick-archive.json", archive);
 
   const repositoryBefore = await snapshotRepositoryFiles(repository);
@@ -1421,6 +1421,250 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
   assert.equal(await readGitHead(repository), headBefore);
 });
 
+test("packaged CLI completes and archives a changed Quick without committing", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-changed-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await writeFile(join(repository, "README.md"), "changed Quick fixture\n", "utf8");
+  const initialized = await executeCliResult("init", "--cwd", repository, "--json");
+  assert.equal(initialized.exitCode, 0);
+  await runGit(repository, "add", ".");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  const fixture = Object.freeze({
+    taskId: "TASK-17-CHANGED-QUICK",
+    title: "Archive a changed Quick without committing",
+    goal: "Change the Quick fixture through the approved Writer scope",
+    acceptanceCriterion: "The Quick records and archives its changed result without a commit",
+    files: Object.freeze(["README.md"]),
+    eventNamespace: "17-CHANGED-QUICK",
+    sessionRef: "session-17-changed-quick",
+  }) satisfies TaskLifecycleFixture;
+  const { start, transitions, completedState } = createChangedQuickCompletion(
+    fixture,
+    "2026-07-16T14:00:00Z",
+    "2026-07-16T14:00:01Z",
+  );
+  const archive = taskLifecycleTransition(
+    fixture,
+    completedState,
+    "archived",
+    "finish",
+    "ARCHIVE",
+    "2026-07-16T14:00:02Z",
+  );
+  await writeTaskRequest(repository, "changed-quick-complete.json", {
+    start,
+    transitions,
+    writes: [{ path: "README.md", content: "changed by Quick\n" }],
+  });
+  await writeTaskRequest(repository, "changed-quick-archive.json", archive);
+  await runGit(repository, "add", "changed-quick-complete.json", "changed-quick-archive.json");
+  await runGit(repository, "commit", "--quiet", "-m", "Quick requests");
+
+  const headBefore = await readGitHead(repository);
+  const completed = await executeCliResult(
+    "quick",
+    "complete",
+    "--from",
+    "changed-quick-complete.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(completed.exitCode, 0);
+  const completedEnvelope = JSON.parse(completed.stdout) as CliJsonEnvelope;
+  assert.equal(completedEnvelope.operation, "quick.complete");
+  assert.equal(completedEnvelope.result?.outcome, "changed");
+  assert.deepEqual(completedEnvelope.result?.changedPaths, ["README.md"]);
+  assertQuickProjection(completedEnvelope.result?.projection, "completed");
+  assert.equal(await readFile(join(repository, "README.md"), "utf8"), "changed by Quick\n");
+  assert.equal(await readGitHead(repository), headBefore);
+  const quickRecordPath = join(repository, ".sayhi", "tasks", fixture.taskId, "quick.json");
+  const quickRecordContent = await readFile(quickRecordPath, "utf8");
+  const quickRecord = JSON.parse(quickRecordContent) as {
+    changedPaths: readonly string[];
+    commit: null;
+    workflow: {
+      projection: {
+        lifecycle: string;
+        phase: string;
+        route: string;
+        intent: { acceptanceCriteria: readonly string[] };
+        scope: { files: readonly string[] };
+      };
+      events: readonly { type: string; to?: { phase?: string } }[];
+    };
+  };
+  assert.deepEqual(quickRecord.changedPaths, ["README.md"]);
+  assert.equal(quickRecord.commit, null);
+  assert.equal(quickRecord.workflow.projection.route, "quick");
+  assert.equal(quickRecord.workflow.projection.lifecycle, "completed");
+  assert.equal(quickRecord.workflow.projection.phase, "finish");
+  assert.deepEqual(quickRecord.workflow.projection.intent.acceptanceCriteria, [
+    fixture.acceptanceCriterion,
+  ]);
+  assert.deepEqual(quickRecord.workflow.projection.scope.files, ["README.md"]);
+  assert.equal(
+    quickRecord.workflow.events.some(
+      (event) => event.type === "workflow_transitioned" && event.to?.phase === "review",
+    ),
+    true,
+  );
+
+  const shown = await executeCliResult(
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(shown.exitCode, 0);
+  const shownEnvelope = JSON.parse(shown.stdout) as CliJsonEnvelope;
+  assert.equal(shownEnvelope.result?.outcome, "changed");
+  assertQuickProjection(shownEnvelope.result?.projection, "completed");
+  await writeFile(quickRecordPath, "{}\n", "utf8");
+  const corruptedShow = await executeCliResult(
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(corruptedShow.exitCode, 3);
+  assert.equal(
+    readCliErrorCode(JSON.parse(corruptedShow.stdout)),
+    "task_lifecycle.quick_result.invalid",
+  );
+  const corruptedArchive = await executeCliResult(
+    "quick",
+    "archive",
+    fixture.taskId,
+    "--from",
+    "changed-quick-archive.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(corruptedArchive.exitCode, 3);
+  assert.equal(
+    readCliErrorCode(JSON.parse(corruptedArchive.stdout)),
+    "task_lifecycle.quick_result.invalid",
+  );
+  await writeFile(quickRecordPath, quickRecordContent, "utf8");
+
+  const archived = await executeCliResult(
+    "quick",
+    "archive",
+    fixture.taskId,
+    "--from",
+    "changed-quick-archive.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(archived.exitCode, 0);
+  const archivedEnvelope = JSON.parse(archived.stdout) as CliJsonEnvelope;
+  assert.equal(archivedEnvelope.result?.outcome, "changed");
+  assertQuickProjection(archivedEnvelope.result?.projection, "archived");
+  const archivedQuickRecord = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "tasks", "archive", fixture.taskId, "quick.json"),
+      "utf8",
+    ),
+  ) as { changedPaths: readonly string[]; commit: null };
+  assert.deepEqual(archivedQuickRecord.changedPaths, ["README.md"]);
+  assert.equal(archivedQuickRecord.commit, null);
+  assert.equal(await readGitHead(repository), headBefore);
+});
+
+test("packaged CLI stops a changed Quick write outside its approved scope", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-outside-scope-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await writeFile(join(repository, "README.md"), "scoped Quick fixture\n", "utf8");
+  const initialized = await executeCliResult("init", "--cwd", repository, "--json");
+  assert.equal(initialized.exitCode, 0);
+  await runGit(repository, "add", ".");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  const fixture = Object.freeze({
+    taskId: "TASK-17-OUTSIDE-SCOPE",
+    title: "Reject a changed Quick outside its approved scope",
+    goal: "Prove changed Quick writes remain within the declared scope",
+    acceptanceCriterion: "The Quick stops before an out-of-scope write",
+    files: Object.freeze(["README.md"]),
+    eventNamespace: "17-OUTSIDE-SCOPE",
+    sessionRef: "session-17-outside-scope",
+  }) satisfies TaskLifecycleFixture;
+  const { start, transitions } = createChangedQuickCompletion(
+    fixture,
+    "2026-07-16T15:00:00Z",
+    "2026-07-16T15:00:01Z",
+  );
+  await writeTaskRequest(repository, "outside-scope-quick.json", {
+    start,
+    transitions,
+    writes: [
+      { path: "README.md", content: "must not be written\n" },
+      { path: "outside-scope.txt", content: "must not be written\n" },
+    ],
+  });
+  await writeTaskRequest(repository, "outside-scope-retry-quick.json", {
+    start,
+    transitions,
+    writes: [{ path: "README.md", content: "recovered by Quick\n" }],
+  });
+  await runGit(
+    repository,
+    "add",
+    "outside-scope-quick.json",
+    "outside-scope-retry-quick.json",
+  );
+  await runGit(repository, "commit", "--quiet", "-m", "Quick request");
+
+  const headBefore = await readGitHead(repository);
+  const completed = await executeCliResult(
+    "quick",
+    "complete",
+    "--from",
+    "outside-scope-quick.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(completed.exitCode, 3);
+  const failure = JSON.parse(completed.stdout) as {
+    error?: { code?: string };
+  };
+  assert.equal(failure.error?.code, "task_lifecycle.writer.scope");
+  assert.equal(await readFile(join(repository, "README.md"), "utf8"), "scoped Quick fixture\n");
+  await assert.rejects(readFile(join(repository, "outside-scope.txt"), "utf8"));
+  assert.equal(await readGitHead(repository), headBefore);
+  await assert.rejects(
+    readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "task.json"), "utf8"),
+  );
+  const recovered = await executeCliResult(
+    "quick",
+    "complete",
+    "--from",
+    "outside-scope-retry-quick.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(recovered.exitCode, 0);
+  const recoveredEnvelope = JSON.parse(recovered.stdout) as CliJsonEnvelope;
+  assert.equal(recoveredEnvelope.result?.outcome, "changed");
+  assertQuickProjection(recoveredEnvelope.result?.projection, "completed");
+  assert.equal(await readFile(join(repository, "README.md"), "utf8"), "recovered by Quick\n");
+});
 async function showTaskState(repository: string): Promise<WorkflowState> {
   const shown = await executeCliResult(
     "task",
@@ -1436,6 +1680,50 @@ async function showTaskState(repository: string): Promise<WorkflowState> {
     projection: envelope.result?.projection as WorkflowState["projection"],
     events: envelope.result?.events as WorkflowState["events"],
   };
+}
+
+function createChangedQuickCompletion(
+  fixture: TaskLifecycleFixture,
+  startTimestamp: string,
+  transitionTimestamp: string,
+) {
+  const buildStart = taskLifecycleStartRequest(fixture, startTimestamp);
+  const start = {
+    ...buildStart,
+    task: { ...buildStart.task, route: "quick" as const },
+  };
+  const created = coreContract.startWorkflowTask(start);
+  if (!created.ok) {
+    throw new Error(created.diagnostics[0]?.message ?? "Quick creation failed");
+  }
+  let completedState = created.state;
+  const transitions = [];
+  for (const [lifecycle, phase, suffix] of [
+    ["active", "implement", "IMPLEMENT"],
+    ["active", "review", "REVIEW"],
+    ["active", "finish", "FINISH"],
+    ["completed", "finish", "COMPLETE"],
+  ] as const) {
+    const transition = taskLifecycleTransition(
+      fixture,
+      completedState,
+      lifecycle,
+      phase,
+      suffix,
+      transitionTimestamp,
+    );
+    transitions.push(transition);
+    const advanced = coreContract.transitionWorkflow(completedState, transition);
+    if (!advanced.ok) {
+      throw new Error(advanced.diagnostics[0]?.message ?? "Quick transition failed");
+    }
+    completedState = advanced.state;
+  }
+  return Object.freeze({
+    start,
+    transitions: Object.freeze(transitions),
+    completedState,
+  });
 }
 
 async function writeTaskRequest(
@@ -1598,6 +1886,18 @@ function quickEventPhases(value: unknown): readonly string[] {
 }
 
 
+function readCliErrorCode(value: unknown): string | undefined {
+  if (value === null || typeof value !== "object" || !("error" in value)) {
+    return undefined;
+  }
+  const error = value.error;
+  return error !== null &&
+    typeof error === "object" &&
+    "code" in error &&
+    typeof error.code === "string"
+    ? error.code
+    : undefined;
+}
 function readCliResult(value: unknown): unknown {
   assert.ok(value !== null && typeof value === "object" && "result" in value);
   return value.result;
