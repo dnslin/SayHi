@@ -63,6 +63,14 @@ function requireString(record: Record<string, unknown>, field: string): string {
   return value;
 }
 
+function requireVersion(record: Record<string, unknown>, field: string): number {
+  const value = record[field];
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    assert.fail(`${field} must be a positive safe integer.`);
+  }
+  return value;
+}
+
 
 test("packaged CLI binary executes Managed Project lifecycle commands", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-cli-binary-"));
@@ -1831,11 +1839,16 @@ async function approveFoundationPlan(
   assert.equal(recorded.exitCode, 0);
   const recordedEnvelope = requireRecord(JSON.parse(recorded.stdout), "Plan record envelope");
   const recordedResult = requireRecord(recordedEnvelope.result, "Plan record result");
+  const recordedProjection = requireRecord(
+    recordedResult.projection,
+    "Plan record Projection",
+  );
+  const recordedVersion = requireVersion(recordedProjection, "version");
   const plan = requireRecord(recordedResult.plan, "Recorded Plan");
 
   await writeTaskRequest(repository, ".sayhi/.runtime/plan-decision.json", {
     taskId: FOUNDATION_TASK.taskId,
-    expectedVersion: frozenState.projection.version,
+    expectedVersion: recordedVersion,
     planIdentity: requireString(plan, "identity"),
     contextManifestIdentity: requireString(plan, "contextManifestIdentity"),
     event: {

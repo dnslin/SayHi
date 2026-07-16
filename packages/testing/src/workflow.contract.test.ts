@@ -922,6 +922,152 @@ test("replay rejects malformed Event metadata and duplicate idempotency keys", (
   assert.deepEqual(state.events, snapshot);
 });
 
+test("replay rejects Build Plan rejections without user attribution or recorded evidence", () => {
+  let state = startTask("build");
+  state = advanceTask(state, "active", "explore", "plan-replay-explore");
+  state = advanceTask(state, "active", "plan", "plan-replay-plan");
+  const position = {
+    lifecycle: state.projection.lifecycle,
+    phase: state.projection.phase,
+    step: state.projection.step,
+  };
+  const material = {
+    planIdentity: `sha256:${"a".repeat(64)}`,
+    requirementsIdentity: hashTestValue(state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity: `sha256:${"c".repeat(64)}`,
+  };
+  const frozenContextPayload = {
+    schemaVersion: state.events[0]!.schemaVersion,
+    eventId: "EVENT-BUILD-PLAN-CONTEXT-FROZEN",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    type: "context_manifest_changed",
+    from: position,
+    to: position,
+    actor: { kind: "agent", id: "planner", sessionRef: "plan-session" },
+    outcome: "accepted",
+    gates: [],
+    blockers: state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Freeze Plan Context.",
+    idempotencyKey: "IDEMPOTENCY-BUILD-PLAN-CONTEXT-FROZEN",
+    occurredAt: "2026-07-15T11:59:00Z",
+    phase: "implement",
+    manifestPath: material.contextManifestPath,
+    manifestIdentity: material.contextManifestIdentity,
+    change: "frozen",
+  };
+  const frozenContextEvent = {
+    ...frozenContextPayload,
+    chainDigest: digestReplayEvent(frozenContextPayload),
+  } as unknown as WorkflowEvent;
+  const recordedPayload = {
+    schemaVersion: state.events[0]!.schemaVersion,
+    eventId: "EVENT-BUILD-PLAN-RECORDED",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: frozenContextPayload.sequence + 1,
+    previousChainDigest: frozenContextEvent.chainDigest,
+    type: "build_plan_changed",
+    from: position,
+    to: position,
+    actor: { kind: "agent", id: "planner", sessionRef: "plan-session" },
+    outcome: "accepted",
+    gates: [],
+    blockers: state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Record Plan evidence.",
+    idempotencyKey: "IDEMPOTENCY-BUILD-PLAN-RECORDED",
+    occurredAt: "2026-07-15T12:00:00Z",
+    change: "recorded",
+    ...material,
+  };
+  const recordedEvent = {
+    ...recordedPayload,
+    chainDigest: digestReplayEvent(recordedPayload),
+  } as unknown as WorkflowEvent;
+  const recordedReplay = coreContract.replayWorkflowEvents([
+    ...state.events,
+    frozenContextEvent,
+    recordedEvent,
+  ]);
+  assert.equal(recordedReplay.ok, true);
+  const unboundRecordPayload = {
+    ...recordedPayload,
+    eventId: "EVENT-BUILD-PLAN-UNBOUND",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    idempotencyKey: "IDEMPOTENCY-BUILD-PLAN-UNBOUND",
+  };
+  const unboundRecordEvent = {
+    ...unboundRecordPayload,
+    chainDigest: digestReplayEvent(unboundRecordPayload),
+  } as unknown as WorkflowEvent;
+  const unboundRecordReplay = coreContract.replayWorkflowEvents([
+    ...state.events,
+    unboundRecordEvent,
+  ]);
+  assert.equal(unboundRecordReplay.ok, false);
+  if (!unboundRecordReplay.ok) {
+    assert.equal(unboundRecordReplay.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+
+  const agentRejectionPayload = {
+    ...recordedPayload,
+    eventId: "EVENT-BUILD-PLAN-REJECTED-AGENT",
+    sequence: recordedPayload.sequence + 1,
+    previousChainDigest: recordedEvent.chainDigest,
+    actor: { kind: "agent", id: "reviewer", sessionRef: "review-session" },
+    reason: "Reject Plan evidence.",
+    idempotencyKey: "IDEMPOTENCY-BUILD-PLAN-REJECTED-AGENT",
+    occurredAt: "2026-07-15T12:01:00Z",
+    change: "rejected",
+  };
+  const agentRejectionEvent = {
+    ...agentRejectionPayload,
+    chainDigest: digestReplayEvent(agentRejectionPayload),
+  } as unknown as WorkflowEvent;
+  const agentRejectionReplay = coreContract.replayWorkflowEvents([
+    ...state.events,
+    frozenContextEvent,
+    recordedEvent,
+    agentRejectionEvent,
+  ]);
+  assert.equal(agentRejectionReplay.ok, false);
+  if (!agentRejectionReplay.ok) {
+    assert.equal(agentRejectionReplay.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+
+  const unrecordedRejectionPayload = {
+    ...recordedPayload,
+    eventId: "EVENT-BUILD-PLAN-REJECTED-UNRECORDED",
+    actor: { kind: "user", id: "reviewer", sessionRef: "review-session" },
+    reason: "Reject unrecorded Plan evidence.",
+    idempotencyKey: "IDEMPOTENCY-BUILD-PLAN-REJECTED-UNRECORDED",
+    occurredAt: "2026-07-15T12:01:00Z",
+    change: "rejected",
+  };
+  const unrecordedRejectionEvent = {
+    ...unrecordedRejectionPayload,
+    chainDigest: digestReplayEvent(unrecordedRejectionPayload),
+  } as unknown as WorkflowEvent;
+  const unrecordedRejectionReplay = coreContract.replayWorkflowEvents([
+    ...state.events,
+    frozenContextEvent,
+    unrecordedRejectionEvent,
+  ]);
+  assert.equal(unrecordedRejectionReplay.ok, false);
+  if (!unrecordedRejectionReplay.ok) {
+    assert.equal(
+      unrecordedRejectionReplay.diagnostics[0]?.code,
+      "workflow.event.invalid",
+    );
+  }
+});
+
 test("replay rejects a stale Event sequence without changing accepted history", () => {
   const started = startTask("build");
   const advanced = coreContract.transitionWorkflow(started, {
@@ -985,7 +1131,25 @@ function digestReplayEvent(event: Record<string, unknown>): string {
     idempotencyKey: event.idempotencyKey,
     occurredAt: event.occurredAt,
   };
+  if (event.type === "build_plan_changed") {
+    payload.change = event.change;
+    payload.planIdentity = event.planIdentity;
+    payload.requirementsIdentity = event.requirementsIdentity;
+    payload.contextManifestPath = event.contextManifestPath;
+    payload.contextManifestIdentity = event.contextManifestIdentity;
+  } else if (event.type === "context_manifest_changed") {
+    payload.phase = event.phase;
+    payload.manifestPath = event.manifestPath;
+    payload.manifestIdentity = event.manifestIdentity;
+    payload.change = event.change;
+  }
   const serialized = stableTestJson(payload);
+  assert.ok(serialized);
+  return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
+}
+
+function hashTestValue(value: unknown): string {
+  const serialized = stableTestJson(value);
   assert.ok(serialized);
   return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
 }

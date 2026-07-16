@@ -710,6 +710,8 @@ async function runPlanCli(parsed: ParsedPlanArguments): Promise<CliRunResult> {
             projection: result.state.projection,
             plan: result.plan,
             created: result.created,
+            event: result.event,
+            appended: result.appended,
           }),
           parsed.json,
         )
