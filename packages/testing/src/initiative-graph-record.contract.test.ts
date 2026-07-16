@@ -106,6 +106,41 @@ test("Task recovery rebuilds a missing Initiative graph record from accepted his
   assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), fixture.graph);
 });
 
+test("Task recovery replaces a corrupt Initiative graph projection from accepted history", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const graphPath = join(
+    fixture.repository,
+    ".sayhi",
+    "tasks",
+    INITIATIVE_ID,
+    "graph.json",
+  );
+  await writeFile(graphPath, "{", "utf8");
+
+  const corrupt = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(corrupt.ok, false);
+  if (!corrupt.ok) {
+    assert.equal(corrupt.diagnostics[0]?.code, "initiative_graph.record.invalid");
+  }
+
+  const recovered = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(recovered.ok, true);
+  const restored = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(restored.ok, true);
+  if (restored.ok) {
+    assert.deepEqual(restored.graph, fixture.graph);
+  }
+});
+
 test("Graph inspection rejects invalid and incompatible records without changing Initiative state", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
   const graphPath = join(

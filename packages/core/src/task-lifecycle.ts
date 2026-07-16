@@ -993,13 +993,11 @@ async function writeInitiativeGraphIfChanged(
   path: string,
   graph: DependencyGraph,
 ): Promise<boolean> {
-  const expected = serializeInitiativeGraph(graph);
-  const current = await fileSystem.inspect(path);
-  if (current.kind === "file" && (await fileSystem.readFile(path)) === expected) {
-    return false;
-  }
-  await fileSystem.writeFile(path, expected);
-  return true;
+  return writeSnapshotIfChanged(
+    fileSystem,
+    path,
+    serializeInitiativeGraph(graph),
+  );
 }
 
 async function createDurableTaskLocked(
@@ -2280,7 +2278,14 @@ async function writeProjectionIfChanged(
   path: string,
   projection: TaskProjection,
 ): Promise<boolean> {
-  const expected = serializeProjection(projection);
+  return writeSnapshotIfChanged(fileSystem, path, serializeProjection(projection));
+}
+
+async function writeSnapshotIfChanged(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  expected: string,
+): Promise<boolean> {
   const current = await fileSystem.inspect(path);
   if (current.kind === "file" && (await fileSystem.readFile(path)) === expected) {
     return false;
