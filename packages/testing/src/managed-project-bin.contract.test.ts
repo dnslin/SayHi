@@ -430,11 +430,66 @@ test("packaged CLI creates and inspects a durable Task", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-cli-binary-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   await mkdir(join(repository, ".git"));
+  const beforeInitialization = await executeCliResult(
+    "task",
+    "list",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(beforeInitialization.exitCode, 6);
   assert.equal((await executeCli("init", "--cwd", repository, "--json")).stderr, "");
   await writeFile(
     join(repository, "task-create.json"),
     `${JSON.stringify(taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-16T10:00:00Z"), null, 2)}\n`,
     "utf8",
+  );
+  const missingRequest = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-request-missing.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(missingRequest.exitCode, 8);
+  assert.equal(
+    (JSON.parse(missingRequest.stdout) as CliJsonEnvelope).error?.code,
+    "task_lifecycle.io_failed",
+  );
+  await writeTaskRequest(repository, "task-gated-create.json", {
+    ...taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-16T10:00:01Z"),
+    routeGate: { gate: "route", evidence: [] },
+  });
+  const gated = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-gated-create.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(gated.exitCode, 5);
+  assert.equal(
+    (JSON.parse(gated.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.gate.evidence_invalid",
+  );
+  await writeFile(join(repository, "task-malformed-create.json"), "{\"contractVersion\":1}\n", "utf8");
+  const malformedCreate = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-malformed-create.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(malformedCreate.exitCode, 3);
+  assert.equal(
+    (JSON.parse(malformedCreate.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.request.invalid",
   );
 
   const created = await executeCliResult(
@@ -466,6 +521,10 @@ test("packaged CLI creates and inspects a durable Task", async (t) => {
     (shownEnvelope.result?.projection as { id: string }).id,
     FOUNDATION_TASK.taskId,
   );
+  const listed = await executeCliResult("task", "list", "--cwd", repository, "--json");
+  assert.equal(listed.exitCode, 0);
+  const listedEnvelope = JSON.parse(listed.stdout) as CliJsonEnvelope;
+  assert.deepEqual(listedEnvelope.result?.taskIds, [FOUNDATION_TASK.taskId]);
 });
 
 test("packaged CLI advances, recovers, and archives a durable Task", async (t) => {
@@ -573,13 +632,145 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
   const recoveredEnvelope = JSON.parse(recovered.stdout) as CliJsonEnvelope;
   assert.equal(recoveredEnvelope.result?.recovered, true);
   state = await showTaskState(repository);
+  await writeTaskRequest(repository, "task-transition.json", {});
+  const unboundAdvance = await executeCliResult(
+    "task",
+    "advance",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(unboundAdvance.exitCode, 3);
+  assert.equal(
+    (JSON.parse(unboundAdvance.stdout) as CliJsonEnvelope).error?.code,
+    "task.request.task_id_mismatch",
+  );
+  await writeTaskRequest(repository, "task-transition.json", {
+    taskId: FOUNDATION_TASK.taskId,
+  });
+  const malformedAdvance = await executeCliResult(
+    "task",
+    "advance",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(malformedAdvance.exitCode, 3);
+  assert.equal(
+    (JSON.parse(malformedAdvance.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.request.invalid",
+  );
+  const transitionWithMismatchedTaskId = taskLifecycleTransition(
+    FOUNDATION_TASK,
+    state,
+    "active",
+    "plan",
+    "MISMATCHED-TASK-ID",
+    "2026-07-16T11:01:58Z",
+  );
+  await writeTaskRequest(repository, "task-transition.json", transitionWithMismatchedTaskId);
+  const eventCountBeforeMismatchedTaskId = state.events.length;
+  const mismatchedTaskIdResult = await executeCliResult(
+    "task",
+    "advance",
+    "TASK-15-OTHER",
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(mismatchedTaskIdResult.exitCode, 3);
+  assert.equal(
+    (JSON.parse(mismatchedTaskIdResult.stdout) as CliJsonEnvelope).error?.code,
+    "task.request.task_id_mismatch",
+  );
+  assert.equal((await showTaskState(repository)).events.length, eventCountBeforeMismatchedTaskId);
+  const misroutedBlock = taskLifecycleTransition(
+    FOUNDATION_TASK,
+    state,
+    "active",
+    "plan",
+    "MISROUTED-BLOCK",
+    "2026-07-16T11:01:59Z",
+  );
+  await writeTaskRequest(repository, "task-transition.json", misroutedBlock);
+  const eventCountBeforeMisroutedBlock = state.events.length;
+  const misroutedBlockResult = await executeCliResult(
+    "task",
+    "block",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(misroutedBlockResult.exitCode, 3);
+  assert.equal(
+    (JSON.parse(misroutedBlockResult.stdout) as CliJsonEnvelope).error?.code,
+    "task.transition.target.invalid",
+  );
+  assert.equal((await showTaskState(repository)).events.length, eventCountBeforeMisroutedBlock);
+  const block = {
+    ...taskLifecycleTransition(
+      FOUNDATION_TASK,
+      state,
+      "blocked",
+      "explore",
+      "BLOCK",
+      "2026-07-16T11:02:00Z",
+    ),
+    blockers: ["Awaiting user input"],
+  };
+  await writeTaskRequest(repository, "task-transition.json", block);
+  const blocked = await executeCliResult(
+    "task",
+    "block",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(blocked.exitCode, 0);
+  state = await showTaskState(repository);
+  assert.equal(state.projection.lifecycle, "blocked");
+  const unblock = taskLifecycleTransition(
+    FOUNDATION_TASK,
+    state,
+    "active",
+    "explore",
+    "UNBLOCK",
+    "2026-07-16T11:02:01Z",
+  );
+  await writeTaskRequest(repository, "task-transition.json", unblock);
+  const unblocked = await executeCliResult(
+    "task",
+    "unblock",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(unblocked.exitCode, 0);
+  state = await showTaskState(repository);
+  assert.equal(state.projection.lifecycle, "active");
 
   for (const [lifecycle, phase] of [
     ["active", "plan"],
     ["active", "implement"],
     ["active", "review"],
     ["active", "finish"],
-    ["completed", "finish"],
   ] as const) {
     const transition = taskLifecycleTransition(
       FOUNDATION_TASK,
@@ -603,6 +794,28 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     assert.equal(transitioned.exitCode, 0);
     state = await showTaskState(repository);
   }
+  const completion = taskLifecycleTransition(
+    FOUNDATION_TASK,
+    state,
+    "completed",
+    "finish",
+    "COMPLETE",
+    "2026-07-16T11:02:02Z",
+  );
+  await writeTaskRequest(repository, "task-transition.json", completion);
+  const completed = await executeCliResult(
+    "task",
+    "complete",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(completed.exitCode, 0);
+  state = await showTaskState(repository);
+  assert.equal(state.projection.lifecycle, "completed");
   const archive = taskLifecycleTransition(
     FOUNDATION_TASK,
     state,
@@ -612,6 +825,57 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     "2026-07-16T11:03:00Z",
   );
   await writeTaskRequest(repository, "task-transition.json", archive);
+  const archivedThroughAdvance = await executeCliResult(
+    "task",
+    "advance",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(archivedThroughAdvance.exitCode, 3);
+  assert.equal(
+    (JSON.parse(archivedThroughAdvance.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.transition.illegal",
+  );
+  assert.equal((await showTaskState(repository)).projection.lifecycle, "completed");
+  await writeTaskRequest(repository, "task-transition.json", {
+    taskId: FOUNDATION_TASK.taskId,
+  });
+  const malformedArchive = await executeCliResult(
+    "task",
+    "archive",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(malformedArchive.exitCode, 3);
+  assert.equal(
+    (JSON.parse(malformedArchive.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.request.invalid",
+  );
+  await writeTaskRequest(repository, "task-transition.json", archive);
+  const mismatchedArchive = await executeCliResult(
+    "task",
+    "archive",
+    "TASK-15-OTHER",
+    "--from",
+    "task-transition.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(mismatchedArchive.exitCode, 3);
+  assert.equal(
+    (JSON.parse(mismatchedArchive.stdout) as CliJsonEnvelope).error?.code,
+    "task.request.task_id_mismatch",
+  );
+  assert.equal((await showTaskState(repository)).events.length, state.events.length);
   const archived = await executeCliResult(
     "task",
     "archive",
@@ -664,6 +928,7 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
     "export const foundation = 'dirty';\n",
     "utf8",
   );
+  await writeFile(join(repository, "unrelated-user.txt"), "private notes\n", "utf8");
 
   const baseline = await executeCliResult(
     "task",
@@ -678,9 +943,12 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
   const dirtyPaths = (baselineEnvelope.result?.baseline as {
     dirtyPaths: readonly { path: string }[];
   }).dirtyPaths;
-  assert.deepEqual(dirtyPaths.map((path) => path.path), ["packages/core/foundation.ts"]);
+  assert.deepEqual(dirtyPaths.map((path) => path.path), [
+    "packages/core/foundation.ts",
+    "unrelated-user.txt",
+  ]);
 
-  const adopted = await executeCliResult(
+  const incompleteAdoption = await executeCliResult(
     "task",
     "adopt",
     FOUNDATION_TASK.taskId,
@@ -689,10 +957,36 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
     repository,
     "--json",
   );
+  assert.equal(incompleteAdoption.exitCode, 3);
+  const adopted = await executeCliResult(
+    "task",
+    "adopt",
+    FOUNDATION_TASK.taskId,
+    "packages/core/foundation.ts",
+    "unrelated-user.txt",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(adopted.exitCode, 0);
   const adoptedEnvelope = JSON.parse(adopted.stdout) as CliJsonEnvelope;
   assert.equal(adoptedEnvelope.operation, "task.adopt");
   assert.equal(adoptedEnvelope.result?.appended, true);
+  const repeatedAdoption = await executeCliResult(
+    "task",
+    "adopt",
+    FOUNDATION_TASK.taskId,
+    "packages/core/foundation.ts",
+    "unrelated-user.txt",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(repeatedAdoption.exitCode, 0);
+  assert.equal(
+    (JSON.parse(repeatedAdoption.stdout) as CliJsonEnvelope).result?.appended,
+    false,
+  );
 
   const events = await executeCliResult(
     "task",
@@ -707,6 +1001,12 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
   assert.equal(
     (eventsEnvelope.result?.events as readonly { type: string }[]).at(-1)?.type,
     "baseline_adopted",
+  );
+  assert.equal(
+    (eventsEnvelope.result?.events as readonly { type: string }[]).filter(
+      (event) => event.type === "baseline_adopted",
+    ).length,
+    1,
   );
 });
 
@@ -753,6 +1053,12 @@ test("packaged CLI doctor fails closed on corrupt durable Event history", async 
   assert.equal(diagnosis.exitCode, 3);
   const envelope = JSON.parse(diagnosis.stdout) as CliJsonEnvelope;
   assert.equal(envelope.error?.code, "workflow.event.chain_invalid");
+  const listed = await executeCliResult("task", "list", "--cwd", repository, "--json");
+  assert.equal(listed.exitCode, 3);
+  assert.equal(
+    (JSON.parse(listed.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.event.chain_invalid",
+  );
   assert.equal(await readFile(eventsPath, "utf8"), corruptHistory);
   assert.equal(await readFile(projectionPath, "utf8"), projection);
 });

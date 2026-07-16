@@ -176,10 +176,14 @@ type TaskSubcommand =
   | "advance"
   | "archive"
   | "baseline"
+  | "block"
+  | "complete"
   | "create"
   | "events"
+  | "list"
   | "recover"
-  | "show";
+  | "show"
+  | "unblock";
 interface ParsedTaskArguments {
   readonly ok: true;
   readonly command: "task";
@@ -588,6 +592,17 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
     return repositoryRoot;
   }
   const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
+  const projectDiagnosis = await coreContract.diagnoseManagedProject({
+    fileSystem,
+    installation: CLI_MANAGED_PROJECT_INSTALLATION,
+  });
+  if (!projectDiagnosis.ok) {
+    return cliProjectDiagnosisFailure(
+      `task.${parsed.subcommand}`,
+      projectDiagnosis,
+      parsed.json,
+    );
+  }
   switch (parsed.subcommand) {
     case "create": {
       const request = await readTaskJsonRequest(
@@ -615,33 +630,14 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
           )
         : cliDomainFailure("task.create", result.diagnostics[0], parsed.json);
     }
-    case "advance": {
-      const request = await readTaskJsonRequest(
-        fileSystem,
-        parsed.source!,
-        "task.advance",
-        parsed.json,
-      );
-      if (!request.ok) {
-        return request.result;
-      }
-      const result = await coreContract.advanceDurableTask({
-        fileSystem,
-        transition: request.value as unknown as TransitionWorkflowRequest,
-      });
-      return result.ok
-        ? cliSuccess(
-            "task.advance",
-            Object.freeze({
-              taskId: result.state.projection.id,
-              projection: result.state.projection,
-              event: result.event,
-              appended: result.appended,
-            }),
-            parsed.json,
-          )
-        : cliDomainFailure("task.advance", result.diagnostics[0], parsed.json);
-    }
+    case "advance":
+      return runTaskTransition(fileSystem, parsed, "task.advance");
+    case "block":
+      return runTaskTransition(fileSystem, parsed, "task.block", "blocked");
+    case "unblock":
+      return runTaskTransition(fileSystem, parsed, "task.unblock", "active");
+    case "complete":
+      return runTaskTransition(fileSystem, parsed, "task.complete", "completed");
     case "recover": {
       const result = await coreContract.recoverDurableTask({
         fileSystem,
@@ -669,6 +665,15 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
       );
       if (!request.ok) {
         return request.result;
+      }
+      const taskIdFailure = taskRequestIdFailure(
+        request.value,
+        parsed.taskId!,
+        "task.archive",
+        parsed.json,
+      );
+      if (taskIdFailure !== undefined) {
+        return taskIdFailure;
       }
       const result = await coreContract.archiveDurableTask({
         fileSystem,
@@ -733,6 +738,12 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
           )
         : cliDomainFailure("task.adopt", result.diagnostics[0], parsed.json);
     }
+    case "list": {
+      const result = await coreContract.listDurableTasks({ fileSystem });
+      return result.ok
+        ? cliSuccess("task.list", Object.freeze({ taskIds: result.taskIds }), parsed.json)
+        : cliDomainFailure("task.list", result.diagnostics[0], parsed.json);
+    }
     case "events": {
       const result = await coreContract.readDurableTask({
         fileSystem,
@@ -764,6 +775,88 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
         : cliDomainFailure("task.show", result.diagnostics[0], parsed.json);
     }
   }
+}
+
+async function runTaskTransition(
+  fileSystem: NodeManagedProjectFileSystem,
+  parsed: ParsedTaskArguments,
+  operation: "task.advance" | "task.block" | "task.unblock" | "task.complete",
+  expectedLifecycle?: "active" | "blocked" | "completed",
+): Promise<CliRunResult> {
+  const request = await readTaskJsonRequest(
+    fileSystem,
+    parsed.source!,
+    operation,
+    parsed.json,
+  );
+  if (!request.ok) {
+    return request.result;
+  }
+  const taskIdFailure = taskRequestIdFailure(
+    request.value,
+    parsed.taskId!,
+    operation,
+    parsed.json,
+  );
+  if (taskIdFailure !== undefined) {
+    return taskIdFailure;
+  }
+  if (expectedLifecycle !== undefined) {
+    const target = request.value.to;
+    if (
+      typeof target !== "object" ||
+      target === null ||
+      Array.isArray(target) ||
+      (target as Record<string, unknown>).lifecycle !== expectedLifecycle
+    ) {
+      return cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "task.transition.target.invalid",
+          message: `${operation} requires a transition to ${expectedLifecycle}.`,
+          remediation: "Submit a Transition request whose target lifecycle matches the command.",
+        }),
+        parsed.json,
+      );
+    }
+  }
+  const result = await coreContract.advanceDurableTask({
+    fileSystem,
+    transition: request.value as unknown as TransitionWorkflowRequest,
+  });
+  return result.ok
+    ? cliSuccess(
+        operation,
+        Object.freeze({
+          taskId: result.state.projection.id,
+          projection: result.state.projection,
+          event: result.event,
+          appended: result.appended,
+        }),
+        parsed.json,
+      )
+    : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
+}
+
+function taskRequestIdFailure(
+  request: Readonly<Record<string, unknown>>,
+  expectedTaskId: string,
+  operation: string,
+  json: boolean,
+): CliRunResult | undefined {
+  const requestTaskId = request.taskId;
+  if (typeof requestTaskId === "string" && requestTaskId === expectedTaskId) {
+    return undefined;
+  }
+  return cliDomainFailure(
+    operation,
+    Object.freeze({
+      code: "task.request.task_id_mismatch",
+      message: "The Task id in the request does not match the command Task id.",
+      remediation: "Use the same Task id in the command and transition request.",
+    }),
+    json,
+  );
 }
 
 type CapturedTaskBaselineResult =
@@ -849,8 +942,25 @@ async function readTaskJsonRequest(
   operation: string,
   json: boolean,
 ): Promise<TaskJsonRequestResult> {
+  let sourceText: string;
   try {
-    const value: unknown = JSON.parse(await fileSystem.readRepositoryFile(source));
+    sourceText = await fileSystem.readRepositoryFile(source);
+  } catch {
+    return Object.freeze({
+      ok: false,
+      result: cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "task_lifecycle.io_failed",
+          message: "Task request could not be read from the repository.",
+          remediation: "Restore the request file and retry.",
+        }),
+        json,
+      ),
+    });
+  }
+  try {
+    const value: unknown = JSON.parse(sourceText);
     return typeof value === "object" && value !== null && !Array.isArray(value)
       ? Object.freeze({ ok: true, value: value as Record<string, unknown> })
       : Object.freeze({
@@ -1030,10 +1140,14 @@ function parseTaskArguments(args: readonly string[]): TaskArgumentResult | null 
     subcommand !== "advance" &&
     subcommand !== "archive" &&
     subcommand !== "baseline" &&
+    subcommand !== "block" &&
+    subcommand !== "complete" &&
     subcommand !== "create" &&
     subcommand !== "events" &&
+    subcommand !== "list" &&
     subcommand !== "recover" &&
-    subcommand !== "show"
+    subcommand !== "show" &&
+    subcommand !== "unblock"
   ) {
     return { ok: false, message: "Task command is not supported." };
   }
@@ -1042,6 +1156,11 @@ function parseTaskArguments(args: readonly string[]): TaskArgumentResult | null 
       return { ok: false, message: "task create requires only --from <request.json>." };
     }
     return { ok: true, command: "task", subcommand, cwd, json, source };
+  }
+  if (subcommand === "list") {
+    return taskId === undefined && source === undefined && mode === undefined
+      ? { ok: true, command: "task", subcommand, cwd, json }
+      : { ok: false, message: "task list is read-only." };
   }
   if (taskId === undefined) {
     return { ok: false, message: `task ${subcommand} requires one Task id.` };
@@ -1691,8 +1810,37 @@ function cliSuccess(
       };
 }
 
+function cliProjectDiagnosisFailure(
+  operation: string,
+  result: DiagnoseManagedProjectResult,
+  json: boolean,
+): CliRunResult {
+  return cliDiagnosticFailure(
+    operation,
+    managedProjectExitCode(result),
+    result.diagnostics[0],
+    json,
+  );
+}
+
 function cliDomainFailure(
   operation: string,
+  diagnostic: CliJsonDiagnostic | undefined,
+  json: boolean,
+): CliRunResult {
+  const exitCode =
+    diagnostic?.code === "task_lifecycle.io_failed"
+      ? 8
+      : diagnostic?.code === "workflow.gate.unmet" ||
+          diagnostic?.code === "workflow.gate.evidence_invalid"
+        ? 5
+        : 3;
+  return cliDiagnosticFailure(operation, exitCode, diagnostic, json);
+}
+
+function cliDiagnosticFailure(
+  operation: string,
+  exitCode: number,
   diagnostic: CliJsonDiagnostic | undefined,
   json: boolean,
 ): CliRunResult {
@@ -1706,9 +1854,9 @@ function cliDomainFailure(
     version: cliJsonVersion(),
   };
   return json
-    ? { exitCode: 3, stdout: `${JSON.stringify(envelope)}\n`, stderr: "" }
+    ? { exitCode, stdout: `${JSON.stringify(envelope)}\n`, stderr: "" }
     : {
-        exitCode: 3,
+        exitCode,
         stdout: "",
         stderr: `${error.message}\nRemediation: ${error.remediation}\n`,
       };

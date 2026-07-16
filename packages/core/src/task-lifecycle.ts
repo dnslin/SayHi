@@ -211,6 +211,10 @@ export type InspectDurableInitiativeGraphResult =
 export interface DiagnoseDurableTasksRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
 }
+export interface ListDurableTasksRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+}
+
 
 export interface AdoptDurableTaskBaselineRequest {
   readonly fileSystem: TaskBaselineFileSystem;
@@ -382,6 +386,14 @@ export type ReadDurableTaskResult =
       state: WorkflowState;
     }>
   | TaskLifecycleFailure;
+export type ListDurableTasksResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      taskIds: readonly string[];
+    }>
+  | TaskLifecycleFailure;
+
 
 
 
@@ -521,21 +533,50 @@ export async function createDurableTask(
 export async function advanceDurableTask(
   request: AdvanceDurableTaskRequest,
 ): Promise<AdvanceDurableTaskResult> {
-  const paths = taskPaths(request.transition.taskId);
+  const transition = request.transition as TransitionWorkflowRequest | undefined;
+  const paths = taskPaths(transition?.taskId);
   if (!paths.ok) {
     return paths;
+  }
+  if (transition?.to?.lifecycle === "archived") {
+    return failure([
+      diagnostic(
+        "workflow.transition.illegal",
+        "$.to.lifecycle",
+        "Archive transitions require the durable archive operation.",
+        "Use archiveDurableTask to archive a completed Task.",
+      ),
+    ]);
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
     advanceDurableTaskLocked(request, paths),
   );
 }
-
 export async function archiveDurableTask(
   request: ArchiveDurableTaskRequest,
 ): Promise<ArchiveDurableTaskResult> {
-  const paths = taskPaths(request.transition.taskId);
+  const transition = request.transition as TransitionWorkflowRequest | undefined;
+  const paths = taskPaths(transition?.taskId);
   if (!paths.ok) {
     return paths;
+  }
+  const target = transition?.to as
+    | Readonly<{ lifecycle?: unknown; phase?: unknown; step?: unknown }>
+    | undefined;
+  if (
+    target === undefined ||
+    typeof target.lifecycle !== "string" ||
+    typeof target.phase !== "string" ||
+    typeof target.step !== "string"
+  ) {
+    return failure([
+      diagnostic(
+        "workflow.request.invalid",
+        "$.to",
+        "Workflow transition request is malformed.",
+        "Provide a complete transition target and retry.",
+      ),
+    ]);
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
     archiveDurableTaskLocked(request, paths),
@@ -607,6 +648,44 @@ export async function readDurableTask(
       })
     : loaded;
 }
+export async function listDurableTasks(
+  request: ListDurableTasksRequest,
+): Promise<ListDurableTasksResult> {
+  let entries: readonly TaskLifecycleDirectoryEntry[];
+  try {
+    entries = await request.fileSystem.listDirectory(TASKS_DIRECTORY);
+  } catch {
+    return failure([ioDiagnostic(TASKS_DIRECTORY)]);
+  }
+  const taskIds: string[] = [];
+  for (const entry of entries) {
+    if (entry.name === "archive" && entry.kind === "directory") {
+      continue;
+    }
+    const entryPath = `${TASKS_DIRECTORY}/${entry.name}`;
+    if (entry.kind !== "directory") {
+      return failure([
+        diagnostic(
+          "task_lifecycle.history.missing",
+          entryPath,
+          "A Task Store entry is not a real directory.",
+          "Restore or remove the unsafe Task entry before retrying.",
+        ),
+      ]);
+    }
+    const task = await readDurableTask({ fileSystem: request.fileSystem, taskId: entry.name });
+    if (!task.ok) {
+      return task;
+    }
+    taskIds.push(task.state.projection.id);
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    taskIds: Object.freeze(taskIds),
+  });
+}
+
 export async function inspectDurableInitiativeGraph(
   request: InspectDurableInitiativeGraphRequest,
 ): Promise<InspectDurableInitiativeGraphResult> {
@@ -1937,6 +2016,7 @@ async function adoptDurableTaskBaselineLocked(
   if (!baseline.ok) {
     return baseline;
   }
+  const baselineIdentity = hashCanonicalJson(baselineMaterial(baseline.baseline));
   const baselineCheck = await revalidateTaskBaseline(
     request.fileSystem,
     request.taskId,
@@ -1947,12 +2027,27 @@ async function adoptDurableTaskBaselineLocked(
   if (baselineCheck !== null) {
     return baselineCheck;
   }
+  const existingAdoption = latestBaselineAdoption(loaded.state);
+  if (
+    existingAdoption !== null &&
+    existingAdoption.baselineIdentity === baselineIdentity &&
+    stableJson(existingAdoption.adopted) === stableJson(baseline.baseline.dirtyPaths)
+  ) {
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: loaded.state,
+      event: existingAdoption,
+      appended: false,
+    });
+  }
+
 
   const adopted = adoptWorkflowBaseline(loaded.state, {
     contractVersion: 1,
     taskId: request.taskId,
     expectedVersion: request.expectedVersion,
-    baselineIdentity: baseline.identity,
+    baselineIdentity,
     adopted: baseline.baseline.dirtyPaths,
     event: request.event,
   });
@@ -2027,7 +2122,7 @@ async function withDurableTaskWriterLocked<Value>(
     return missingBaseline();
   }
   if (
-    adoption.baselineIdentity !== baseline.identity ||
+    adoption.baselineIdentity !== hashCanonicalJson(baselineMaterial(baseline.baseline)) ||
     stableJson(adoption.adopted) !== stableJson(baseline.baseline.dirtyPaths)
   ) {
     return baselineInvalid(
@@ -2599,10 +2694,10 @@ function writerUnavailable(): TaskLifecycleFailure {
 }
 
 
-function taskPaths(taskId: string):
+function taskPaths(taskId: unknown):
   | Readonly<{ ok: true } & TaskPaths>
   | TaskLifecycleFailure {
-  if (!isPortableTaskId(taskId)) {
+  if (typeof taskId !== "string" || !isPortableTaskId(taskId)) {
     return failure([
       diagnostic(
         "task_lifecycle.task_id.invalid",

@@ -7,6 +7,7 @@ import {
   createDurableTask,
   createDurableTaskHandoff,
   diagnoseDurableTasks,
+  listDurableTasks,
   recoverDurableTask,
   type TaskArchiveFileSystem,
   type TransitionWorkflowRequest,
@@ -628,6 +629,12 @@ test("archiving removes a completed Task from active Task listing without losing
     return;
   }
   assert.equal(diagnosed.taskCount, 0);
+  const listed = await listDurableTasks({ fileSystem });
+  assert.equal(listed.ok, true);
+  if (!listed.ok) {
+    return;
+  }
+  assert.deepEqual(listed.taskIds, []);
 
   const archiveHistory = fileSystem.files.get(archivedEventsPath);
 
@@ -665,6 +672,24 @@ test("archiving removes a completed Task from active Task listing without losing
   assert.equal(retried.moved, false);
   assert.deepEqual(retried.state, archived.state);
   assert.equal(fileSystem.files.get(archivedEventsPath), archiveHistory);
+});
+
+test("Core lists only active Tasks with valid Event history", async () => {
+  const { fileSystem } = await createAdvancedTask();
+  const listed = await listDurableTasks({ fileSystem });
+  assert.equal(listed.ok, true);
+  if (!listed.ok) {
+    return;
+  }
+  assert.deepEqual(listed.taskIds, [TASK_ID]);
+
+  fileSystem.files.set(EVENTS_PATH, "{\"event\":\"corrupt\"}\n");
+  const corrupt = await listDurableTasks({ fileSystem });
+  assert.equal(corrupt.ok, false);
+  if (corrupt.ok) {
+    return;
+  }
+  assert.equal(corrupt.diagnostics[0]?.code, "workflow.event.invalid");
 });
 
 test("an interrupted archive move resumes without appending another archive Event", async () => {

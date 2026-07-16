@@ -495,7 +495,7 @@ export function readGateEvidenceKinds(
 export function startWorkflowTask(
   request: StartWorkflowTaskRequest,
 ): StartWorkflowTaskResult {
-  const diagnostic = validateStartRequest(request);
+  const diagnostic = safelyValidateStartRequest(request);
   if (diagnostic !== null) {
     return startFailure(diagnostic);
   }
@@ -545,15 +545,14 @@ export function transitionWorkflow(
   request: TransitionWorkflowRequest,
 ): TransitionWorkflowResult {
   const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const structuralDiagnostic = validateTransitionRequestStructure(request);
+  if (structuralDiagnostic !== null) {
+    return transitionFailure(state, structuralDiagnostic);
+  }
   const repeatedEvent = state.events.find(
     (event) => event.idempotencyKey === request.event.idempotencyKey,
   );
-  if (
-    repeatedEvent !== undefined &&
-    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
-    request.taskId === state.projection.id &&
-    stateIsConsistent
-  ) {
+  if (repeatedEvent !== undefined) {
     if (
       repeatedEvent.type === "workflow_transitioned" &&
       matchesTransitionIntent(repeatedEvent, request)
@@ -575,8 +574,7 @@ export function transitionWorkflow(
       ),
     );
   }
-
-  const requestDiagnostic = validateTransitionRequest(
+  const requestDiagnostic = safelyValidateTransitionRequest(
     state,
     request,
     stateIsConsistent,
@@ -584,6 +582,7 @@ export function transitionWorkflow(
   if (requestDiagnostic !== null) {
     return transitionFailure(state, requestDiagnostic);
   }
+
 
   const transition = findTransition(state.projection, request.to);
   if (transition === undefined) {
@@ -1083,6 +1082,46 @@ function transitionStep(lifecycle: WorkflowLifecycle): string {
   return lifecycle === "completed" || lifecycle === "archived"
     ? lifecycle
     : "ready";
+}
+
+function safelyValidateStartRequest(request: StartWorkflowTaskRequest): WorkflowDiagnostic | null {
+  try {
+    return validateStartRequest(request);
+  } catch {
+    return invalidRequest("$", "Workflow start request is malformed.");
+  }
+}
+
+function validateTransitionRequestStructure(
+  request: TransitionWorkflowRequest,
+): WorkflowDiagnostic | null {
+  try {
+    if (
+      request === null ||
+      typeof request !== "object" ||
+      request.event === null ||
+      typeof request.event !== "object" ||
+      request.to === null ||
+      typeof request.to !== "object"
+    ) {
+      return invalidRequest("$", "Workflow transition request is malformed.");
+    }
+    return null;
+  } catch {
+    return invalidRequest("$", "Workflow transition request is malformed.");
+  }
+}
+
+function safelyValidateTransitionRequest(
+  state: WorkflowState,
+  request: TransitionWorkflowRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  try {
+    return validateTransitionRequest(state, request, stateIsConsistent);
+  } catch {
+    return invalidRequest("$", "Workflow transition request is malformed.");
+  }
 }
 
 function validateStartRequest(
