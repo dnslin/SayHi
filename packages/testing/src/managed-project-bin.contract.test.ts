@@ -1288,6 +1288,7 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
   const completedEnvelope = JSON.parse(completed.stdout) as CliJsonEnvelope;
   assert.equal(completedEnvelope.operation, "quick.complete");
   assert.equal(completedEnvelope.result?.taskId, fixture.taskId);
+  assert.equal(completedEnvelope.result?.outcome, "no-change");
   assertQuickProjection(completedEnvelope.result?.projection, "completed");
   assert.deepEqual(
     quickEventPhases(completedEnvelope.result?.events),
@@ -1308,6 +1309,7 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
   const shownEnvelope = JSON.parse(shown.stdout) as CliJsonEnvelope;
   assert.equal(shownEnvelope.operation, "quick.show");
   assertQuickProjection(shownEnvelope.result?.projection, "completed");
+  assert.equal(shownEnvelope.result?.outcome, "no-change");
   const activeAuditPath = await locateQuickAuditFile(auditRoot, "active");
 
 
@@ -1325,6 +1327,7 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
   const archivedEnvelope = JSON.parse(archived.stdout) as CliJsonEnvelope;
   assert.equal(archivedEnvelope.operation, "quick.archive");
   assertQuickProjection(archivedEnvelope.result?.projection, "archived");
+  assert.equal(archivedEnvelope.result?.outcome, "no-change");
   const archiveAuditPath = await locateQuickAuditFile(auditRoot, "archive");
   const interruptedArchiveAudit = await readFile(archiveAuditPath, "utf8");
   await rm(archiveAuditPath);
@@ -1369,6 +1372,23 @@ test("packaged CLI completes an auditable no-change Quick without repository wri
     "--json",
   );
   assert.equal(duplicateCompletion.exitCode, 4);
+  const archivedAuditPath = await locateQuickAuditFile(auditRoot, "archive");
+  await writeFile(
+    archivedAuditPath,
+    withoutQuickOutcome(await readFile(archivedAuditPath, "utf8")),
+    "utf8",
+  );
+  const missingOutcome = await executeCliResultWithEnvironment(
+    environment,
+    "quick",
+    "show",
+    fixture.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(missingOutcome.exitCode, 3);
+
 
   const unsafeAuditRoot = join(auditRoot, "repository-link");
   await symlink(repository, unsafeAuditRoot, "junction");
@@ -1587,6 +1607,13 @@ function readCliProjection(value: unknown): unknown {
   const result = readCliResult(value);
   assert.ok(result !== null && typeof result === "object" && "projection" in result);
   return result.projection;
+}
+
+function withoutQuickOutcome(source: string): string {
+  const value: unknown = JSON.parse(source);
+  assert.ok(value !== null && typeof value === "object" && "outcome" in value);
+  delete value.outcome;
+  return `${JSON.stringify(value)}\n`;
 }
 
 async function locateQuickAuditFile(

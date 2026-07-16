@@ -224,6 +224,9 @@ interface ParsedQuickArguments {
 }
 type QuickArgumentResult = ParsedQuickArguments | InvalidCliArguments;
 
+type QuickAuditOutcome = "no-change";
+const NO_CHANGE_QUICK_OUTCOME: QuickAuditOutcome = "no-change";
+
 
 
 type ManagedProjectOperationResult =
@@ -645,6 +648,7 @@ async function runQuickCli(parsed: ParsedQuickArguments): Promise<CliRunResult> 
               taskId: recovered.state.projection.id,
               projection: recovered.state.projection,
               events: recovered.state.events,
+              outcome: recovered.outcome,
               archived: recovered.archived,
             }),
             parsed.json,
@@ -753,6 +757,7 @@ async function completeNoChangeQuick(
       state.projection.id,
       Object.freeze({
         schemaVersion: 1,
+        outcome: NO_CHANGE_QUICK_OUTCOME,
         baselineBefore,
         baselineAfter,
         state,
@@ -774,6 +779,7 @@ async function completeNoChangeQuick(
           taskId: persisted.state.projection.id,
           projection: persisted.state.projection,
           events: persisted.state.events,
+          outcome: persisted.outcome,
         }),
         parsed.json,
       )
@@ -859,6 +865,7 @@ async function archiveNoChangeQuick(
           taskId: persisted.state.projection.id,
           projection: persisted.state.projection,
           events: persisted.state.events,
+          outcome: persisted.outcome,
           moved,
         }),
         parsed.json,
@@ -872,6 +879,7 @@ type RecoveredQuickAudit =
       record: Record<string, unknown>;
       state: WorkflowState;
       location: "active" | "archive";
+      outcome: QuickAuditOutcome;
       archived: boolean;
     }>
   | Readonly<{ ok: false; result: CliRunResult }>;
@@ -894,7 +902,8 @@ async function recoverQuickAudit(
     !("state" in stored.value) ||
     !isRecord(stored.value.state) ||
     !("events" in stored.value.state) ||
-    !Array.isArray(stored.value.state.events)
+    !Array.isArray(stored.value.state.events) ||
+    stored.value.outcome !== NO_CHANGE_QUICK_OUTCOME
   ) {
     return Object.freeze({
       ok: false,
@@ -935,6 +944,7 @@ async function recoverQuickAudit(
     record: stored.value,
     state: replayed.state,
     location: stored.location,
+    outcome: NO_CHANGE_QUICK_OUTCOME,
     archived:
       stored.location === "archive" || replayed.state.projection.lifecycle === "archived",
   });

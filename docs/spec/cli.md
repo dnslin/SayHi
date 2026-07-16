@@ -96,6 +96,7 @@ sayhi quick archive <task-id> --from <transition-request.json>
 Commands that imply a transition MUST use the same transition service as the OMP `workflow_advance` Tool. Administrative commands cannot skip Gates unless a specific, audited override operation exists.
 
 `quick complete` transports a Start request plus every gated Quick transition to Core, then retains the completed no-change audit outside the repository. `quick show` replays that audit through Core after restart; `quick archive` transports a Core-valid archive transition. The external audit root defaults to the local user runtime directory and MAY be set with `SAYHI_QUICK_AUDIT_DIR`, which MUST remain outside the repository.
+Every persisted no-change audit MUST record `outcome: "no-change"`; `quick complete`, `quick show`, and `quick archive` return that validated outcome in their JSON result.
 
 `task create`, `task advance`, `task block`, `task unblock`, `task complete`, and `task archive` read their request JSON from a regular, repository-relative file. The CLI transports that request to Core; Core remains the sole validator of Task state, versions, Gates, Events, and archive eligibility.
 

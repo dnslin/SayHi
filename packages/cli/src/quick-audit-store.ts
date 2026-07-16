@@ -22,6 +22,11 @@ export interface StoredQuickAudit {
   readonly location: QuickAuditLocation;
 }
 
+interface QuickAuditPaths {
+  readonly active: string;
+  readonly archive: string;
+}
+
 export class QuickAuditStoreError extends Error {
   readonly code: "exists" | "io_failed" | "missing" | "unsafe_root";
 
@@ -77,67 +82,66 @@ export class NodeQuickAuditStore {
 
 
   async create(taskId: string, value: unknown): Promise<void> {
-    const fileName = quickAuditFileName(taskId);
-    const active = join(this.#activeDirectory, fileName);
-    const archive = join(this.#archiveDirectory, fileName);
+    const paths = this.#paths(taskId);
     if (
-      (await inspectPath(active)) !== "missing" ||
-      (await inspectPath(archive)) !== "missing"
+      (await inspectPath(paths.active)) !== "missing" ||
+      (await inspectPath(paths.archive)) !== "missing"
     ) {
       throw new QuickAuditStoreError(
         "exists",
         "A Quick audit already exists for this Task.",
       );
     }
-    await writeNewJson(active, value);
+    await writeNewJson(paths.active, value);
   }
 
   async read(taskId: string): Promise<StoredQuickAudit> {
-    const fileName = quickAuditFileName(taskId);
-    const archive = join(this.#archiveDirectory, fileName);
-    if ((await inspectPath(archive)) === "file") {
-      return { value: await readJson(archive), location: "archive" };
+    const paths = this.#paths(taskId);
+    if ((await inspectPath(paths.archive)) === "file") {
+      return { value: await readJson(paths.archive), location: "archive" };
     }
-    const active = join(this.#activeDirectory, fileName);
-    if ((await inspectPath(active)) === "file") {
-      return { value: await readJson(active), location: "active" };
+    if ((await inspectPath(paths.active)) === "file") {
+      return { value: await readJson(paths.active), location: "active" };
     }
     throw new QuickAuditStoreError("missing", "Quick audit was not found.");
   }
 
   async archive(taskId: string, value: unknown): Promise<void> {
-    const fileName = quickAuditFileName(taskId);
-    const active = join(this.#activeDirectory, fileName);
-    if ((await inspectPath(active)) !== "file") {
-      throw new QuickAuditStoreError("missing", "Active Quick audit was not found.");
-    }
-    const archive = join(this.#archiveDirectory, fileName);
-    if ((await inspectPath(archive)) !== "missing") {
-      throw new QuickAuditStoreError(
-        "exists",
-        "An archived Quick audit already exists for this Task.",
-      );
-    }
-    await replaceJson(active, value);
-    await this.finalizeArchive(taskId);
+    const paths = await this.#requireActiveAudit(taskId);
+    await replaceJson(paths.active, value);
+    await this.#moveActiveAudit(paths);
   }
 
   async finalizeArchive(taskId: string): Promise<void> {
+    await this.#moveActiveAudit(await this.#requireActiveAudit(taskId));
+  }
+
+  #paths(taskId: string): QuickAuditPaths {
     const fileName = quickAuditFileName(taskId);
-    const active = join(this.#activeDirectory, fileName);
-    if ((await inspectPath(active)) !== "file") {
+    return Object.freeze({
+      active: join(this.#activeDirectory, fileName),
+      archive: join(this.#archiveDirectory, fileName),
+    });
+  }
+
+  async #requireActiveAudit(taskId: string): Promise<QuickAuditPaths> {
+    const paths = this.#paths(taskId);
+    if ((await inspectPath(paths.active)) !== "file") {
       throw new QuickAuditStoreError("missing", "Active Quick audit was not found.");
     }
-    const archive = join(this.#archiveDirectory, fileName);
-    if ((await inspectPath(archive)) !== "missing") {
+    if ((await inspectPath(paths.archive)) !== "missing") {
       throw new QuickAuditStoreError(
         "exists",
         "An archived Quick audit already exists for this Task.",
       );
     }
+    return paths;
+  }
+
+  async #moveActiveAudit(paths: QuickAuditPaths): Promise<void> {
     try {
       await mkdir(this.#archiveDirectory, { recursive: true });
-      await rename(active, archive);
+      await rename(paths.active, paths.archive);
     } catch {
       throw new QuickAuditStoreError(
         "io_failed",
