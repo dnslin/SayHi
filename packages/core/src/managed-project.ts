@@ -48,6 +48,7 @@ export interface ManagedProjectFileSystem {
   inspect(path: string): Promise<Readonly<{ kind: ManagedProjectPathKind }>>;
   readFile(path: string): Promise<string>;
   createDirectory(path: string): Promise<void>;
+  /** Atomically replaces the managed file with UTF-8 content. */
   writeFile(path: string, content: string): Promise<void>;
 }
 

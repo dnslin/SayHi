@@ -167,6 +167,17 @@ interface ParsedContextArguments {
 }
 
 type ContextArgumentResult = ParsedContextArguments | InvalidCliArguments;
+type GraphSubcommand = "show";
+interface ParsedGraphArguments {
+  readonly ok: true;
+  readonly command: "graph";
+  readonly subcommand: GraphSubcommand;
+  readonly cwd: string;
+  readonly json: boolean;
+  readonly initiativeTaskId: string;
+}
+type GraphArgumentResult = ParsedGraphArguments | InvalidCliArguments;
+
 
 
 type ManagedProjectOperationResult =
@@ -196,6 +207,19 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           args.includes("--json"),
         );
   }
+  const graph = parseGraphArguments(args);
+  if (graph !== null) {
+    return graph.ok
+      ? runGraphCli(graph)
+      : cliFailure(
+          "graph",
+          2,
+          graph.message,
+          "Run sayhi graph show <initiative-id>.",
+          args.includes("--json"),
+        );
+  }
+
 
   const parsed = parseArguments(args);
   if (!parsed.ok) {
@@ -517,6 +541,28 @@ async function runContextCli(
 }
 
 
+async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> {
+  const repositoryRoot = await resolveCliRepositoryRoot(
+    parsed.cwd,
+    `graph.${parsed.subcommand}`,
+    parsed.json,
+  );
+  if (typeof repositoryRoot !== "string") {
+    return repositoryRoot;
+  }
+  const result = await coreContract.inspectDurableInitiativeGraph({
+    fileSystem: new NodeManagedProjectFileSystem(repositoryRoot),
+    initiativeTaskId: parsed.initiativeTaskId,
+  });
+  return result.ok
+    ? cliSuccess(
+        "graph.show",
+        Object.freeze({ graph: result.graph, nodes: result.nodes }),
+        parsed.json,
+      )
+    : cliDomainFailure("graph.show", result.diagnostics[0], parsed.json);
+}
+
 async function resolveCliRepositoryRoot(
   cwd: string,
   operation: string,
@@ -601,6 +647,61 @@ function isGlobalPresentationOption(argument: string): boolean {
     argument === "--non-interactive" ||
     argument === "--verbose"
   );
+}
+
+function parseGraphArguments(args: readonly string[]): GraphArgumentResult | null {
+  if (leadingCliCommand(args) !== "graph") {
+    return null;
+  }
+  let cwd = process.cwd();
+  let json = false;
+  let graphCount = 0;
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (isGlobalPresentationOption(argument)) {
+      continue;
+    }
+    if (argument === "--cwd") {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, message: "--cwd requires a path." };
+      }
+      cwd = value;
+      index += 1;
+      continue;
+    }
+    if (argument === "graph") {
+      graphCount += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      return { ok: false, message: `Unknown argument: ${argument}` };
+    }
+    values.push(argument);
+  }
+  if (graphCount !== 1) {
+    return { ok: false, message: "Specify exactly one graph command." };
+  }
+  const [subcommand, initiativeTaskId, extra] = values;
+  if (subcommand !== "show") {
+    return { ok: false, message: "Graph command is not supported." };
+  }
+  if (initiativeTaskId === undefined || extra !== undefined) {
+    return { ok: false, message: "graph show requires exactly one Initiative id." };
+  }
+  return {
+    ok: true,
+    command: "graph",
+    subcommand,
+    cwd,
+    json,
+    initiativeTaskId,
+  };
 }
 
 function parseArguments(args: readonly string[]): CliArgumentResult {
