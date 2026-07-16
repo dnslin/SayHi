@@ -5,10 +5,16 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { NodeManagedProjectFileSystem, runCli, type CliJsonEnvelope } from "@dnslin/sayhi-cli";
-import { createDurableTask } from "@dnslin/sayhi-core";
+import {
+  advanceDurableTask,
+  createDurableTask,
+  readDurableTask,
+} from "@dnslin/sayhi-core";
 
 import {
+  taskLifecycleExploreTransition,
   taskLifecycleStartRequest,
+  taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
 
@@ -40,6 +46,25 @@ async function createApprovedSpec(
     "--json",
   ]);
   assert.equal(created.exitCode, 0);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    assert.fail(`${label} must be an object.`);
+  }
+  return value;
+}
+
+function requireString(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== "string") {
+    assert.fail(`${field} must be a string.`);
+  }
+  return value;
 }
 
 
@@ -351,4 +376,212 @@ test("CLI reports untrusted, missing, and malformed Context without downgrade", 
   const malformedEnvelope = JSON.parse(malformed.stdout) as CliJsonEnvelope;
   assert.equal(malformedEnvelope.error?.code, "context_manifest.invalid");
   assert.match(malformedEnvelope.error?.remediation ?? "", /Repair/u);
+});
+
+test("CLI records and human-approves a hash-bound Build Plan", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-plan-cli-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await mkdir(join(repository, ".git"));
+  assert.equal(
+    (await runCli(["init", "--cwd", repository, "--json"])).exitCode,
+    0,
+  );
+  await mkdir(join(repository, "docs"));
+  await writeFile(
+    join(repository, "docs", "implementation.md"),
+    "Stable implementation context.\n",
+    "utf8",
+  );
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(FIXTURE, "2026-07-15T10:00:00Z"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const explored = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleExploreTransition(
+      FIXTURE,
+      created.state.projection.version,
+      "EXPLORE",
+      "2026-07-15T10:01:00Z",
+    ),
+  });
+  assert.equal(explored.ok, true);
+  if (!explored.ok) {
+    return;
+  }
+  const planned = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      FIXTURE,
+      explored.state,
+      "active",
+      "plan",
+      "PLAN",
+      "2026-07-15T10:02:00Z",
+    ),
+  });
+  assert.equal(planned.ok, true);
+  if (!planned.ok) {
+    return;
+  }
+  assert.equal(
+    (
+      await runCli([
+        "context",
+        "add",
+        TASK_ID,
+        "implement",
+        "docs/implementation.md",
+        "--apply",
+        "--cwd",
+        repository,
+        "--json",
+      ])
+    ).exitCode,
+    0,
+  );
+  assert.equal(
+    (
+      await runCli([
+        "context",
+        "freeze",
+        TASK_ID,
+        "implement",
+        "--apply",
+        "--cwd",
+        repository,
+        "--json",
+      ])
+    ).exitCode,
+    0,
+  );
+  const beforePlan = await readDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(beforePlan.ok, true);
+  if (!beforePlan.ok) {
+    return;
+  }
+  await writeFile(
+    join(repository, "plan-record.json"),
+    JSON.stringify({
+      taskId: TASK_ID,
+      expectedVersion: beforePlan.state.projection.version,
+      content: "# Implementation Plan\n\nApprove the exact frozen Context.\n",
+      event: {
+        eventId: "EVENT-12-CLI-PLAN-RECORDED",
+        actor: { kind: "agent", id: "planning-agent", sessionRef: "plan-session" },
+        reason: "Record reviewable implementation Plan.",
+        idempotencyKey: "IDEMPOTENCY-12-CLI-PLAN-RECORDED",
+        occurredAt: "2026-07-15T10:03:00Z",
+      },
+    }),
+    "utf8",
+  );
+  const recorded = await runCli([
+    "plan",
+    "record",
+    TASK_ID,
+    "--from",
+    "plan-record.json",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(recorded.exitCode, 0);
+  const recordedEnvelope = requireRecord(JSON.parse(recorded.stdout), "Plan record envelope");
+  assert.equal(requireString(recordedEnvelope, "operation"), "plan.record");
+  const recordedResult = requireRecord(recordedEnvelope.result, "Plan record result");
+  const plan = requireRecord(recordedResult.plan, "Recorded Build Plan");
+  const planIdentity = requireString(plan, "identity");
+  const contextManifestIdentity = requireString(plan, "contextManifestIdentity");
+  assert.deepEqual(plan.requirements, beforePlan.state.projection.intent);
+  assert.match(requireString(plan, "content"), /Approve the exact frozen Context/u);
+
+  const approval = {
+    taskId: TASK_ID,
+    expectedVersion: beforePlan.state.projection.version,
+    planIdentity,
+    contextManifestIdentity,
+    event: {
+      eventId: "EVENT-12-CLI-PLAN-DECISION",
+      actor: { kind: "user", id: "reviewer-12", sessionRef: "approval-session" },
+      reason: "Human decided the implementation Plan.",
+      idempotencyKey: "IDEMPOTENCY-12-CLI-PLAN-DECISION",
+      occurredAt: "2026-07-15T10:04:00Z",
+    },
+  };
+  await writeFile(
+    join(repository, "plan-decision.json"),
+    JSON.stringify(approval),
+    "utf8",
+  );
+  const rejected = await runCli([
+    "plan",
+    "reject",
+    TASK_ID,
+    "--from",
+    "plan-decision.json",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(rejected.exitCode, 0);
+  const rejectedEnvelope = requireRecord(JSON.parse(rejected.stdout), "Plan rejection envelope");
+  const rejectedResult = requireRecord(rejectedEnvelope.result, "Plan rejection result");
+  assert.equal(requireString(rejectedResult, "decision"), "rejected");
+  assert.equal(
+    requireString(requireRecord(rejectedResult.projection, "Rejected Projection"), "phase"),
+    "plan",
+  );
+
+  await writeFile(
+    join(repository, "docs", "implementation.md"),
+    "Drifted implementation context.\n",
+    "utf8",
+  );
+  const stale = await runCli([
+    "plan",
+    "approve",
+    TASK_ID,
+    "--from",
+    "plan-decision.json",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(stale.exitCode, 3);
+  const staleEnvelope = requireRecord(JSON.parse(stale.stdout), "Stale Plan approval envelope");
+  const staleError = requireRecord(staleEnvelope.error, "Stale Plan approval error");
+  assert.equal(requireString(staleError, "code"), "build_plan.context_stale");
+
+  await writeFile(
+    join(repository, "docs", "implementation.md"),
+    "Stable implementation context.\n",
+    "utf8",
+  );
+  const approved = await runCli([
+    "plan",
+    "approve",
+    TASK_ID,
+    "--from",
+    "plan-decision.json",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(approved.exitCode, 0);
+  const approvedEnvelope = requireRecord(JSON.parse(approved.stdout), "Plan approval envelope");
+  assert.equal(requireString(approvedEnvelope, "operation"), "plan.approve");
+  const approvedResult = requireRecord(approvedEnvelope.result, "Plan approval result");
+  assert.equal(
+    requireString(requireRecord(approvedResult.projection, "Approved Projection"), "phase"),
+    "implement",
+  );
+  const approvedEvent = requireRecord(approvedResult.event, "Plan approval Event");
+  const approvedActor = requireRecord(approvedEvent.actor, "Plan approver");
+  assert.equal(requireString(approvedActor, "id"), "reviewer-12");
 });

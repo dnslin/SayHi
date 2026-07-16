@@ -46,6 +46,8 @@ import {
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
   inspectDurableContextManifest,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
   inspectDurableInitiativeGraph,
 } from "./task-lifecycle.js";
 
@@ -169,6 +171,12 @@ export type {
 } from "./dependency-graph.js";
 
 export type { ContractIdentity } from "./identity.js";
+
+export { DURABLE_BUILD_PLAN_SCHEMA_VERSION } from "./build-plan.js";
+export type {
+  DurableBuildPlan,
+  ParseDurableBuildPlanResult,
+} from "./build-plan.js";
 
 export { CONTEXT_MANIFEST_CONTRACT_VERSION } from "./context-manifest.js";
 export type { ContextManifestDiagnostic } from "./context-manifest.js";
@@ -312,6 +320,8 @@ export {
   inspectDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
 } from "./task-lifecycle.js";
 export type {
   ArchiveDurableTaskRequest,
@@ -369,6 +379,10 @@ export type {
   ScopedTaskWriter,
   WithDurableTaskWriterRequest,
   WithDurableTaskWriterResult,
+  DecideDurableBuildPlanRequest,
+  DecideDurableBuildPlanResult,
+  RecordDurableBuildPlanRequest,
+  RecordDurableBuildPlanResult,
 } from "./task-lifecycle.js";
 
 export interface BootstrapContract {
@@ -417,6 +431,8 @@ export interface CoreContract {
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
+  readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
+  readonly recordDurableBuildPlan: typeof recordDurableBuildPlan;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -465,4 +481,6 @@ export const coreContract: CoreContract = Object.freeze({
   withDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
 });

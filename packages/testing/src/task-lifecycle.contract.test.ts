@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  archiveDurableTask,
   advanceDurableTask,
+  addDurableContextManifestEntry,
+  archiveDurableTask,
   createDurableTask,
   createDurableTaskHandoff,
+  decideDurableBuildPlan,
   diagnoseDurableTasks,
+  freezeDurableContextManifest,
   listDurableTasks,
+  recordDurableBuildPlan,
   recoverDurableTask,
   type TaskArchiveFileSystem,
   type TransitionWorkflowRequest,
@@ -90,6 +94,10 @@ class MemoryTaskLifecycleFileSystem implements TaskArchiveFileSystem {
       throw new Error(`Missing test file: ${path}`);
     }
     return content;
+  }
+
+  async readRepositoryFile(path: string): Promise<string> {
+    return this.readFile(path);
   }
 
   async createDirectory(path: string): Promise<void> {
@@ -750,3 +758,205 @@ function transitionForFixture(
     "2026-07-15T12:00:00Z",
   );
 }
+
+test("only a durable hash-bound approved Build Plan enters Implement", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+
+  const explored = await advanceDurableTask({
+    fileSystem,
+    transition: exploreTransition(created.state.projection.version),
+  });
+  assert.equal(explored.ok, true);
+  if (!explored.ok) {
+    return;
+  }
+  const planned = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      explored.state,
+      "active",
+      "plan",
+      "PLAN",
+      "2026-07-15T14:00:00Z",
+    ),
+  });
+  assert.equal(planned.ok, true);
+  if (!planned.ok) {
+    return;
+  }
+  fileSystem.files.set("docs/plan-context.md", "Stable implementation context.\n");
+  const addedContext = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: planned.state.projection.version,
+    phase: "implement",
+    source: "docs/plan-context.md",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "IMPLEMENT-CONTEXT-ADDED",
+      "2026-07-15T14:01:00Z",
+    ),
+  });
+  assert.equal(addedContext.ok, true);
+  if (!addedContext.ok) {
+    return;
+  }
+  const frozenContext = await freezeDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: addedContext.state.projection.version,
+    phase: "implement",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "IMPLEMENT-CONTEXT",
+      "2026-07-15T14:01:30Z",
+    ),
+  });
+  assert.equal(frozenContext.ok, true);
+  if (!frozenContext.ok) {
+    return;
+  }
+
+  const prepared = await recordDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: frozenContext.state.projection.version,
+    content: "# Implementation Plan\n\nPersist and approve the Plan Gate.\n",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PLAN-RECORDED",
+      "2026-07-15T14:02:00Z",
+    ),
+  });
+  assert.equal(prepared.ok, true);
+  if (!prepared.ok) {
+    return;
+  }
+  assert.deepEqual(prepared.plan.requirements, frozenContext.state.projection.intent);
+  assert.deepEqual(
+    prepared.plan.contextManifestIdentity,
+    frozenContext.event.manifestIdentity,
+  );
+
+  const bypassed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      frozenContext.state,
+      "active",
+      "implement",
+      "BYPASS",
+      "2026-07-15T14:03:00Z",
+    ),
+  });
+  assert.equal(bypassed.ok, false);
+  if (!bypassed.ok) {
+    assert.equal(bypassed.diagnostics[0]?.code, "build_plan.approval_required");
+  }
+
+  const rejected = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: prepared.state.projection.version,
+    decision: "rejected",
+    planIdentity: prepared.plan.identity,
+    contextManifestIdentity: prepared.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(
+        TASK_FIXTURE,
+        "PLAN-REJECTED",
+        "2026-07-15T14:04:00Z",
+      ),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "approval-session" },
+    },
+  });
+  assert.equal(rejected.ok, true);
+  if (!rejected.ok) {
+    return;
+  }
+  assert.equal(rejected.decision, "rejected");
+  assert.equal(rejected.state.projection.phase, "plan");
+  const eventCountBeforeDrift = rejected.state.events.length;
+
+  fileSystem.files.set("docs/plan-context.md", "Drifted implementation context.\n");
+  const staleApproval = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: rejected.state.projection.version,
+    decision: "approved",
+    planIdentity: prepared.plan.identity,
+    contextManifestIdentity: prepared.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(
+        TASK_FIXTURE,
+        "PLAN-STALE",
+        "2026-07-15T14:05:00Z",
+      ),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "approval-session" },
+    },
+  });
+  assert.equal(staleApproval.ok, false);
+  if (!staleApproval.ok) {
+    assert.equal(staleApproval.diagnostics[0]?.code, "build_plan.context_stale");
+  }
+  const planningAfterDrift = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(planningAfterDrift.ok, true);
+  if (!planningAfterDrift.ok) {
+    return;
+  }
+  assert.equal(planningAfterDrift.state.projection.phase, "plan");
+  assert.equal(planningAfterDrift.state.events.length, eventCountBeforeDrift);
+  fileSystem.files.set("docs/plan-context.md", "Stable implementation context.\n");
+
+  const approved = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: planningAfterDrift.state.projection.version,
+    decision: "approved",
+    planIdentity: prepared.plan.identity,
+    contextManifestIdentity: prepared.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(
+        TASK_FIXTURE,
+        "PLAN-APPROVED",
+        "2026-07-15T14:06:00Z", 
+      ),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "approval-session" },
+    },
+  });
+  assert.equal(approved.ok, true);
+  if (!approved.ok) {
+    return;
+  }
+  assert.equal(approved.decision, "approved");
+  if (approved.decision !== "approved") {
+    return;
+  }
+  assert.equal(approved.state.projection.phase, "implement");
+  assert.equal(approved.event.type, "workflow_transitioned");
+  assert.equal(approved.event.actor.id, "reviewer-42");
+  assert.deepEqual(approved.event.gates, [
+    {
+      gate: "plan",
+      evidence: [
+        {
+          kind: "human-approval",
+          reference: `plans/${prepared.plan.identity.slice("sha256:".length)}.json`,
+        },
+      ],
+    },
+  ]);
+
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.deepEqual(recovered.state, approved.state);
+});

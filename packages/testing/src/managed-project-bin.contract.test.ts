@@ -44,6 +44,25 @@ const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    assert.fail(`${label} must be a JSON object.`);
+  }
+  return value;
+}
+
+function requireString(record: Record<string, unknown>, field: string): string {
+  const value = record[field];
+  if (typeof value !== "string") {
+    assert.fail(`${field} must be a string.`);
+  }
+  return value;
+}
+
 
 test("packaged CLI binary executes Managed Project lifecycle commands", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-cli-binary-"));
@@ -880,34 +899,17 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
   state = await showTaskState(repository);
   assert.equal(state.projection.lifecycle, "active");
 
-  for (const [lifecycle, phase] of [
-    ["active", "plan"],
-    ["active", "implement"],
-    ["active", "review"],
-    ["active", "finish"],
-  ] as const) {
-    const transition = taskLifecycleTransition(
-      FOUNDATION_TASK,
-      state,
-      lifecycle,
-      phase,
-      `${lifecycle}-${phase}`,
-      "2026-07-16T11:02:00Z",
-    );
-    await writeTaskRequest(repository, "task-transition.json", transition);
-    const transitioned = await executeCliResult(
-      "task",
-      "advance",
-      FOUNDATION_TASK.taskId,
-      "--from",
-      "task-transition.json",
-      "--cwd",
-      repository,
-      "--json",
-    );
-    assert.equal(transitioned.exitCode, 0);
-    state = await showTaskState(repository);
-  }
+  state = await advanceFoundationTask(
+    repository,
+    state,
+    [
+      ["active", "plan"],
+      ["active", "implement"],
+      ["active", "review"],
+      ["active", "finish"],
+    ],
+    "2026-07-16T11:02:00Z",
+  );
   const completion = taskLifecycleTransition(
     FOUNDATION_TASK,
     state,
@@ -1746,6 +1748,16 @@ async function advanceFoundationTask(
 ): Promise<WorkflowState> {
   let state = initialState;
   for (const [lifecycle, phase] of transitions) {
+    if (
+      state.projection.route === "build" &&
+      state.projection.lifecycle === "active" &&
+      state.projection.phase === "plan" &&
+      lifecycle === "active" &&
+      phase === "implement"
+    ) {
+      state = await approveFoundationPlan(repository, state, occurredAt);
+      continue;
+    }
     await writeTaskRequest(
       repository,
       "task-transition.json",
@@ -1773,6 +1785,83 @@ async function advanceFoundationTask(
     assert.equal(state.projection.eventHead.sequence, state.events.length);
   }
   return state;
+}
+
+async function approveFoundationPlan(
+  repository: string,
+  state: WorkflowState,
+  occurredAt: string,
+): Promise<WorkflowState> {
+  const frozen = await executeCliResult(
+    "context",
+    "freeze",
+    FOUNDATION_TASK.taskId,
+    "implement",
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(frozen.exitCode, 0);
+  const frozenState = await showTaskState(repository);
+  assert.equal(frozenState.projection.version > state.projection.version, true);
+
+  await writeTaskRequest(repository, ".sayhi/.runtime/plan-record.json", {
+    taskId: FOUNDATION_TASK.taskId,
+    expectedVersion: frozenState.projection.version,
+    content: "# Foundation Implementation Plan\n\nAdvance only after human approval.\n",
+    event: {
+      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED`,
+      actor: { kind: "agent", id: "planning-agent", sessionRef: FOUNDATION_TASK.sessionRef },
+      reason: "Record the Foundation implementation Plan.",
+      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED`,
+      occurredAt,
+    },
+  });
+  const recorded = await executeCliResult(
+    "plan",
+    "record",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    ".sayhi/.runtime/plan-record.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(recorded.exitCode, 0);
+  const recordedEnvelope = requireRecord(JSON.parse(recorded.stdout), "Plan record envelope");
+  const recordedResult = requireRecord(recordedEnvelope.result, "Plan record result");
+  const plan = requireRecord(recordedResult.plan, "Recorded Plan");
+
+  await writeTaskRequest(repository, ".sayhi/.runtime/plan-decision.json", {
+    taskId: FOUNDATION_TASK.taskId,
+    expectedVersion: frozenState.projection.version,
+    planIdentity: requireString(plan, "identity"),
+    contextManifestIdentity: requireString(plan, "contextManifestIdentity"),
+    event: {
+      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED`,
+      actor: { kind: "user", id: "foundation-reviewer", sessionRef: FOUNDATION_TASK.sessionRef },
+      reason: "Approve the Foundation implementation Plan.",
+      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED`,
+      occurredAt,
+    },
+  });
+  const approved = await executeCliResult(
+    "plan",
+    "approve",
+    FOUNDATION_TASK.taskId,
+    "--from",
+    ".sayhi/.runtime/plan-decision.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(approved.exitCode, 0);
+  const approvedEnvelope = requireRecord(JSON.parse(approved.stdout), "Plan approval envelope");
+  const approvedResult = requireRecord(approvedEnvelope.result, "Plan approval result");
+  const approvedProjection = requireRecord(approvedResult.projection, "Plan approval Projection");
+  assert.equal(requireString(approvedProjection, "phase"), "implement");
+  return showTaskState(repository);
 }
 
 async function executeCli(...args: readonly string[]) {
