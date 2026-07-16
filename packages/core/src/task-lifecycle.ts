@@ -2306,9 +2306,12 @@ async function withDurableTaskWriterLocked<Value>(
 
 type PreparedDurableQuickResult = Readonly<{
   loaded: Extract<LoadTaskResult, Readonly<{ ok: true }>>;
-  baselineBefore: BaselineRecord;
-  baselineAfter: BaselineRecord;
-  changedPaths: readonly string[];
+  result: Readonly<
+    Pick<
+      DurableQuickResult,
+      "schemaVersion" | "baselineBefore" | "baselineAfter" | "changedPaths" | "commit"
+    >
+  >;
 }>;
 
 async function prepareDurableQuickResult(
@@ -2406,9 +2409,13 @@ async function prepareDurableQuickResult(
     ok: true,
     value: Object.freeze({
       loaded,
-      baselineBefore: baselineBefore.baseline,
-      baselineAfter: baselineAfter.baseline,
-      changedPaths,
+      result: Object.freeze({
+        schemaVersion: 1 as const,
+        baselineBefore: baselineBefore.baseline,
+        baselineAfter: baselineAfter.baseline,
+        changedPaths,
+        commit: null,
+      }),
     }),
   });
 }
@@ -2432,14 +2439,10 @@ async function recordDurableQuickResultLocked(
     );
   }
   const result = Object.freeze({
-    schemaVersion: 1 as const,
+    ...prepared.value.result,
     taskId: prepared.value.loaded.state.projection.id,
     projectionVersion: prepared.value.loaded.state.projection.version,
     workflow: prepared.value.loaded.state,
-    baselineBefore: prepared.value.baselineBefore,
-    baselineAfter: prepared.value.baselineAfter,
-    changedPaths: prepared.value.changedPaths,
-    commit: null,
   });
   try {
     await request.fileSystem.writeFile(
@@ -2484,14 +2487,10 @@ async function completeDurableQuickResultLocked(
     return failure(transitioned.diagnostics);
   }
   const result = Object.freeze({
-    schemaVersion: 1 as const,
+    ...prepared.value.result,
     taskId: transitioned.state.projection.id,
     projectionVersion: transitioned.state.projection.version,
     workflow: transitioned.state,
-    baselineBefore: prepared.value.baselineBefore,
-    baselineAfter: prepared.value.baselineAfter,
-    changedPaths: prepared.value.changedPaths,
-    commit: null,
   });
   let activePath = prepared.value.loaded.eventsPath;
   try {
