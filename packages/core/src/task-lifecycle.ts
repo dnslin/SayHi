@@ -48,6 +48,7 @@ import {
 export const TASK_LIFECYCLE_CONTRACT_VERSION = 1 as const;
 
 const TASKS_DIRECTORY = ".sayhi/tasks";
+const TASK_ARCHIVE_DIRECTORY = `${TASKS_DIRECTORY}/archive`;
 
 export interface TaskLifecycleDirectoryEntry {
   readonly name: string;
@@ -61,6 +62,10 @@ export interface TaskLifecycleFileSystem extends ManagedProjectFileSystem {
     path: string,
     operation: () => Promise<Result>,
   ): Promise<Result>;
+}
+
+export interface TaskArchiveFileSystem extends TaskLifecycleFileSystem {
+  moveDirectory(source: string, target: string): Promise<void>;
 }
 export interface ContextManifestFileSystem extends TaskLifecycleFileSystem {
   readRepositoryFile(path: string): Promise<string>;
@@ -105,7 +110,8 @@ export type TaskLifecycleDiagnosticCode =
   | "context_manifest.source.duplicate"
   | "context_manifest.approval_required"
   | "context_manifest.entry.missing"
-  | "context_manifest.stale";
+  | "context_manifest.stale"
+  | "task_lifecycle.handoff.invalid";
 
 export interface TaskLifecycleDiagnostic {
   readonly code: TaskLifecycleDiagnosticCode;
@@ -124,9 +130,35 @@ export interface AdvanceDurableTaskRequest {
   readonly transition: TransitionWorkflowRequest;
 }
 
+export interface ArchiveDurableTaskRequest {
+  readonly fileSystem: TaskArchiveFileSystem;
+  readonly transition: TransitionWorkflowRequest;
+}
+
 export interface RecoverDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly taskId: string;
+}
+
+export interface CreateDurableTaskHandoffRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly repositoryFingerprint: string;
+  readonly artifactReferences: readonly string[];
+  readonly createdAt: string;
+}
+
+export interface DurableTaskHandoff {
+  readonly schemaVersion: 1;
+  readonly taskId: string;
+  readonly phase: WorkflowPhase;
+  readonly step: string;
+  readonly projectionVersion: number;
+  readonly blockers: readonly string[];
+  readonly repositoryFingerprint: string;
+  readonly artifactReferences: readonly string[];
+  readonly createdAt: string;
 }
 export interface ReadDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
@@ -317,6 +349,24 @@ export type RecoverDurableTaskResult =
       contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
       state: WorkflowState;
       recovered: boolean;
+      handoff: DurableTaskHandoff | null;
+    }>
+  | TaskLifecycleFailure;
+
+export type CreateDurableTaskHandoffResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      handoff: DurableTaskHandoff;
+    }>
+  | TaskLifecycleFailure;
+
+export type ArchiveDurableTaskResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      moved: boolean;
     }>
   | TaskLifecycleFailure;
 
@@ -337,8 +387,10 @@ export type DiagnoseDurableTasksResult =
 
 interface TaskPaths {
   readonly taskDirectory: string;
+  readonly archiveTaskDirectory: string;
   readonly eventsPath: string;
   readonly projectionPath: string;
+  readonly handoffPath: string;
   readonly lockPath: string;
 }
 
@@ -435,6 +487,30 @@ export async function advanceDurableTask(
   );
 }
 
+export async function archiveDurableTask(
+  request: ArchiveDurableTaskRequest,
+): Promise<ArchiveDurableTaskResult> {
+  const paths = taskPaths(request.transition.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    archiveDurableTaskLocked(request, paths),
+  );
+}
+
+export async function createDurableTaskHandoff(
+  request: CreateDurableTaskHandoffRequest,
+): Promise<CreateDurableTaskHandoffResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    createDurableTaskHandoffLocked(request, paths),
+  );
+}
+
 export async function recoverDurableTask(
   request: RecoverDurableTaskRequest,
 ): Promise<RecoverDurableTaskResult> {
@@ -443,7 +519,7 @@ export async function recoverDurableTask(
     return paths;
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-    recoverDurableTaskLocked(request),
+    recoverDurableTaskLocked(request, paths),
   );
 }
 
@@ -1302,6 +1378,7 @@ async function advanceDurableTaskLocked(
 
 async function recoverDurableTaskLocked(
   request: RecoverDurableTaskRequest,
+  paths: TaskPaths,
 ): Promise<RecoverDurableTaskResult> {
   const loaded = await loadTask(request.fileSystem, request.taskId);
   if (!loaded.ok) {
@@ -1313,15 +1390,215 @@ async function recoverDurableTaskLocked(
       loaded.projectionPath,
       loaded.state.projection,
     );
+    const handoff = await loadDurableTaskHandoff(
+      request.fileSystem,
+      paths.handoffPath,
+      loaded.state,
+    );
+    if (!handoff.ok) {
+      return handoff;
+    }
     return Object.freeze({
       ok: true,
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       state: loaded.state,
       recovered,
+      handoff: handoff.value,
     });
   } catch {
     return ioFailure(loaded.projectionPath);
   }
+}
+
+async function createDurableTaskHandoffLocked(
+  request: CreateDurableTaskHandoffRequest,
+  paths: TaskPaths,
+): Promise<CreateDurableTaskHandoffResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  if (loaded.state.projection.version !== request.expectedVersion) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedVersion",
+        "The durable Task changed before its Handoff could be recorded.",
+        "Reload the current Projection and retry with its version.",
+      ),
+    ]);
+  }
+  const invalid = validateHandoffInput(request);
+  if (invalid !== null) {
+    return invalid;
+  }
+  const handoff = Object.freeze({
+    schemaVersion: 1 as const,
+    taskId: loaded.state.projection.id,
+    phase: loaded.state.projection.phase,
+    step: loaded.state.projection.step,
+    projectionVersion: loaded.state.projection.version,
+    blockers: Object.freeze([...loaded.state.projection.blockers]),
+    repositoryFingerprint: request.repositoryFingerprint,
+    artifactReferences: Object.freeze([...request.artifactReferences]),
+    createdAt: request.createdAt,
+  });
+  try {
+    await request.fileSystem.writeFile(paths.handoffPath, serializeHandoff(handoff));
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      handoff,
+    });
+  } catch {
+    return ioFailure(paths.handoffPath);
+  }
+}
+
+async function archiveDurableTaskLocked(
+  request: ArchiveDurableTaskRequest,
+  paths: TaskPaths,
+): Promise<ArchiveDurableTaskResult> {
+  if (
+    request.transition.to.lifecycle !== "archived" ||
+    request.transition.to.phase !== "finish"
+  ) {
+    return invalidTaskArchive(
+      "$.transition.to",
+      "Durable Task archiving only accepts the archived Finish transition.",
+      "Use the completed Finish state and the archive transition before moving a Task.",
+    );
+  }
+
+  let failurePath = TASK_ARCHIVE_DIRECTORY;
+  try {
+    const archiveRoot = await request.fileSystem.inspect(TASK_ARCHIVE_DIRECTORY);
+    if (archiveRoot.kind !== "directory") {
+      return invalidTaskArchive(
+        TASK_ARCHIVE_DIRECTORY,
+        "The durable Task archive location is missing or unsafe.",
+        "Restore .sayhi/tasks/archive as a directory before retrying.",
+      );
+    }
+
+    failurePath = paths.archiveTaskDirectory;
+    const archivedDirectory = await request.fileSystem.inspect(
+      paths.archiveTaskDirectory,
+    );
+    if (archivedDirectory.kind !== "missing") {
+      if (archivedDirectory.kind !== "directory") {
+        return invalidTaskArchive(
+          paths.archiveTaskDirectory,
+          "The archived Task location is not a real directory.",
+          "Restore the archived Task directory before retrying.",
+        );
+      }
+      const activeDirectory = await request.fileSystem.inspect(paths.taskDirectory);
+      if (activeDirectory.kind !== "missing") {
+        return invalidTaskArchive(
+          paths.taskDirectory,
+          "Active and archived Task directories both exist for this Task.",
+          "Preserve both directories and resolve the duplicate Task state before retrying.",
+        );
+      }
+      const archived = await loadTask(
+        request.fileSystem,
+        request.transition.taskId,
+        paths.archiveTaskDirectory,
+      );
+      if (!archived.ok) {
+        return archived;
+      }
+      if (archived.state.projection.lifecycle !== "archived") {
+        return invalidTaskArchive(
+          paths.archiveTaskDirectory,
+          "The archived Task directory does not contain an archived Task.",
+          "Restore the directory to the active Project Store Task path before retrying.",
+        );
+      }
+      const repeated = validateRepeatedArchiveTransition(
+        archived.state,
+        request.transition,
+      );
+      if (!repeated.ok) {
+        return repeated;
+      }
+      return Object.freeze({
+        ok: true,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        state: archived.state,
+        moved: repeated.matchesAcceptedEvent,
+      });
+    }
+
+    const loaded = await loadTask(request.fileSystem, request.transition.taskId);
+    if (!loaded.ok) {
+      return loaded;
+    }
+    let state = loaded.state;
+    if (state.projection.lifecycle === "archived") {
+      const repeated = validateRepeatedArchiveTransition(state, request.transition);
+      if (!repeated.ok) {
+        return repeated;
+      }
+      failurePath = loaded.projectionPath;
+      await writeProjectionIfChanged(
+        request.fileSystem,
+        loaded.projectionPath,
+        state.projection,
+      );
+    } else {
+      const transitioned = transitionWorkflow(state, request.transition);
+      if (!transitioned.ok) {
+        return failure(transitioned.diagnostics);
+      }
+      failurePath = loaded.eventsPath;
+      await request.fileSystem.appendFile(
+        loaded.eventsPath,
+        serializeEvent(transitioned.event),
+      );
+      state = transitioned.state;
+      failurePath = loaded.projectionPath;
+      await writeProjectionIfChanged(
+        request.fileSystem,
+        loaded.projectionPath,
+        state.projection,
+      );
+    }
+
+    failurePath = paths.taskDirectory;
+    await request.fileSystem.moveDirectory(
+      paths.taskDirectory,
+      paths.archiveTaskDirectory,
+    );
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state,
+      moved: true,
+    });
+  } catch {
+    return ioFailure(failurePath);
+  }
+}
+
+function validateRepeatedArchiveTransition(
+  state: WorkflowState,
+  transition: TransitionWorkflowRequest,
+):
+  | Readonly<{ ok: true; matchesAcceptedEvent: boolean }>
+  | TaskLifecycleFailure {
+  if (
+    !state.events.some(
+      (event) => event.idempotencyKey === transition.event.idempotencyKey,
+    )
+  ) {
+    return Object.freeze({ ok: true, matchesAcceptedEvent: false });
+  }
+  const retried = transitionWorkflow(state, transition);
+  return retried.ok
+    ? Object.freeze({ ok: true, matchesAcceptedEvent: true })
+    : failure(retried.diagnostics);
 }
 
 async function adoptDurableTaskBaselineLocked(
@@ -1563,30 +1840,33 @@ function invalidContextManifest(
 async function loadTask(
   fileSystem: TaskLifecycleFileSystem,
   taskId: string,
+  taskDirectory?: string,
 ): Promise<LoadTaskResult> {
   const paths = taskPaths(taskId);
   if (!paths.ok) {
     return paths;
   }
-
+  const directoryPath = taskDirectory ?? paths.taskDirectory;
+  const eventsPath = `${directoryPath}/events.jsonl`;
+  const projectionPath = `${directoryPath}/task.json`;
   try {
-    const taskDirectory = await fileSystem.inspect(paths.taskDirectory);
-    if (taskDirectory.kind !== "directory") {
+    const taskDirectoryEntry = await fileSystem.inspect(directoryPath);
+    if (taskDirectoryEntry.kind !== "directory") {
       return failure([
         diagnostic(
           "task_lifecycle.history.missing",
-          paths.taskDirectory,
+          directoryPath,
           "The durable Task directory is missing or unsafe.",
           "Restore the Task directory from the repository before retrying.",
         ),
       ]);
     }
-    const eventsFile = await fileSystem.inspect(paths.eventsPath);
+    const eventsFile = await fileSystem.inspect(eventsPath);
     if (eventsFile.kind !== "file") {
       return failure([
         diagnostic(
           "task_lifecycle.history.missing",
-          paths.eventsPath,
+          eventsPath,
           "The durable Workflow Event history is missing or unsafe.",
           "Restore the append-only events.jsonl file before retrying.",
         ),
@@ -1594,8 +1874,8 @@ async function loadTask(
     }
 
     const parsed = parseEventHistory(
-      paths.eventsPath,
-      await fileSystem.readFile(paths.eventsPath),
+      eventsPath,
+      await fileSystem.readFile(eventsPath),
     );
     if (!parsed.ok) {
       return parsed;
@@ -1604,7 +1884,7 @@ async function loadTask(
     if (!replayed.ok) {
       return failure(
         replayed.diagnostics.map((item) =>
-          prefixWorkflowDiagnostic(paths.eventsPath, item),
+          prefixWorkflowDiagnostic(eventsPath, item),
         ),
       );
     }
@@ -1612,7 +1892,7 @@ async function loadTask(
       return failure([
         diagnostic(
           "workflow.task.mismatch",
-          `${paths.eventsPath}$[0].taskId`,
+          `${eventsPath}$[0].taskId`,
           "Workflow Event history belongs to a different durable Task.",
           "Restore the Event history accepted for the requested Task id.",
         ),
@@ -1622,11 +1902,11 @@ async function loadTask(
     return Object.freeze({
       ok: true,
       state: replayed.state,
-      eventsPath: paths.eventsPath,
-      projectionPath: paths.projectionPath,
+      eventsPath,
+      projectionPath,
     });
   } catch {
-    return ioFailure(paths.eventsPath);
+    return ioFailure(eventsPath);
   }
 }
 
@@ -2005,9 +2285,11 @@ function taskPaths(taskId: string):
   return Object.freeze({
     ok: true,
     taskDirectory,
+    archiveTaskDirectory: `${TASK_ARCHIVE_DIRECTORY}/${taskId}`,
     eventsPath: `${taskDirectory}/events.jsonl`,
     projectionPath: `${taskDirectory}/task.json`,
     lockPath: `.sayhi/.runtime/task-${taskId}.lock`,
+    handoffPath: `${taskDirectory}/handoff.json`,
   });
 }
 
@@ -2027,6 +2309,156 @@ function serializeEvent(event: WorkflowEvent): string {
 
 function serializeProjection(projection: TaskProjection): string {
   return `${JSON.stringify(projection, null, 2)}\n`;
+}
+
+function serializeHandoff(handoff: DurableTaskHandoff): string {
+  return `${JSON.stringify(handoff, null, 2)}\n`;
+}
+
+async function loadDurableTaskHandoff(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  state: WorkflowState,
+): Promise<
+  | Readonly<{ ok: true; value: DurableTaskHandoff | null }>
+  | TaskLifecycleFailure
+> {
+  try {
+    const entry = await fileSystem.inspect(path);
+    if (entry.kind === "missing") {
+      return Object.freeze({ ok: true, value: null });
+    }
+    if (entry.kind !== "file") {
+      return invalidHandoff(
+        path,
+        "The durable Task Handoff is missing or unsafe.",
+        "Restore handoff.json as a regular file or remove it before retrying.",
+      );
+    }
+    return parseDurableTaskHandoff(path, await fileSystem.readFile(path), state);
+  } catch {
+    return ioFailure(path);
+  }
+}
+
+function parseDurableTaskHandoff(
+  path: string,
+  content: string,
+  state: WorkflowState,
+): Readonly<{ ok: true; value: DurableTaskHandoff }> | TaskLifecycleFailure {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff is not valid JSON.",
+      "Restore a complete handoff.json file before retrying.",
+    );
+  }
+  if (!isHandoffRecord(value)) {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff does not match the recovered Task state.",
+      "Record a new Handoff at the current durable Task version before retrying.",
+    );
+  }
+  if (
+    value.schemaVersion !== 1 ||
+    value.taskId !== state.projection.id ||
+    value.phase !== state.projection.phase ||
+    value.step !== state.projection.step ||
+    value.projectionVersion !== state.projection.version ||
+    !sameStrings(value.blockers, state.projection.blockers) ||
+    typeof value.repositoryFingerprint !== "string" ||
+    value.repositoryFingerprint.trim().length === 0 ||
+    !isNonEmptyStringArray(value.artifactReferences) ||
+    !isRfc3339Timestamp(value.createdAt)
+  ) {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff does not match the recovered Task state.",
+      "Record a new Handoff at the current durable Task version before retrying.",
+    );
+  }
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      schemaVersion: 1 as const,
+      taskId: state.projection.id,
+      phase: state.projection.phase,
+      step: state.projection.step,
+      projectionVersion: state.projection.version,
+      blockers: Object.freeze([...state.projection.blockers]),
+      repositoryFingerprint: value.repositoryFingerprint,
+      artifactReferences: Object.freeze([...value.artifactReferences]),
+      createdAt: value.createdAt,
+    }),
+  });
+}
+
+function validateHandoffInput(
+  request: CreateDurableTaskHandoffRequest,
+): TaskLifecycleFailure | null {
+  if (request.repositoryFingerprint.trim().length === 0) {
+    return invalidHandoff(
+      "$.repositoryFingerprint",
+      "A Handoff requires the current repository fingerprint.",
+      "Provide the fingerprint captured at the safe Handoff boundary.",
+    );
+  }
+  if (!isNonEmptyStringArray(request.artifactReferences)) {
+    return invalidHandoff(
+      "$.artifactReferences",
+      "A Handoff requires non-empty artifact references.",
+      "Provide the Context, Evidence, or other durable artifact references needed to resume.",
+    );
+  }
+  if (!isRfc3339Timestamp(request.createdAt)) {
+    return invalidHandoff(
+      "$.createdAt",
+      "A Handoff requires an RFC 3339 UTC creation time.",
+      "Record the Handoff with its UTC creation time.",
+    );
+  }
+  return null;
+}
+
+function isHandoffRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sameStrings(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((item, index) => item === expected[index])
+  );
+}
+
+function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => typeof item === "string" && item.trim().length > 0)
+  );
+}
+
+function isRfc3339Timestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function invalidHandoff(
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([
+    diagnostic("task_lifecycle.handoff.invalid", path, message, remediation),
+  ]);
 }
 
 function prefixWorkflowDiagnostic(
@@ -2053,6 +2485,16 @@ function failure(
     contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
     diagnostics: Object.freeze([...diagnostics]),
   });
+}
+
+function invalidTaskArchive(
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([
+    diagnostic("task_lifecycle.store.invalid", path, message, remediation),
+  ]);
 }
 
 function ioFailure(path: string): TaskLifecycleFailure {

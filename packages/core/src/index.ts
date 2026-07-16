@@ -18,6 +18,7 @@ import {
 } from "./spec.js";
 import {
   readRouteDefinition,
+  readGateEvidenceKinds,
   adoptWorkflowBaseline,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -26,8 +27,10 @@ import {
 } from "./workflow.js";
 import {
   advanceDurableTask,
+  archiveDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   recoverDurableTask,
   readDurableTask,
@@ -225,6 +228,7 @@ export {
   WORKFLOW_CONTRACT_VERSION,
   adoptWorkflowBaseline,
   readRouteDefinition,
+  readGateEvidenceKinds,
   replayWorkflowEvents,
   startWorkflowTask,
   transitionWorkflow,
@@ -278,9 +282,11 @@ export type {
 export {
   TASK_LIFECYCLE_CONTRACT_VERSION,
   addDurableContextManifestEntry,
+  archiveDurableTask,
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   recoverDurableTask,
   readDurableTask,
@@ -291,6 +297,8 @@ export {
   withDurableTaskWriter,
 } from "./task-lifecycle.js";
 export type {
+  ArchiveDurableTaskRequest,
+  ArchiveDurableTaskResult,
   AdvanceDurableTaskRequest,
   AddDurableContextManifestEntryRequest,
   AddDurableContextManifestEntryResult,
@@ -307,6 +315,9 @@ export type {
   AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
   CreateDurableTaskRequest,
+  CreateDurableTaskHandoffRequest,
+  CreateDurableTaskHandoffResult,
+  DurableTaskHandoff,
   CreateDurableTaskResult,
   DiagnoseDurableTasksRequest,
   DiagnoseDurableTasksResult,
@@ -318,6 +329,7 @@ export type {
   TaskLifecycleDiagnosticCode,
   TaskLifecycleDirectoryEntry,
   TaskLifecycleFileSystem,
+  TaskArchiveFileSystem,
   TaskBaselineCaptureRequest,
   TaskBaselineFileSystem,
   TaskWriter,
@@ -351,7 +363,9 @@ export interface CoreContract {
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly createDurableTask: typeof createDurableTask;
+  readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly advanceDurableTask: typeof advanceDurableTask;
+  readonly archiveDurableTask: typeof archiveDurableTask;
   readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
   readonly refreshDurableContextManifest: typeof refreshDurableContextManifest;
   readonly freezeDurableContextManifest: typeof freezeDurableContextManifest;
@@ -390,7 +404,9 @@ export const coreContract: CoreContract = Object.freeze({
   adoptWorkflowBaseline,
   recordContextManifestChange,
   createDurableTask,
+  createDurableTaskHandoff,
   advanceDurableTask,
+  archiveDurableTask,
   addDurableContextManifestEntry,
   refreshDurableContextManifest,
   freezeDurableContextManifest,

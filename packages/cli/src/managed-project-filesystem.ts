@@ -103,6 +103,13 @@ export class NodeManagedProjectFileSystem
     }
   }
 
+  async moveDirectory(source: string, target: string): Promise<void> {
+    await rename(
+      this.#resolveManagedPath(source),
+      this.#resolveManagedPath(target),
+    );
+  }
+
   async withTaskMutationLock<Result>(
     path: string,
     operation: () => Promise<Result>,

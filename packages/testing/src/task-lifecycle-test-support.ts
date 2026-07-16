@@ -1,7 +1,15 @@
-import type {
-  StartWorkflowTaskRequest,
-  TransitionWorkflowRequest,
-  WorkflowEventMetadata,
+import {
+  advanceDurableTask,
+  coreContract,
+  createDurableTask,
+  readGateEvidenceKinds,
+  type StartWorkflowTaskRequest,
+  type TaskLifecycleFileSystem,
+  type TransitionWorkflowRequest,
+  type WorkflowEventMetadata,
+  type WorkflowLifecycle,
+  type WorkflowPhase,
+  type WorkflowState,
 } from "@dnslin/sayhi-core";
 
 export interface TaskLifecycleFixture {
@@ -101,3 +109,86 @@ export function taskLifecycleEventMetadata(
     occurredAt,
   };
 }
+
+export function taskLifecycleTransition(
+  fixture: TaskLifecycleFixture,
+  state: WorkflowState,
+  lifecycle: WorkflowLifecycle,
+  phase: WorkflowPhase,
+  suffix: string,
+  occurredAt: string,
+): TransitionWorkflowRequest {
+  const transition = coreContract
+    .readRouteDefinition(state.projection.route)
+    .transitions.find(
+      (candidate) =>
+        candidate.from.lifecycle === state.projection.lifecycle &&
+        candidate.from.phase === state.projection.phase &&
+        candidate.to.lifecycle === lifecycle &&
+        candidate.to.phase === phase,
+    );
+  if (transition === undefined) {
+    throw new Error(`Missing transition to ${lifecycle}/${phase}.`);
+  }
+  if (state.projection.step !== transition.from.step) {
+    throw new Error(`Unexpected Task Step for ${lifecycle}/${phase}.`);
+  }
+  return {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: transition.to,
+    gates: transition.requiredGates.map((gate) => ({
+      gate,
+      evidence: [
+        {
+          kind: readGateEvidenceKinds(gate)[0]!,
+          reference: `evidence/${suffix}-${gate}.json`,
+        },
+      ],
+    })),
+    event: taskLifecycleEventMetadata(fixture, suffix, occurredAt),
+  };
+}
+
+export async function createCompletedDurableTask(
+  fileSystem: TaskLifecycleFileSystem,
+  fixture: TaskLifecycleFixture,
+  createdAt: string,
+  transitionedAt: string,
+): Promise<WorkflowState> {
+  const created = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(fixture, createdAt),
+  });
+  if (!created.ok) {
+    throw new Error(created.diagnostics[0]?.message ?? "Task creation failed");
+  }
+  let state = created.state;
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+    ["active", "finish"],
+    ["completed", "finish"],
+  ] as const) {
+    const advanced = await advanceDurableTask({
+      fileSystem,
+      transition: taskLifecycleTransition(
+        fixture,
+        state,
+        lifecycle,
+        phase,
+        `${lifecycle}-${phase}`,
+        transitionedAt,
+      ),
+    });
+    if (!advanced.ok) {
+      throw new Error(advanced.diagnostics[0]?.message ?? "Task advancement failed");
+    }
+    state = advanced.state;
+  }
+  return state;
+}
+

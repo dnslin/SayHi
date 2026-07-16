@@ -4,8 +4,8 @@ import test from "node:test";
 
 import {
   coreContract,
+  readGateEvidenceKinds,
   type DependencyGraph,
-  type GateEvidenceKind,
   type StartWorkflowTaskRequest,
   type WorkflowGate,
   type WorkflowRoute,
@@ -1057,28 +1057,6 @@ function eventMetadata(suffix: string) {
   };
 }
 
-function evidenceKind(gate: WorkflowGate): GateEvidenceKind {
-  switch (gate) {
-    case "route":
-    case "plan":
-      return "human-approval";
-    case "review":
-    case "review-repair":
-      return "review";
-    case "cancel":
-      return "human-approval";
-    case "explore":
-    case "implement":
-    case "integrate":
-    case "finish":
-      return "validation";
-    case "archive":
-      return "validation";
-    case "initiative-ready":
-    case "replan":
-      return "workflow";
-    case "block":
-    case "resume":
-      return "workflow";
-  }
+function evidenceKind(gate: WorkflowGate) {
+  return readGateEvidenceKinds(gate)[0]!;
 }
