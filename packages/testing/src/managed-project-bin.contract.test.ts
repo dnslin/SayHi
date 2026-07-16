@@ -33,13 +33,29 @@ const FOUNDATION_TASK = Object.freeze({
   taskId: "TASK-15-FOUNDATION",
   title: "Demonstrate the recoverable Foundation CLI",
   goal: "Recover a durable Task through the packaged CLI scenario",
-  acceptanceCriterion: "The packaged CLI preserves recoverable Foundation state",
+  acceptanceCriterion:
+    "The packaged CLI preserves recoverable Foundation state",
   files: Object.freeze(["packages/core/**"]),
   eventNamespace: "15-FOUNDATION",
   sessionRef: "session-15-foundation",
 }) satisfies TaskLifecycleFixture;
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
-const CURRENT_RUNTIME_IGNORE_CONTENT = "# SayHi local runtime state\n/.runtime/\n";
+const CURRENT_RUNTIME_IGNORE_CONTENT =
+  "# SayHi local runtime state\n/.runtime/\n";
+
+const FOUNDATION_TASK = Object.freeze({
+  taskId: "TASK-15-FOUNDATION",
+  title: "Demonstrate the recoverable Foundation CLI",
+  goal: "Recover a durable Task through the packaged CLI scenario",
+  acceptanceCriterion:
+    "The packaged CLI preserves recoverable Foundation state",
+  files: Object.freeze(["packages/core/**"]),
+  eventNamespace: "15-FOUNDATION",
+  sessionRef: "session-15-foundation",
+}) satisfies TaskLifecycleFixture;
+const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
+const CURRENT_RUNTIME_IGNORE_CONTENT =
+  "# SayHi local runtime state\n/.runtime/\n";
 
 test("packaged CLI binary executes Managed Project lifecycle commands", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-cli-binary-"));
@@ -125,8 +141,16 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
   const existingOmpRules = "user-owned OMP rules\n";
   const existingRootAgents = "user-owned root agents\n";
   await mkdir(join(repository, ".omp"));
-  await writeFile(join(repository, ".omp", "AGENTS.md"), existingOmpAgents, "utf8");
-  await writeFile(join(repository, ".omp", "RULES.md"), existingOmpRules, "utf8");
+  await writeFile(
+    join(repository, ".omp", "AGENTS.md"),
+    existingOmpAgents,
+    "utf8",
+  );
+  await writeFile(
+    join(repository, ".omp", "RULES.md"),
+    existingOmpRules,
+    "utf8",
+  );
   await writeFile(join(repository, "AGENTS.md"), existingRootAgents, "utf8");
   await writeTaskRequest(
     repository,
@@ -134,14 +158,28 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-15T12:00:00Z"),
   );
 
-  const initialization = await executeCli("init", "--cwd", repository, "--json");
+  const initialization = await executeCli(
+    "init",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(initialization.stderr, "");
   const initialized = JSON.parse(initialization.stdout) as CliJsonEnvelope;
   assert.equal(initialized.ok, true);
   assert.equal(initialized.operation, "project.init");
-  assert.equal(await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"), existingOmpAgents);
-  assert.equal(await readFile(join(repository, ".omp", "RULES.md"), "utf8"), existingOmpRules);
-  assert.equal(await readFile(join(repository, "AGENTS.md"), "utf8"), existingRootAgents);
+  assert.equal(
+    await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"),
+    existingOmpAgents,
+  );
+  assert.equal(
+    await readFile(join(repository, ".omp", "RULES.md"), "utf8"),
+    existingOmpRules,
+  );
+  assert.equal(
+    await readFile(join(repository, "AGENTS.md"), "utf8"),
+    existingRootAgents,
+  );
   await runGit(repository, "add", "--all");
   await runGit(repository, "commit", "--quiet", "-m", "initial state");
 
@@ -172,8 +210,8 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     "--json",
   );
   assert.equal(baseline.exitCode, 0);
-  const observedBaseline = (JSON.parse(baseline.stdout) as CliJsonEnvelope).result
-    ?.baseline as { dirtyPaths: readonly { path: string }[] };
+  const observedBaseline = (JSON.parse(baseline.stdout) as CliJsonEnvelope)
+    .result?.baseline as { dirtyPaths: readonly { path: string }[] };
   assert.deepEqual(
     observedBaseline.dirtyPaths.map((change) => change.path),
     ["packages/core/foundation.ts"],
@@ -201,7 +239,10 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     "task_lifecycle.baseline.missing",
   );
   assert.equal(
-    await readFile(join(repository, "packages", "core", "foundation.ts"), "utf8"),
+    await readFile(
+      join(repository, "packages", "core", "foundation.ts"),
+      "utf8",
+    ),
     "export const foundation = 'dirty';\n",
   );
   const adopted = await executeCliResult(
@@ -248,7 +289,10 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     "--json",
   );
   assert.equal(spec.stderr, "");
-  assert.equal((JSON.parse(spec.stdout) as CliJsonEnvelope).operation, "spec.create");
+  assert.equal(
+    (JSON.parse(spec.stdout) as CliJsonEnvelope).operation,
+    "spec.create",
+  );
   const context = await executeCli(
     "context",
     "add",
@@ -261,7 +305,10 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     "--json",
   );
   assert.equal(context.stderr, "");
-  assert.equal((JSON.parse(context.stdout) as CliJsonEnvelope).operation, "context.add");
+  assert.equal(
+    (JSON.parse(context.stdout) as CliJsonEnvelope).operation,
+    "context.add",
+  );
   await writeFile(
     join(repository, ".sayhi", "spec", "foundation.md"),
     "# Foundation\n\nChanged behavior.\n",
@@ -346,7 +393,9 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
   );
   assert.equal(archived.exitCode, 0);
   const archivedEnvelope = JSON.parse(archived.stdout) as CliJsonEnvelope;
-  const archivedProjection = archivedEnvelope.result?.projection as { lifecycle: string };
+  const archivedProjection = archivedEnvelope.result?.projection as {
+    lifecycle: string;
+  };
   assert.equal(archivedProjection.lifecycle, "archived");
 
   const runtimeIgnorePath = join(repository, ".sayhi", ".gitignore");
@@ -368,19 +417,38 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     .update(LEGACY_RUNTIME_IGNORE_CONTENT)
     .digest("hex");
   runtimeRecord.generatedSourceVersion = "0.0.0";
-  await writeFile(ownershipPath, `${JSON.stringify(ownership, null, 2)}\n`, "utf8");
+  await writeFile(
+    ownershipPath,
+    `${JSON.stringify(ownership, null, 2)}\n`,
+    "utf8",
+  );
   const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
     installed: { templates: string };
   };
   manifest.installed.templates = "0.0.0";
-  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    "utf8",
+  );
 
-  const updated = await executeCli("update", "--apply", "--cwd", repository, "--json");
+  const updated = await executeCli(
+    "update",
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(updated.stderr, "");
-  assert.equal((JSON.parse(updated.stdout) as CliJsonEnvelope).result?.state, "applied");
-  assert.equal(await readFile(runtimeIgnorePath, "utf8"), CURRENT_RUNTIME_IGNORE_CONTENT);
-  const userRuntimeIgnoreContent =
-    `${CURRENT_RUNTIME_IGNORE_CONTENT}user-local-change\n`;
+  assert.equal(
+    (JSON.parse(updated.stdout) as CliJsonEnvelope).result?.state,
+    "applied",
+  );
+  assert.equal(
+    await readFile(runtimeIgnorePath, "utf8"),
+    CURRENT_RUNTIME_IGNORE_CONTENT,
+  );
+  const userRuntimeIgnoreContent = `${CURRENT_RUNTIME_IGNORE_CONTENT}user-local-change\n`;
   await writeFile(runtimeIgnorePath, userRuntimeIgnoreContent, "utf8");
   const conflict = await executeCli(
     "update",
@@ -399,12 +467,25 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     actions.find((action) => action.path === ".sayhi/.gitignore")?.result,
     "conflict",
   );
-  assert.equal(await readFile(runtimeIgnorePath, "utf8"), userRuntimeIgnoreContent);
+  assert.equal(
+    await readFile(runtimeIgnorePath, "utf8"),
+    userRuntimeIgnoreContent,
+  );
   await writeFile(runtimeIgnorePath, CURRENT_RUNTIME_IGNORE_CONTENT, "utf8");
 
   const userConfig = "schemaVersion: 1\nuserSetting: keep\n";
-  await writeFile(join(repository, ".sayhi", "config.yaml"), userConfig, "utf8");
-  const uninstall = await executeCli("uninstall", "--apply", "--cwd", repository, "--json");
+  await writeFile(
+    join(repository, ".sayhi", "config.yaml"),
+    userConfig,
+    "utf8",
+  );
+  const uninstall = await executeCli(
+    "uninstall",
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(uninstall.stderr, "");
   const uninstalled = JSON.parse(uninstall.stdout) as CliJsonEnvelope;
   assert.equal(uninstalled.ok, true);
@@ -414,11 +495,23 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
     await readFile(join(repository, ".sayhi", "config.yaml"), "utf8"),
     userConfig,
   );
-  assert.equal(await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"), existingOmpAgents);
-  assert.equal(await readFile(join(repository, ".omp", "RULES.md"), "utf8"), existingOmpRules);
-  assert.equal(await readFile(join(repository, "AGENTS.md"), "utf8"), existingRootAgents);
   assert.equal(
-    await readFile(join(repository, "packages", "core", "foundation.ts"), "utf8"),
+    await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"),
+    existingOmpAgents,
+  );
+  assert.equal(
+    await readFile(join(repository, ".omp", "RULES.md"), "utf8"),
+    existingOmpRules,
+  );
+  assert.equal(
+    await readFile(join(repository, "AGENTS.md"), "utf8"),
+    existingRootAgents,
+  );
+  assert.equal(
+    await readFile(
+      join(repository, "packages", "core", "foundation.ts"),
+      "utf8",
+    ),
     "export const foundation = 'dirty';\n",
   );
   await assert.rejects(readFile(runtimeIgnorePath, "utf8"));
@@ -438,7 +531,10 @@ test("packaged CLI creates and inspects a durable Task", async (t) => {
     "--json",
   );
   assert.equal(beforeInitialization.exitCode, 6);
-  assert.equal((await executeCli("init", "--cwd", repository, "--json")).stderr, "");
+  assert.equal(
+    (await executeCli("init", "--cwd", repository, "--json")).stderr,
+    "",
+  );
   await writeFile(
     join(repository, "task-create.json"),
     `${JSON.stringify(taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-16T10:00:00Z"), null, 2)}\n`,
@@ -476,7 +572,11 @@ test("packaged CLI creates and inspects a durable Task", async (t) => {
     (JSON.parse(gated.stdout) as CliJsonEnvelope).error?.code,
     "workflow.gate.evidence_invalid",
   );
-  await writeFile(join(repository, "task-malformed-create.json"), "{\"contractVersion\":1}\n", "utf8");
+  await writeFile(
+    join(repository, "task-malformed-create.json"),
+    '{"contractVersion":1}\n',
+    "utf8",
+  );
   const malformedCreate = await executeCliResult(
     "task",
     "create",
@@ -521,7 +621,13 @@ test("packaged CLI creates and inspects a durable Task", async (t) => {
     (shownEnvelope.result?.projection as { id: string }).id,
     FOUNDATION_TASK.taskId,
   );
-  const listed = await executeCliResult("task", "list", "--cwd", repository, "--json");
+  const listed = await executeCliResult(
+    "task",
+    "list",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(listed.exitCode, 0);
   const listedEnvelope = JSON.parse(listed.stdout) as CliJsonEnvelope;
   assert.deepEqual(listedEnvelope.result?.taskIds, [FOUNDATION_TASK.taskId]);
@@ -585,7 +691,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     "--json",
   );
   assert.equal(retried.exitCode, 0);
-  assert.equal((await showTaskState(repository)).events.length, state.events.length);
+  assert.equal(
+    (await showTaskState(repository)).events.length,
+    state.events.length,
+  );
 
   const staleExplore = {
     ...explore,
@@ -595,7 +704,11 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
       idempotencyKey: "IDEMPOTENCY-15-FOUNDATION-STALE",
     },
   };
-  await writeTaskRequest(repository, "task-stale-transition.json", staleExplore);
+  await writeTaskRequest(
+    repository,
+    "task-stale-transition.json",
+    staleExplore,
+  );
   const stale = await executeCliResult(
     "task",
     "advance",
@@ -609,7 +722,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
   assert.equal(stale.exitCode, 3);
   const staleEnvelope = JSON.parse(stale.stdout) as CliJsonEnvelope;
   assert.equal(staleEnvelope.error?.code, "workflow.version.stale");
-  assert.equal((await showTaskState(repository)).events.length, state.events.length);
+  assert.equal(
+    (await showTaskState(repository)).events.length,
+    state.events.length,
+  );
 
   const projectionPath = join(
     repository,
@@ -674,7 +790,11 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     "MISMATCHED-TASK-ID",
     "2026-07-16T11:01:58Z",
   );
-  await writeTaskRequest(repository, "task-transition.json", transitionWithMismatchedTaskId);
+  await writeTaskRequest(
+    repository,
+    "task-transition.json",
+    transitionWithMismatchedTaskId,
+  );
   const eventCountBeforeMismatchedTaskId = state.events.length;
   const mismatchedTaskIdResult = await executeCliResult(
     "task",
@@ -691,7 +811,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     (JSON.parse(mismatchedTaskIdResult.stdout) as CliJsonEnvelope).error?.code,
     "task.request.task_id_mismatch",
   );
-  assert.equal((await showTaskState(repository)).events.length, eventCountBeforeMismatchedTaskId);
+  assert.equal(
+    (await showTaskState(repository)).events.length,
+    eventCountBeforeMismatchedTaskId,
+  );
   const misroutedBlock = taskLifecycleTransition(
     FOUNDATION_TASK,
     state,
@@ -717,7 +840,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     (JSON.parse(misroutedBlockResult.stdout) as CliJsonEnvelope).error?.code,
     "task.transition.target.invalid",
   );
-  assert.equal((await showTaskState(repository)).events.length, eventCountBeforeMisroutedBlock);
+  assert.equal(
+    (await showTaskState(repository)).events.length,
+    eventCountBeforeMisroutedBlock,
+  );
   const block = {
     ...taskLifecycleTransition(
       FOUNDATION_TASK,
@@ -840,7 +966,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     (JSON.parse(archivedThroughAdvance.stdout) as CliJsonEnvelope).error?.code,
     "workflow.transition.illegal",
   );
-  assert.equal((await showTaskState(repository)).projection.lifecycle, "completed");
+  assert.equal(
+    (await showTaskState(repository)).projection.lifecycle,
+    "completed",
+  );
   await writeTaskRequest(repository, "task-transition.json", {
     taskId: FOUNDATION_TASK.taskId,
   });
@@ -875,7 +1004,10 @@ test("packaged CLI advances, recovers, and archives a durable Task", async (t) =
     (JSON.parse(mismatchedArchive.stdout) as CliJsonEnvelope).error?.code,
     "task.request.task_id_mismatch",
   );
-  assert.equal((await showTaskState(repository)).events.length, state.events.length);
+  assert.equal(
+    (await showTaskState(repository)).events.length,
+    state.events.length,
+  );
   const archived = await executeCliResult(
     "task",
     "archive",
@@ -928,7 +1060,11 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
     "export const foundation = 'dirty';\n",
     "utf8",
   );
-  await writeFile(join(repository, "unrelated-user.txt"), "private notes\n", "utf8");
+  await writeFile(
+    join(repository, "unrelated-user.txt"),
+    "private notes\n",
+    "utf8",
+  );
 
   const baseline = await executeCliResult(
     "task",
@@ -940,13 +1076,15 @@ test("packaged CLI records explicit dirty Baseline adoption", async (t) => {
   );
   assert.equal(baseline.exitCode, 0);
   const baselineEnvelope = JSON.parse(baseline.stdout) as CliJsonEnvelope;
-  const dirtyPaths = (baselineEnvelope.result?.baseline as {
-    dirtyPaths: readonly { path: string }[];
-  }).dirtyPaths;
-  assert.deepEqual(dirtyPaths.map((path) => path.path), [
-    "packages/core/foundation.ts",
-    "unrelated-user.txt",
-  ]);
+  const dirtyPaths = (
+    baselineEnvelope.result?.baseline as {
+      dirtyPaths: readonly { path: string }[];
+    }
+  ).dirtyPaths;
+  assert.deepEqual(
+    dirtyPaths.map((path) => path.path),
+    ["packages/core/foundation.ts", "unrelated-user.txt"],
+  );
 
   const incompleteAdoption = await executeCliResult(
     "task",
@@ -1044,16 +1182,29 @@ test("packaged CLI doctor fails closed on corrupt durable Event history", async 
     FOUNDATION_TASK.taskId,
     "task.json",
   );
-  const event = JSON.parse((await readFile(eventsPath, "utf8")).trimEnd()) as object;
+  const event = JSON.parse(
+    (await readFile(eventsPath, "utf8")).trimEnd(),
+  ) as object;
   const corruptHistory = `${JSON.stringify({ ...event, reason: "tampered" })}\n`;
   await writeFile(eventsPath, corruptHistory, "utf8");
   const projection = await readFile(projectionPath, "utf8");
 
-  const diagnosis = await executeCliResult("doctor", "--cwd", repository, "--json");
+  const diagnosis = await executeCliResult(
+    "doctor",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(diagnosis.exitCode, 3);
   const envelope = JSON.parse(diagnosis.stdout) as CliJsonEnvelope;
   assert.equal(envelope.error?.code, "workflow.event.chain_invalid");
-  const listed = await executeCliResult("task", "list", "--cwd", repository, "--json");
+  const listed = await executeCliResult(
+    "task",
+    "list",
+    "--cwd",
+    repository,
+    "--json",
+  );
   assert.equal(listed.exitCode, 3);
   assert.equal(
     (JSON.parse(listed.stdout) as CliJsonEnvelope).error?.code,
@@ -1140,7 +1291,11 @@ async function runGit(repository: string, ...args: readonly string[]) {
 async function executeCliResult(...args: readonly string[]) {
   try {
     const result = await executeCli(...args);
-    return Object.freeze({ exitCode: 0, stdout: result.stdout, stderr: result.stderr });
+    return Object.freeze({
+      exitCode: 0,
+      stdout: result.stdout,
+      stderr: result.stderr,
+    });
   } catch (error: unknown) {
     if (
       typeof error === "object" &&
