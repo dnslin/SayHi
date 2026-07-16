@@ -40,6 +40,7 @@ import {
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
   inspectDurableContextManifest,
+  inspectDurableInitiativeGraph,
 } from "./task-lifecycle.js";
 
 export {
@@ -293,6 +294,7 @@ export {
   refreshDurableContextManifest,
   freezeDurableContextManifest,
   inspectDurableContextManifest,
+  inspectDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
 } from "./task-lifecycle.js";
@@ -305,6 +307,10 @@ export type {
   ContextManifestFileSystem,
   InspectDurableContextManifestRequest,
   InspectDurableContextManifestResult,
+  InitiativeGraphNodeInspection,
+  InitiativeGraphNodeStatus,
+  InspectDurableInitiativeGraphRequest,
+  InspectDurableInitiativeGraphResult,
   RefreshDurableContextManifestRequest,
   RefreshDurableContextManifestResult,
   FreezeDurableContextManifestRequest,
@@ -376,6 +382,7 @@ export interface CoreContract {
   readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
+  readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -417,4 +424,5 @@ export const coreContract: CoreContract = Object.freeze({
   diagnoseDurableTasks,
   withDurableTaskWriter,
   inspectDurableContextManifest,
+  inspectDurableInitiativeGraph,
 });

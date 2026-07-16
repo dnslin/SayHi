@@ -1,5 +1,9 @@
 import { hashCanonicalJson, stableJson } from "./identity.js";
 import {
+  validateDependencyGraph,
+  type DependencyGraphDiagnostic,
+} from "./dependency-graph.js";
+import {
   RECORD_CONTRACT_VERSION,
   validateContractRecord,
   type BaselineRecord,
@@ -33,6 +37,8 @@ import {
   type StartWorkflowTaskRequest,
   type ContextManifestChangedEvent,
   type TaskCreatedEvent,
+  type DependencyGraph,
+  type DependencyGraphEdge,
   type TaskProjection,
   type TaskScope,
   type TransitionWorkflowRequest,
@@ -111,7 +117,12 @@ export type TaskLifecycleDiagnosticCode =
   | "context_manifest.approval_required"
   | "context_manifest.entry.missing"
   | "context_manifest.stale"
-  | "task_lifecycle.handoff.invalid";
+  | "task_lifecycle.handoff.invalid"
+  | "initiative_graph.record.missing"
+  | "initiative_graph.record.invalid"
+  | "initiative_graph.record.conflict"
+  | "initiative_graph.task.mismatch"
+  | "initiative_graph.identity.mismatch";
 
 export interface TaskLifecycleDiagnostic {
   readonly code: TaskLifecycleDiagnosticCode;
@@ -164,6 +175,36 @@ export interface ReadDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly taskId: string;
 }
+export interface InspectDurableInitiativeGraphRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly initiativeTaskId: string;
+}
+export type InitiativeGraphNodeStatus =
+  | Readonly<{ state: "missing" }>
+  | Readonly<{
+      state: "recorded";
+      lifecycle: TaskProjection["lifecycle"];
+      phase: TaskProjection["phase"];
+      step: string;
+      version: number;
+    }>;
+export interface InitiativeGraphNodeInspection {
+  readonly taskId: string;
+  readonly dependencies: readonly Readonly<{
+    taskId: string;
+    type: DependencyGraphEdge["type"];
+    reason: string;
+  }>[];
+  readonly status: InitiativeGraphNodeStatus;
+}
+export type InspectDurableInitiativeGraphResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      graph: DependencyGraph;
+      nodes: readonly InitiativeGraphNodeInspection[];
+    }>
+  | TaskLifecycleFailure;
 
 
 export interface DiagnoseDurableTasksRequest {
@@ -390,6 +431,7 @@ interface TaskPaths {
   readonly archiveTaskDirectory: string;
   readonly eventsPath: string;
   readonly projectionPath: string;
+  readonly graphPath: string;
   readonly handoffPath: string;
   readonly lockPath: string;
 }
@@ -483,7 +525,7 @@ export async function advanceDurableTask(
     return paths;
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-    advanceDurableTaskLocked(request),
+    advanceDurableTaskLocked(request, paths),
   );
 }
 
@@ -564,6 +606,45 @@ export async function readDurableTask(
       })
     : loaded;
 }
+export async function inspectDurableInitiativeGraph(
+  request: InspectDurableInitiativeGraphRequest,
+): Promise<InspectDurableInitiativeGraphResult> {
+  const paths = taskPaths(request.initiativeTaskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  const loaded = await loadTask(request.fileSystem, request.initiativeTaskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const graphRecord = await loadInitiativeGraphRecord(
+    request.fileSystem,
+    paths.graphPath,
+    loaded.state.projection,
+  );
+  if (!graphRecord.ok) {
+    return graphRecord;
+  }
+  const inspectedNodes = await Promise.all(
+    graphRecord.graph.nodes.map((node) =>
+      inspectInitiativeGraphNode(request.fileSystem, graphRecord.graph, node),
+    ),
+  );
+  const nodes: InitiativeGraphNodeInspection[] = [];
+  for (const inspectedNode of inspectedNodes) {
+    if (!inspectedNode.ok) {
+      return inspectedNode;
+    }
+    nodes.push(inspectedNode.value);
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    graph: graphRecord.graph,
+    nodes: Object.freeze(nodes),
+  });
+}
+
 
 export async function addDurableContextManifestEntry(
   request: AddDurableContextManifestEntryRequest,
@@ -710,6 +791,177 @@ export async function inspectDurableContextManifest(
 }
 
 
+
+type InitiativeGraphRecordLoadResult =
+  | Readonly<{ ok: true; graph: DependencyGraph }>
+  | TaskLifecycleFailure;
+type InitiativeGraphNodeInspectionResult =
+  | Readonly<{ ok: true; value: InitiativeGraphNodeInspection }>
+  | TaskLifecycleFailure;
+
+async function inspectInitiativeGraphNode(
+  fileSystem: TaskLifecycleFileSystem,
+  graph: DependencyGraph,
+  node: DependencyGraph["nodes"][number],
+): Promise<InitiativeGraphNodeInspectionResult> {
+  const dependencies = Object.freeze(
+    graph.edges
+      .filter((edge) => edge.to === node.taskId)
+      .map((edge) =>
+        Object.freeze({
+          taskId: edge.from,
+          type: edge.type,
+          reason: edge.reason,
+        }),
+      ),
+  );
+  const task = await readDurableTask({ fileSystem, taskId: node.taskId });
+  if (!task.ok) {
+    return task.diagnostics.some(
+      (item) => item.code === "task_lifecycle.history.missing",
+    )
+      ? Object.freeze({
+          ok: true,
+          value: Object.freeze({
+            taskId: node.taskId,
+            dependencies,
+            status: Object.freeze({ state: "missing" as const }),
+          }),
+        })
+      : task;
+  }
+  const projection = task.state.projection;
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      taskId: node.taskId,
+      dependencies,
+      status: Object.freeze({
+        state: "recorded" as const,
+        lifecycle: projection.lifecycle,
+        phase: projection.phase,
+        step: projection.step,
+        version: projection.version,
+      }),
+    }),
+  });
+}
+
+async function loadInitiativeGraphRecord(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  projection: TaskProjection,
+): Promise<InitiativeGraphRecordLoadResult> {
+  try {
+    if ((await fileSystem.inspect(path)).kind !== "file") {
+      return initiativeGraphFailure(
+        "initiative_graph.record.missing",
+        path,
+        "The Initiative Dependency Graph record is missing or unsafe.",
+        "Restore graph.json from the accepted Initiative Event history before retrying.",
+      );
+    }
+    let graph: unknown;
+    try {
+      graph = JSON.parse(await fileSystem.readFile(path));
+    } catch {
+      return initiativeGraphFailure(
+        "initiative_graph.record.invalid",
+        path,
+        "The Initiative Dependency Graph record is not valid JSON.",
+        "Restore a complete schema-valid graph.json file before retrying.",
+      );
+    }
+    const validated = validateDependencyGraph({ contractVersion: 1, graph });
+    if (!validated.ok) {
+      return failure(
+        validated.diagnostics.map((item) =>
+          dependencyGraphRecordDiagnostic(path, item),
+        ),
+      );
+    }
+    if (projection.route !== "initiative") {
+      return initiativeGraphFailure(
+        "initiative_graph.task.mismatch",
+        path,
+        "The graph record belongs to a Task that is not an Initiative.",
+        "Inspect the Initiative Task that owns this graph record.",
+      );
+    }
+    if (validated.graph.initiativeTaskId !== projection.id) {
+      return initiativeGraphFailure(
+        "initiative_graph.task.mismatch",
+        path,
+        "The graph record belongs to a different Initiative Task.",
+        "Restore the graph.json record accepted for this Initiative.",
+      );
+    }
+    if (validated.graph.id !== projection.initiativeGraphId) {
+      return initiativeGraphFailure(
+        "initiative_graph.identity.mismatch",
+        path,
+        "The graph record id does not match the Initiative Projection.",
+        "Restore the graph.json record bound to this Initiative Projection.",
+      );
+    }
+    return Object.freeze({ ok: true, graph: validated.graph });
+  } catch {
+    return ioFailure(path);
+  }
+}
+
+async function preflightInitiativeGraphRecord(
+  fileSystem: TaskLifecycleFileSystem,
+  paths: TaskPaths,
+  projection: TaskProjection,
+  graph: DependencyGraph,
+): Promise<TaskLifecycleFailure | null> {
+  const existing = await fileSystem.inspect(paths.graphPath);
+  if (existing.kind === "missing") {
+    return null;
+  }
+  const loaded = await loadInitiativeGraphRecord(
+    fileSystem,
+    paths.graphPath,
+    projection,
+  );
+  if (!loaded.ok) {
+    return loaded;
+  }
+  return stableJson(loaded.graph) === stableJson(graph)
+    ? null
+    : initiativeGraphFailure(
+        "initiative_graph.record.conflict",
+        paths.graphPath,
+        "The graph record conflicts with the accepted Initiative transition.",
+        "Resolve the graph record conflict before retrying the transition.",
+      );
+}
+
+function dependencyGraphRecordDiagnostic(
+  path: string,
+  item: DependencyGraphDiagnostic,
+): TaskLifecycleDiagnostic {
+  const prefix = "$.graph";
+  const suffix = item.path.startsWith(prefix) ? item.path.slice(prefix.length) : "";
+  return diagnostic(item.code, `${path}${suffix}`, item.message, item.remediation);
+}
+
+function initiativeGraphFailure(
+  code: Extract<
+    TaskLifecycleDiagnosticCode,
+    | "initiative_graph.record.missing"
+    | "initiative_graph.record.invalid"
+    | "initiative_graph.record.conflict"
+    | "initiative_graph.task.mismatch"
+    | "initiative_graph.identity.mismatch"
+  >,
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([diagnostic(code, path, message, remediation)]);
+}
 
 async function createDurableTaskLocked(
   fileSystem: TaskLifecycleFileSystem,
@@ -1340,6 +1592,7 @@ async function persistContextManifestChange(
 
 async function advanceDurableTaskLocked(
   request: AdvanceDurableTaskRequest,
+  paths: TaskPaths,
 ): Promise<AdvanceDurableTaskResult> {
   const loaded = await loadTask(request.fileSystem, request.transition.taskId);
   if (!loaded.ok) {
@@ -1349,14 +1602,32 @@ async function advanceDurableTaskLocked(
   if (!transitioned.ok) {
     return failure(transitioned.diagnostics);
   }
-  const appended = transitioned.state.events.length > loaded.state.events.length;
+  const graph = transitioned.event.initiativeGraph;
   let activePath = loaded.eventsPath;
   try {
+    if (graph !== null) {
+      activePath = paths.graphPath;
+      const preflight = await preflightInitiativeGraphRecord(
+        request.fileSystem,
+        paths,
+        transitioned.state.projection,
+        graph,
+      );
+      if (preflight !== null) {
+        return preflight;
+      }
+    }
+    const appended = transitioned.state.events.length > loaded.state.events.length;
+    activePath = loaded.eventsPath;
     if (appended) {
       await request.fileSystem.appendFile(
         loaded.eventsPath,
         serializeEvent(transitioned.event),
       );
+    }
+    if (graph !== null) {
+      activePath = paths.graphPath;
+      await request.fileSystem.writeFile(paths.graphPath, serializeInitiativeGraph(graph));
     }
     activePath = loaded.projectionPath;
     await writeProjectionIfChanged(
@@ -2288,6 +2559,7 @@ function taskPaths(taskId: string):
     archiveTaskDirectory: `${TASK_ARCHIVE_DIRECTORY}/${taskId}`,
     eventsPath: `${taskDirectory}/events.jsonl`,
     projectionPath: `${taskDirectory}/task.json`,
+    graphPath: `${taskDirectory}/graph.json`,
     lockPath: `.sayhi/.runtime/task-${taskId}.lock`,
     handoffPath: `${taskDirectory}/handoff.json`,
   });
@@ -2310,6 +2582,10 @@ function serializeEvent(event: WorkflowEvent): string {
 function serializeProjection(projection: TaskProjection): string {
   return `${JSON.stringify(projection, null, 2)}\n`;
 }
+function serializeInitiativeGraph(graph: DependencyGraph): string {
+  return `${JSON.stringify(graph, null, 2)}\n`;
+}
+
 
 function serializeHandoff(handoff: DurableTaskHandoff): string {
   return `${JSON.stringify(handoff, null, 2)}\n`;
