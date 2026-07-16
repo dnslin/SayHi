@@ -24,6 +24,10 @@ import {
   type PlanManagedProjectUninstallResult,
   type PlanManagedProjectUpdateResult,
   type WorkflowEventMetadata,
+  type StartWorkflowTaskRequest,
+  type TransitionWorkflowRequest,
+  type BaselineRecord,
+  type WorkflowState,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -167,6 +171,27 @@ interface ParsedContextArguments {
 }
 
 type ContextArgumentResult = ParsedContextArguments | InvalidCliArguments;
+type TaskSubcommand =
+  | "adopt"
+  | "advance"
+  | "archive"
+  | "baseline"
+  | "create"
+  | "events"
+  | "recover"
+  | "show";
+interface ParsedTaskArguments {
+  readonly ok: true;
+  readonly command: "task";
+  readonly subcommand: TaskSubcommand;
+  readonly cwd: string;
+  readonly json: boolean;
+  readonly mode?: "apply";
+  readonly taskId?: string;
+  readonly source?: string;
+  readonly adoptedPaths?: readonly string[];
+}
+type TaskArgumentResult = ParsedTaskArguments | InvalidCliArguments;
 type GraphSubcommand = "show";
 interface ParsedGraphArguments {
   readonly ok: true;
@@ -204,6 +229,18 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           2,
           context.message,
           "Run sayhi context add, list, or validate.",
+          args.includes("--json"),
+        );
+  }
+  const task = parseTaskArguments(args);
+  if (task !== null) {
+    return task.ok
+      ? runTaskCli(task)
+      : cliFailure(
+          "task",
+          2,
+          task.message,
+          "Run sayhi task create --from <request.json> or task show <task-id>.",
           args.includes("--json"),
         );
   }
@@ -541,6 +578,245 @@ async function runContextCli(
 }
 
 
+async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
+  const repositoryRoot = await resolveCliRepositoryRoot(
+    parsed.cwd,
+    `task.${parsed.subcommand}`,
+    parsed.json,
+  );
+  if (typeof repositoryRoot !== "string") {
+    return repositoryRoot;
+  }
+  const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
+  switch (parsed.subcommand) {
+    case "create": {
+      const request = await readTaskJsonRequest(
+        fileSystem,
+        parsed.source!,
+        "task.create",
+        parsed.json,
+      );
+      if (!request.ok) {
+        return request.result;
+      }
+      const result = await coreContract.createDurableTask({
+        fileSystem,
+        start: request.value as unknown as StartWorkflowTaskRequest,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.create",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              event: result.event,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.create", result.diagnostics[0], parsed.json);
+    }
+    case "advance": {
+      const request = await readTaskJsonRequest(
+        fileSystem,
+        parsed.source!,
+        "task.advance",
+        parsed.json,
+      );
+      if (!request.ok) {
+        return request.result;
+      }
+      const result = await coreContract.advanceDurableTask({
+        fileSystem,
+        transition: request.value as unknown as TransitionWorkflowRequest,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.advance",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              event: result.event,
+              appended: result.appended,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.advance", result.diagnostics[0], parsed.json);
+    }
+    case "recover": {
+      const result = await coreContract.recoverDurableTask({
+        fileSystem,
+        taskId: parsed.taskId!,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.recover",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              recovered: result.recovered,
+              handoff: result.handoff,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.recover", result.diagnostics[0], parsed.json);
+    }
+    case "archive": {
+      const request = await readTaskJsonRequest(
+        fileSystem,
+        parsed.source!,
+        "task.archive",
+        parsed.json,
+      );
+      if (!request.ok) {
+        return request.result;
+      }
+      const result = await coreContract.archiveDurableTask({
+        fileSystem,
+        transition: request.value as unknown as TransitionWorkflowRequest,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.archive",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              moved: result.moved,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.archive", result.diagnostics[0], parsed.json);
+    }
+    case "baseline": {
+      const captured = await captureTaskBaseline(
+        fileSystem,
+        parsed.taskId!,
+        [],
+        "task.baseline",
+        parsed.json,
+      );
+      return captured.ok
+        ? cliSuccess(
+            "task.baseline",
+            Object.freeze({ taskId: parsed.taskId, baseline: captured.baseline }),
+            parsed.json,
+          )
+        : captured.result;
+    }
+    case "adopt": {
+      const captured = await captureTaskBaseline(
+        fileSystem,
+        parsed.taskId!,
+        parsed.adoptedPaths!,
+        "task.adopt",
+        parsed.json,
+      );
+      if (!captured.ok) {
+        return captured.result;
+      }
+      const result = await coreContract.adoptDurableTaskBaseline({
+        fileSystem,
+        taskId: parsed.taskId!,
+        expectedVersion: captured.state.projection.version,
+        baseline: captured.baseline,
+        event: createCliTaskEvent("Adopted dirty Baseline through the CLI."),
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.adopt",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              event: result.event,
+              appended: result.appended,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.adopt", result.diagnostics[0], parsed.json);
+    }
+    case "events": {
+      const result = await coreContract.readDurableTask({
+        fileSystem,
+        taskId: parsed.taskId!,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.events",
+            Object.freeze({ taskId: result.state.projection.id, events: result.state.events }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.events", result.diagnostics[0], parsed.json);
+    }
+    case "show": {
+      const result = await coreContract.readDurableTask({
+        fileSystem,
+        taskId: parsed.taskId!,
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.show",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              projection: result.state.projection,
+              events: result.state.events,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.show", result.diagnostics[0], parsed.json);
+    }
+  }
+}
+
+type CapturedTaskBaselineResult =
+  | Readonly<{ ok: true; state: WorkflowState; baseline: BaselineRecord }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+
+async function captureTaskBaseline(
+  fileSystem: NodeManagedProjectFileSystem,
+  taskId: string,
+  adoptedPaths: readonly string[],
+  operation: string,
+  json: boolean,
+): Promise<CapturedTaskBaselineResult> {
+  const task = await coreContract.readDurableTask({ fileSystem, taskId });
+  if (!task.ok) {
+    return Object.freeze({
+      ok: false,
+      result: cliDomainFailure(operation, task.diagnostics[0], json),
+    });
+  }
+  try {
+    const baseline = await fileSystem.captureBaseline({
+      taskId,
+      declaredScope: task.state.projection.scope,
+      adoptedPaths,
+    });
+    return Object.freeze({ ok: true, state: task.state, baseline });
+  } catch {
+    return Object.freeze({
+      ok: false,
+      result: cliDomainFailure(
+        operation,
+        Object.freeze({
+          code: "task.baseline.unavailable",
+          message: "Task Baseline could not be captured from the repository.",
+          remediation: "Repair the repository state and retry Baseline inspection.",
+        }),
+        json,
+      ),
+    });
+  }
+}
+
+function createCliTaskEvent(reason: string): WorkflowEventMetadata {
+  return Object.freeze({
+    eventId: randomUUID(),
+    actor: Object.freeze({ kind: "user", id: "sayhi-cli", sessionRef: "cli" }),
+    reason,
+    idempotencyKey: randomUUID(),
+    occurredAt: new Date().toISOString(),
+  });
+}
+
 async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> {
   const repositoryRoot = await resolveCliRepositoryRoot(
     parsed.cwd,
@@ -561,6 +837,52 @@ async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> 
         parsed.json,
       )
     : cliDomainFailure("graph.show", result.diagnostics[0], parsed.json);
+}
+
+type TaskJsonRequestResult =
+  | Readonly<{ ok: true; value: Record<string, unknown> }>
+  | Readonly<{ ok: false; result: CliRunResult }>;
+
+async function readTaskJsonRequest(
+  fileSystem: NodeManagedProjectFileSystem,
+  source: string,
+  operation: string,
+  json: boolean,
+): Promise<TaskJsonRequestResult> {
+  try {
+    const value: unknown = JSON.parse(await fileSystem.readRepositoryFile(source));
+    return typeof value === "object" && value !== null && !Array.isArray(value)
+      ? Object.freeze({ ok: true, value: value as Record<string, unknown> })
+      : Object.freeze({
+          ok: false,
+          result: taskRequestFailure(operation, "Task request must be a JSON object.", json),
+        });
+  } catch {
+    return Object.freeze({
+      ok: false,
+      result: taskRequestFailure(
+        operation,
+        "Task request could not be read as JSON from the repository.",
+        json,
+      ),
+    });
+  }
+}
+
+function taskRequestFailure(
+  operation: string,
+  message: string,
+  json: boolean,
+): CliRunResult {
+  return cliDomainFailure(
+    operation,
+    Object.freeze({
+      code: "task.request.invalid",
+      message,
+      remediation: "Provide a regular JSON request file inside the repository.",
+    }),
+    json,
+  );
 }
 
 async function resolveCliRepositoryRoot(
@@ -647,6 +969,109 @@ function isGlobalPresentationOption(argument: string): boolean {
     argument === "--non-interactive" ||
     argument === "--verbose"
   );
+}
+
+function parseTaskArguments(args: readonly string[]): TaskArgumentResult | null {
+  if (leadingCliCommand(args) !== "task") {
+    return null;
+  }
+  let cwd = process.cwd();
+  let json = false;
+  let mode: "apply" | undefined;
+  let source: string | undefined;
+  let taskCount = 0;
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (isGlobalPresentationOption(argument)) {
+      continue;
+    }
+    if (argument === "--apply") {
+      if (mode !== undefined) {
+        return { ok: false, message: "Specify --apply at most once." };
+      }
+      mode = "apply";
+      continue;
+    }
+    if (argument === "--cwd" || argument === "--from") {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, message: `${argument} requires a path.` };
+      }
+      if (argument === "--cwd") {
+        cwd = value;
+      } else if (source !== undefined) {
+        return { ok: false, message: "Specify --from exactly once." };
+      } else {
+        source = value;
+      }
+      index += 1;
+      continue;
+    }
+    if (argument === "task") {
+      taskCount += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      return { ok: false, message: `Unknown argument: ${argument}` };
+    }
+    values.push(argument);
+  }
+  if (taskCount !== 1) {
+    return { ok: false, message: "Specify exactly one task command." };
+  }
+  const [subcommand, taskId, ...tail] = values;
+  if (
+    subcommand !== "adopt" &&
+    subcommand !== "advance" &&
+    subcommand !== "archive" &&
+    subcommand !== "baseline" &&
+    subcommand !== "create" &&
+    subcommand !== "events" &&
+    subcommand !== "recover" &&
+    subcommand !== "show"
+  ) {
+    return { ok: false, message: "Task command is not supported." };
+  }
+  if (subcommand === "create") {
+    if (taskId !== undefined || tail.length > 0 || source === undefined || mode !== undefined) {
+      return { ok: false, message: "task create requires only --from <request.json>." };
+    }
+    return { ok: true, command: "task", subcommand, cwd, json, source };
+  }
+  if (taskId === undefined) {
+    return { ok: false, message: `task ${subcommand} requires one Task id.` };
+  }
+  if (subcommand === "adopt") {
+    return source === undefined && mode === undefined && tail.length > 0
+      ? {
+          ok: true,
+          command: "task",
+          subcommand,
+          cwd,
+          json,
+          taskId,
+          adoptedPaths: Object.freeze([...tail]),
+        }
+      : { ok: false, message: "task adopt requires one or more repository paths." };
+  }
+  if (subcommand === "show" || subcommand === "events" || subcommand === "baseline") {
+    return source === undefined && mode === undefined && tail.length === 0
+      ? { ok: true, command: "task", subcommand, cwd, json, taskId }
+      : { ok: false, message: `task ${subcommand} is read-only.` };
+  }
+  if (subcommand === "recover") {
+    return source === undefined && mode === "apply" && tail.length === 0
+      ? { ok: true, command: "task", subcommand, cwd, json, taskId, mode }
+      : { ok: false, message: "task recover requires --apply and no request source." };
+  }
+  return source !== undefined && mode === undefined && tail.length === 0
+    ? { ok: true, command: "task", subcommand, cwd, json, taskId, source }
+    : { ok: false, message: `task ${subcommand} requires --from <request.json>.` };
 }
 
 function parseGraphArguments(args: readonly string[]): GraphArgumentResult | null {
