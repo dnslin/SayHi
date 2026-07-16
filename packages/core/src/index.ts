@@ -22,6 +22,7 @@ import {
   adoptWorkflowBaseline,
   replayWorkflowEvents,
   startWorkflowTask,
+  escalateQuickToBuild,
   recordContextManifestChange,
   transitionWorkflow,
 } from "./workflow.js";
@@ -35,6 +36,7 @@ import {
   readDurableQuickResult,
   recordDurableQuickResult,
   diagnoseDurableTasks,
+  escalateDurableQuickToBuild,
   listDurableTasks,
   recoverDurableTask,
   readDurableTask,
@@ -236,6 +238,7 @@ export {
   readGateEvidenceKinds,
   replayWorkflowEvents,
   startWorkflowTask,
+  escalateQuickToBuild,
   transitionWorkflow,
   recordContextManifestChange,
 } from "./workflow.js";
@@ -253,10 +256,13 @@ export type {
   BaselineAdoptedEvent,
   ContextManifestChange,
   ContextManifestChangedEvent,
+  EscalateQuickToBuildRequest,
+  EscalateQuickToBuildResult,
   RecordContextManifestChangeRequest,
   RecordContextManifestChangeResult,
   BaselineAdoptedPath,
   RouteDefinition,
+  RouteEscalatedEvent,
   StartWorkflowTaskRequest,
   StartWorkflowTaskResult,
   TaskCreatedEvent,
@@ -289,6 +295,7 @@ export {
   addDurableContextManifestEntry,
   archiveDurableTask,
   advanceDurableTask,
+  escalateDurableQuickToBuild,
   adoptDurableTaskBaseline,
   createDurableTask,
   createDurableTaskHandoff,
@@ -328,6 +335,8 @@ export type {
   AdoptDurableTaskBaselineRequest,
   AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
+  EscalateDurableQuickToBuildRequest,
+  EscalateDurableQuickToBuildResult,
   CreateDurableTaskRequest,
   CreateDurableTaskHandoffRequest,
   CreateDurableTaskHandoffResult,
@@ -383,6 +392,7 @@ export interface CoreContract {
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
   readonly startWorkflowTask: typeof startWorkflowTask;
+  readonly escalateQuickToBuild: typeof escalateQuickToBuild;
   readonly transitionWorkflow: typeof transitionWorkflow;
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
@@ -393,6 +403,7 @@ export interface CoreContract {
   readonly recordDurableQuickResult: typeof recordDurableQuickResult;
   readonly completeDurableQuickResult: typeof completeDurableQuickResult;
   readonly advanceDurableTask: typeof advanceDurableTask;
+  readonly escalateDurableQuickToBuild: typeof escalateDurableQuickToBuild;
   readonly archiveDurableTask: typeof archiveDurableTask;
   readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
   readonly refreshDurableContextManifest: typeof refreshDurableContextManifest;
@@ -429,6 +440,7 @@ export const coreContract: CoreContract = Object.freeze({
   authorizePhaseExecution,
   readRouteDefinition,
   startWorkflowTask,
+  escalateQuickToBuild,
   transitionWorkflow,
   replayWorkflowEvents,
   adoptWorkflowBaseline,
@@ -439,6 +451,7 @@ export const coreContract: CoreContract = Object.freeze({
   recordDurableQuickResult,
   completeDurableQuickResult,
   advanceDurableTask,
+  escalateDurableQuickToBuild,
   archiveDurableTask,
   addDurableContextManifestEntry,
   refreshDurableContextManifest,
