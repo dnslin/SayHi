@@ -11,6 +11,7 @@ import {
   createDurableTask,
   inspectDurableInitiativeGraph,
   readDurableTask,
+  recoverDurableTask,
   readGateEvidenceKinds,
   type DependencyGraph,
   type StartWorkflowTaskRequest,
@@ -86,6 +87,25 @@ test("Core stores an Initiative graph and CLI inspection reports its dependencie
   assert.deepEqual(envelope.result?.nodes, inspected.nodes);
 });
 
+test("Task recovery rebuilds a missing Initiative graph record from accepted history", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const graphPath = join(
+    fixture.repository,
+    ".sayhi",
+    "tasks",
+    INITIATIVE_ID,
+    "graph.json",
+  );
+  await rm(graphPath);
+
+  const recovered = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), fixture.graph);
+});
+
 test("Graph inspection rejects invalid and incompatible records without changing Initiative state", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
   const graphPath = join(
@@ -141,6 +161,22 @@ test("Graph inspection rejects invalid and incompatible records without changing
     (JSON.parse(shown.stdout) as CliJsonEnvelope).error?.code,
     "dependency_graph.schema_version.unsupported",
   );
+  await writeFile(
+    graphPath,
+    `${JSON.stringify({
+      ...fixture.graph,
+      updatedByEvent: "EVENT-14-NOT-ACCEPTED",
+    })}\n`,
+    "utf8",
+  );
+  const unbound = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(unbound.ok, false);
+  if (!unbound.ok) {
+    assert.equal(unbound.diagnostics[0]?.code, "initiative_graph.event.mismatch");
+  }
   const after = await readDurableTask({
     fileSystem: fixture.fileSystem,
     taskId: INITIATIVE_ID,
