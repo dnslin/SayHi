@@ -33,9 +33,11 @@ import {
   startWorkflowTask,
   recordContextManifestChange,
   transitionWorkflow,
+  escalateQuickToBuild,
   type BaselineAdoptedEvent,
   type StartWorkflowTaskRequest,
   type ContextManifestChangedEvent,
+  type EscalateQuickToBuildRequest,
   type TaskCreatedEvent,
   type DependencyGraph,
   type DependencyGraphEdge,
@@ -48,6 +50,7 @@ import {
   type WorkflowEventMetadata,
   type WorkflowState,
   type WorkflowTransitionedEvent,
+  type RouteEscalatedEvent,
   type WorkflowPhase,
 } from "./workflow.js";
 
@@ -146,6 +149,11 @@ export interface CreateDurableTaskRequest {
 export interface AdvanceDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly transition: TransitionWorkflowRequest;
+}
+
+export interface EscalateDurableQuickToBuildRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly escalation: EscalateQuickToBuildRequest;
 }
 
 export interface ArchiveDurableTaskRequest {
@@ -331,6 +339,16 @@ export type AdvanceDurableTaskResult =
       contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
       state: WorkflowState;
       event: WorkflowTransitionedEvent;
+      appended: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+export type EscalateDurableQuickToBuildResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: RouteEscalatedEvent;
       appended: boolean;
     }>
   | TaskLifecycleFailure;
@@ -609,6 +627,19 @@ export async function advanceDurableTask(
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
     advanceDurableTaskLocked(request, paths),
+  );
+}
+
+export async function escalateDurableQuickToBuild(
+  request: EscalateDurableQuickToBuildRequest,
+): Promise<EscalateDurableQuickToBuildResult> {
+  const escalation = request.escalation as EscalateQuickToBuildRequest | undefined;
+  const paths = taskPaths(escalation?.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    escalateDurableQuickToBuildLocked(request, paths),
   );
 }
 export async function archiveDurableTask(
@@ -1892,6 +1923,45 @@ async function advanceDurableTaskLocked(
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       state: transitioned.state,
       event: transitioned.event,
+      appended,
+    });
+  } catch {
+    return ioFailure(activePath);
+  }
+}
+
+async function escalateDurableQuickToBuildLocked(
+  request: EscalateDurableQuickToBuildRequest,
+  paths: TaskPaths,
+): Promise<EscalateDurableQuickToBuildResult> {
+  const loaded = await loadTask(request.fileSystem, request.escalation.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const escalated = escalateQuickToBuild(loaded.state, request.escalation);
+  if (!escalated.ok) {
+    return failure(escalated.diagnostics);
+  }
+  const appended = escalated.state.events.length > loaded.state.events.length;
+  let activePath = loaded.eventsPath;
+  try {
+    if (appended) {
+      await request.fileSystem.appendFile(
+        loaded.eventsPath,
+        serializeEvent(escalated.event),
+      );
+    }
+    activePath = loaded.projectionPath;
+    await writeProjectionIfChanged(
+      request.fileSystem,
+      loaded.projectionPath,
+      escalated.state.projection,
+    );
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: escalated.state,
+      event: escalated.event,
       appended,
     });
   } catch {

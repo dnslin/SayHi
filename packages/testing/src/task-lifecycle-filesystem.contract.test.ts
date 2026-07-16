@@ -16,6 +16,7 @@ import {
   completeDurableQuickResult,
   createDurableTaskHandoff,
   diagnoseDurableTasks,
+  escalateDurableQuickToBuild,
   initializeManagedProject,
   recoverDurableTask,
   withDurableTaskWriter,
@@ -522,6 +523,113 @@ test("Quick result rejects drift after the scoped Writer completes", async (t) =
   await assert.rejects(
     readFile(join(repository, ".sayhi", "tasks", fixture.taskId, "quick.json"), "utf8"),
   );
+});
+
+test("durable Quick escalation recovers an interrupted Projection write without duplicate Events", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-escalation-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const initialized = await initializeManagedProject({
+    fileSystem,
+    installation: INSTALLATION,
+    projectId: "PROJECT-18-QUICK-ESCALATION",
+    timestamp: "2026-07-16T16:00:00Z",
+  });
+  assert.equal(initialized.ok, true);
+
+  const fixture = Object.freeze({
+    ...TASK_FIXTURE,
+    taskId: "TASK-18-QUICK-ESCALATION",
+    eventNamespace: "18-QUICK-ESCALATION",
+  });
+  const buildStart = taskLifecycleStartRequest(fixture, "2026-07-16T16:00:01Z");
+  const created = await createDurableTask({
+    fileSystem,
+    start: {
+      ...buildStart,
+      task: {
+        ...buildStart.task,
+        route: "quick",
+        contexts: { triage: "context/triage.jsonl" },
+      },
+    },
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+
+  const escalation = {
+    contractVersion: 1 as const,
+    taskId: fixture.taskId,
+    expectedVersion: created.state.projection.version,
+    routeGate: {
+      gate: "route" as const,
+      evidence: [
+        {
+          kind: "human-approval" as const,
+          reference: "evidence/build-route-approved.json",
+        },
+      ],
+    },
+    event: taskLifecycleEventMetadata(
+      fixture,
+      "ESCALATED",
+      "2026-07-16T16:00:02Z",
+    ),
+  };
+  const projectionPath = `.sayhi/tasks/${fixture.taskId}/task.json`;
+  let failProjectionWrite = true;
+  const faultingFileSystem = new Proxy(fileSystem, {
+    get(target, property, receiver) {
+      if (property === "writeFile") {
+        return async (path: string, content: string) => {
+          if (path === projectionPath && failProjectionWrite) {
+            failProjectionWrite = false;
+            throw new Error("route escalation projection write interrupted");
+          }
+          await target.writeFile(path, content);
+        };
+      }
+      const member = Reflect.get(target, property, receiver);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const interrupted = await escalateDurableQuickToBuild({
+    fileSystem: faultingFileSystem,
+    escalation,
+  });
+  assert.equal(interrupted.ok, false);
+  if (!interrupted.ok) {
+    assert.equal(interrupted.diagnostics[0]?.code, "task_lifecycle.io_failed");
+  }
+
+  const recovered = await recoverDurableTask({
+    fileSystem,
+    taskId: fixture.taskId,
+  });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.equal(recovered.state.projection.route, "build");
+  assert.equal(recovered.state.projection.phase, "explore");
+  assert.equal(recovered.state.projection.baselineRef, created.state.projection.baselineRef);
+  assert.deepEqual(recovered.state.projection.intent, created.state.projection.intent);
+  assert.deepEqual(recovered.state.projection.contexts, created.state.projection.contexts);
+
+  const retried = await escalateDurableQuickToBuild({ fileSystem, escalation });
+  assert.equal(retried.ok, true);
+  if (!retried.ok) {
+    return;
+  }
+  assert.equal(retried.appended, false);
+  assert.equal(retried.state.events.length, 2);
+  const events = (await readFile(
+    join(repository, ".sayhi", "tasks", fixture.taskId, "events.jsonl"),
+    "utf8",
+  )).trim().split("\n").map((line) => JSON.parse(line) as { type: string });
+  assert.equal(events.filter((event) => event.type === "route_escalated").length, 1);
 });
 test("Quick completion repairs its record after an interrupted write", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-result-repair-"));

@@ -174,6 +174,140 @@ test("accepted Quick, Build, and Initiative Events replay to the same Task Proje
   }
 });
 
+test("an accepted Quick escalation preserves Task continuity and replays as a Build", () => {
+  const start = startTaskRequest("quick");
+  const created = coreContract.startWorkflowTask({
+    ...start,
+    task: {
+      ...start.task,
+      contexts: {
+        triage: "context/triage.jsonl",
+        implement: "context/implement.jsonl",
+      },
+    },
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+
+  const request = {
+    contractVersion: 1 as const,
+    taskId: created.state.projection.id,
+    expectedVersion: created.state.projection.version,
+    routeGate: {
+      gate: "route" as const,
+      evidence: [
+        {
+          kind: "human-approval" as const,
+          reference: "evidence/build-route-approved.json",
+        },
+      ],
+    },
+    event: eventMetadata("quick-escalated"),
+  };
+  const accepted = coreContract.escalateQuickToBuild(created.state, request);
+  assert.equal(accepted.ok, true);
+  if (!accepted.ok) {
+    return;
+  }
+
+  assert.equal(accepted.event.type, "route_escalated");
+  assert.equal(accepted.event.route, "build");
+  assert.equal(accepted.state.projection.route, "build");
+  assert.deepEqual(accepted.state.projection, {
+    ...created.state.projection,
+    route: "build",
+    phase: "explore",
+    updatedAt: accepted.event.occurredAt,
+    version: 2,
+    eventHead: {
+      sequence: 2,
+      eventId: accepted.event.eventId,
+      chainDigest: accepted.event.chainDigest,
+    },
+  });
+
+  const replayed = coreContract.replayWorkflowEvents(accepted.state.events);
+  assert.equal(replayed.ok, true);
+  if (replayed.ok) {
+    assert.deepEqual(replayed.state, accepted.state);
+  }
+
+  const retried = coreContract.escalateQuickToBuild(accepted.state, request);
+  assert.equal(retried.ok, true);
+  if (retried.ok) {
+    assert.strictEqual(retried.state, accepted.state);
+    assert.strictEqual(retried.event, accepted.event);
+    assert.equal(retried.state.events.length, 2);
+  }
+});
+
+test("Quick escalation remains resumable after declined Route approval and requires Build Plan approval", () => {
+  const quick = startTask("quick");
+  const declined = coreContract.escalateQuickToBuild(quick, {
+    contractVersion: 1,
+    taskId: quick.projection.id,
+    expectedVersion: quick.projection.version,
+    routeGate: {
+      gate: "route",
+      evidence: [{ kind: "workflow", reference: "evidence/route-proposed.json" }],
+    },
+    event: eventMetadata("quick-escalation-declined"),
+  });
+  assert.equal(declined.ok, false);
+  if (!declined.ok) {
+    assert.strictEqual(declined.state, quick);
+    assert.equal(declined.diagnostics[0]?.code, "workflow.gate.evidence_invalid");
+  }
+
+  const accepted = coreContract.escalateQuickToBuild(quick, {
+    contractVersion: 1,
+    taskId: quick.projection.id,
+    expectedVersion: quick.projection.version,
+    routeGate: {
+      gate: "route",
+      evidence: [
+        { kind: "human-approval", reference: "evidence/build-route-approved.json" },
+      ],
+    },
+    event: eventMetadata("quick-escalation-accepted"),
+  });
+  assert.equal(accepted.ok, true);
+  if (!accepted.ok) {
+    return;
+  }
+  assert.equal(accepted.state.events.length, 2);
+
+  const planning = advanceTask(
+    accepted.state,
+    "active",
+    "plan",
+    "escalated-explore-complete",
+  );
+  const unapprovedImplementation = coreContract.transitionWorkflow(planning, {
+    contractVersion: 1,
+    taskId: planning.projection.id,
+    expectedVersion: planning.projection.version,
+    to: { lifecycle: "active", phase: "implement", step: "ready" },
+    gates: [],
+    event: eventMetadata("escalated-plan-unapproved"),
+  });
+  assert.equal(unapprovedImplementation.ok, false);
+  if (!unapprovedImplementation.ok) {
+    assert.strictEqual(unapprovedImplementation.state, planning);
+    assert.equal(unapprovedImplementation.diagnostics[0]?.code, "workflow.gate.unmet");
+  }
+
+  const implementing = advanceTask(
+    planning,
+    "active",
+    "implement",
+    "escalated-plan-approved",
+  );
+  assert.equal(implementing.projection.phase, "implement");
+});
+
 test("illegal, stale, and unmet-Gate transitions preserve the prior workflow state", () => {
   const state = startTask("build");
   const snapshot = structuredClone(state);

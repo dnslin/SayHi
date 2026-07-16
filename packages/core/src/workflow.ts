@@ -225,6 +225,11 @@ export interface WorkflowTransitionedEvent extends WorkflowEventBase {
   readonly from: WorkflowPosition;
 }
 
+export interface RouteEscalatedEvent extends WorkflowEventBase {
+  readonly type: "route_escalated";
+  readonly from: WorkflowPosition;
+}
+
 export interface BaselineAdoptedEvent extends WorkflowEventBase {
   readonly type: "baseline_adopted";
   readonly from: WorkflowPosition;
@@ -247,6 +252,7 @@ export interface ContextManifestChangedEvent extends WorkflowEventBase {
 export type WorkflowEvent =
   | TaskCreatedEvent
   | WorkflowTransitionedEvent
+  | RouteEscalatedEvent
   | BaselineAdoptedEvent
   | ContextManifestChangedEvent;
 
@@ -270,6 +276,14 @@ export interface TransitionWorkflowRequest {
   readonly gates: readonly GateAcceptance[];
   readonly blockers?: readonly string[];
   readonly initiativeGraph?: DependencyGraph;
+  readonly event: WorkflowEventMetadata;
+}
+
+export interface EscalateQuickToBuildRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly routeGate: GateAcceptance;
   readonly event: WorkflowEventMetadata;
 }
 
@@ -337,6 +351,20 @@ export type TransitionWorkflowResult =
       contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
       state: WorkflowState;
       event: WorkflowTransitionedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+
+export type EscalateQuickToBuildResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: RouteEscalatedEvent;
     }>
   | Readonly<{
       ok: false;
@@ -656,6 +684,95 @@ export function transitionWorkflow(
   });
 }
 
+export function escalateQuickToBuild(
+  state: WorkflowState,
+  request: EscalateQuickToBuildRequest,
+): EscalateQuickToBuildResult {
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "route_escalated" &&
+      matchesRouteEscalationIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return Object.freeze({
+      ok: false,
+      contractVersion: WORKFLOW_CONTRACT_VERSION,
+      state,
+      diagnostics: Object.freeze([
+        diagnostic(
+          "workflow.event.idempotency_conflict",
+          "$.event.idempotencyKey",
+          "Idempotency key was already accepted for different Route escalation intent.",
+          "Reuse a key only for an identical retry, or submit a new stable key.",
+        ),
+      ]),
+    });
+  }
+
+  const requestDiagnostic = validateQuickEscalationRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return Object.freeze({
+      ok: false,
+      contractVersion: WORKFLOW_CONTRACT_VERSION,
+      state,
+      diagnostics: Object.freeze([requestDiagnostic]),
+    });
+  }
+
+  const tail = state.events[state.events.length - 1]!;
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: "build" as const,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "route_escalated" as const,
+    from: freezePosition(positionOf(state.projection)),
+    to: freezePosition({ lifecycle: "active", phase: "explore", step: "ready" }),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: copyGateAcceptances([request.routeGate]),
+    blockers: Object.freeze([] as string[]),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectRouteEscalatedEvent(state.projection, event);
+  const nextState = freezeState([...state.events, event], projection);
+
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: nextState,
+    event,
+  });
+}
+
 export function adoptWorkflowBaseline(
   state: WorkflowState,
   request: AdoptWorkflowBaselineRequest,
@@ -908,6 +1025,44 @@ export function replayWorkflowEvents(
       }
       const event = copyCreatedEvent(sourceEvent);
       projection = projectCreatedEvent(event);
+      acceptedEvents.push(event);
+      continue;
+    }
+
+    if (projection !== null && sourceEvent.type === "route_escalated") {
+      const routeGateDiagnostic =
+        sourceEvent.gates.length === 1
+          ? validateRouteGate("build", sourceEvent.gates[0])
+          : diagnostic(
+              "workflow.gate.unmet",
+              "$.routeGate",
+              "Route escalation requires exactly one Route Gate.",
+              "Provide human approval for the Build Route.",
+            );
+      if (
+        sourceEvent.taskId !== projection.id ||
+        projection.route !== "quick" ||
+        projection.lifecycle !== "active" ||
+        sourceEvent.route !== "build" ||
+        !positionsEqual(sourceEvent.from, positionOf(projection)) ||
+        sourceEvent.to.lifecycle !== "active" ||
+        sourceEvent.to.phase !== "explore" ||
+        sourceEvent.to.step !== "ready" ||
+        sourceEvent.blockers.length !== 0 ||
+        sourceEvent.initiativeGraph !== null ||
+        routeGateDiagnostic !== null
+      ) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Route escalation must move an active Quick to Build Explore with human Route approval.",
+            "Restore the accepted Quick-to-Build escalation Event.",
+          ),
+        );
+      }
+      const event = copyRouteEscalatedEvent(sourceEvent);
+      projection = projectRouteEscalatedEvent(projection, event);
       acceptedEvents.push(event);
       continue;
     }
@@ -1294,6 +1449,58 @@ function validateTransitionRequest(
   return validateEventMetadata(request.event, "$.event");
 }
 
+function validateQuickEscalationRequest(
+  state: WorkflowState,
+  request: EscalateQuickToBuildRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (request.taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Route escalation Task id does not match the current Projection.",
+      "Reload the intended Task and submit its stable id.",
+    );
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (request.expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${request.expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Projection and reconsider the Route escalation.",
+    );
+  }
+  if (state.projection.route !== "quick" || state.projection.lifecycle !== "active") {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.state",
+      "Only an active Quick may escalate to Build.",
+      "Resume the active Quick before requesting Route escalation.",
+    );
+  }
+  const routeGateDiagnostic = validateRouteGate("build", request.routeGate);
+  if (routeGateDiagnostic !== null) {
+    return { ...routeGateDiagnostic, path: "$.routeGate" };
+  }
+  return validateEventMetadata(request.event, "$.event");
+}
+
 function validateTransitionInvariants(
   projection: TaskProjection,
   events: readonly WorkflowEvent[],
@@ -1591,6 +1798,23 @@ function matchesTransitionIntent(
   );
 }
 
+function matchesRouteEscalationIntent(
+  event: RouteEscalatedEvent,
+  request: EscalateQuickToBuildRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.route === "build" &&
+    event.sequence === request.expectedVersion + 1 &&
+    stableJson(event.gates) === stableJson([request.routeGate]) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
+
+
 function matchesBaselineAdoptionIntent(
   event: BaselineAdoptedEvent,
   request: AdoptWorkflowBaselineRequest,
@@ -1688,7 +1912,7 @@ function validateReplayEvent(
   if (
     event.type === "task_created"
       ? event.from !== null || !isWorkflowTaskDefinition(event.task)
-      : event.type === "workflow_transitioned"
+      : event.type === "workflow_transitioned" || event.type === "route_escalated"
         ? !isWorkflowPosition(event.from)
         : event.type === "baseline_adopted"
           ? !isBaselineAdoptedEventPayload(event)
@@ -1700,7 +1924,7 @@ function validateReplayEvent(
       "workflow.event.invalid",
       path,
       "Workflow Event type payload is invalid.",
-      "Restore the required task_created, workflow_transitioned, or baseline_adopted payload.",
+      "Restore the required Workflow Event payload.",
     );
   }
   return validateEventMetadata(event, path);
@@ -2031,6 +2255,23 @@ function projectTransitionEvent(
   });
 }
 
+function projectRouteEscalatedEvent(
+  projection: TaskProjection,
+  event: RouteEscalatedEvent,
+): TaskProjection {
+  return Object.freeze({
+    ...projection,
+    route: "build",
+    lifecycle: event.to.lifecycle,
+    phase: event.to.phase,
+    step: event.to.step,
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    blockers: Object.freeze([] as string[]),
+    updatedAt: event.occurredAt,
+  });
+}
+
 function projectBaselineAdoptedEvent(
   projection: TaskProjection,
   event: BaselineAdoptedEvent,
@@ -2109,6 +2350,20 @@ function copyTransitionEvent(
     gates: copyGateAcceptances(event.gates),
     blockers: copyStrings(event.blockers),
     initiativeGraph,
+  });
+}
+
+function copyRouteEscalatedEvent(
+  event: RouteEscalatedEvent,
+): RouteEscalatedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: copyGateAcceptances(event.gates),
+    blockers: Object.freeze([] as string[]),
+    initiativeGraph: null,
   });
 }
 
@@ -2247,6 +2502,7 @@ function digestEvent(
   event:
     | Omit<TaskCreatedEvent, "chainDigest">
     | Omit<WorkflowTransitionedEvent, "chainDigest">
+    | Omit<RouteEscalatedEvent, "chainDigest">
     | Omit<BaselineAdoptedEvent, "chainDigest">
     | Omit<ContextManifestChangedEvent, "chainDigest">
     | WorkflowEvent,
