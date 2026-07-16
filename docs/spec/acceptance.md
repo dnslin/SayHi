@@ -123,7 +123,7 @@ Given any managed Task, when the model requests push, reset, stash, rebase, reve
 
 ### AC-0213 Quick without change
 
-Given a Quick analysis that makes no project change, when Finish occurs, then no durable Task directory is created.
+Given a Quick analysis that makes no project change, when Finish occurs, then no repository file, durable Task directory, or Git commit is created; its compact external runtime audit remains inspectable and archivable after process restart.
 
 ### AC-0214 Quick with change
 

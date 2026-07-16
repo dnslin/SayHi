@@ -151,7 +151,7 @@ SayHi consists of:
 - **FR-TASK-003:** Transitions MUST be optimistic, idempotent, schema-validated, and Gate-validated.
 - **FR-TASK-004:** A corrupt or lagging Projection MUST be recoverable from valid Events.
 - **FR-TASK-005:** The Core MUST reject transitions from stale versions or invalid Phases.
-- **FR-TASK-006:** Quick MUST create a compact durable record only when project changes are produced.
+- **FR-TASK-006:** A no-change Quick MUST create no Project Store Task directory and retain a compact, recoverable external runtime audit; a Quick creates a durable Project Store record only when project changes are produced.
 - **FR-TASK-007:** Completed work MUST pass Finish before archive.
 
 ### 8.4 Engineering content
