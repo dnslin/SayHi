@@ -2,12 +2,11 @@ import {
   advanceDurableTask,
   coreContract,
   createDurableTask,
-  type GateEvidenceKind,
+  readGateEvidenceKinds,
   type StartWorkflowTaskRequest,
   type TaskLifecycleFileSystem,
   type TransitionWorkflowRequest,
   type WorkflowEventMetadata,
-  type WorkflowGate,
   type WorkflowLifecycle,
   type WorkflowPhase,
   type WorkflowState,
@@ -143,7 +142,7 @@ export function taskLifecycleTransition(
       gate,
       evidence: [
         {
-          kind: taskLifecycleEvidenceKind(gate),
+          kind: readGateEvidenceKinds(gate)[0]!,
           reference: `evidence/${suffix}-${gate}.json`,
         },
       ],
@@ -193,25 +192,3 @@ export async function createCompletedDurableTask(
   return state;
 }
 
-function taskLifecycleEvidenceKind(gate: WorkflowGate): GateEvidenceKind {
-  switch (gate) {
-    case "route":
-    case "plan":
-    case "cancel":
-      return "human-approval";
-    case "review":
-    case "review-repair":
-      return "review";
-    case "explore":
-    case "implement":
-    case "integrate":
-    case "finish":
-    case "archive":
-      return "validation";
-    case "initiative-ready":
-    case "replan":
-    case "block":
-    case "resume":
-      return "workflow";
-  }
-}

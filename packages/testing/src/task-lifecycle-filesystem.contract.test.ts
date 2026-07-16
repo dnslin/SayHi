@@ -13,6 +13,7 @@ import {
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   initializeManagedProject,
   recoverDurableTask,
@@ -109,6 +110,31 @@ test("Node filesystem persists and recovers a Task across adapter instances", as
   }
   assert.equal((await readFile(eventsPath, "utf8")).startsWith(creationHistory), true);
 
+  const handoff = {
+    schemaVersion: 1,
+    taskId: TASK_ID,
+    phase: advanced.state.projection.phase,
+    step: advanced.state.projection.step,
+    projectionVersion: advanced.state.projection.version,
+    blockers: advanced.state.projection.blockers,
+    repositoryFingerprint: "sha256:workspace-state",
+    artifactReferences: ["context/explore.jsonl", "evidence/route.json"],
+    createdAt: "2026-07-15T13:00:00Z",
+  };
+  const recorded = await createDurableTaskHandoff({
+    fileSystem: initialFileSystem,
+    taskId: TASK_ID,
+    expectedVersion: advanced.state.projection.version,
+    repositoryFingerprint: handoff.repositoryFingerprint,
+    artifactReferences: handoff.artifactReferences,
+    createdAt: handoff.createdAt,
+  });
+  assert.equal(recorded.ok, true);
+  if (!recorded.ok) {
+    return;
+  }
+  assert.deepEqual(recorded.handoff, handoff);
+
   await rm(projectionPath);
   const restartedFileSystem = new NodeManagedProjectFileSystem(repository);
   const recovered = await recoverDurableTask({
@@ -125,6 +151,7 @@ test("Node filesystem persists and recovers a Task across adapter instances", as
     JSON.parse(await readFile(projectionPath, "utf8")),
     advanced.state.projection,
   );
+  assert.deepEqual(recovered.handoff, handoff);
 });
 
 test("Node filesystem archives a completed Task directory idempotently", async (t) => {

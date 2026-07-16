@@ -18,6 +18,7 @@ import {
 } from "./spec.js";
 import {
   readRouteDefinition,
+  readGateEvidenceKinds,
   adoptWorkflowBaseline,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -29,6 +30,7 @@ import {
   archiveDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   recoverDurableTask,
   readDurableTask,
@@ -226,6 +228,7 @@ export {
   WORKFLOW_CONTRACT_VERSION,
   adoptWorkflowBaseline,
   readRouteDefinition,
+  readGateEvidenceKinds,
   replayWorkflowEvents,
   startWorkflowTask,
   transitionWorkflow,
@@ -283,6 +286,7 @@ export {
   advanceDurableTask,
   adoptDurableTaskBaseline,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   recoverDurableTask,
   readDurableTask,
@@ -311,6 +315,9 @@ export type {
   AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
   CreateDurableTaskRequest,
+  CreateDurableTaskHandoffRequest,
+  CreateDurableTaskHandoffResult,
+  DurableTaskHandoff,
   CreateDurableTaskResult,
   DiagnoseDurableTasksRequest,
   DiagnoseDurableTasksResult,
@@ -356,6 +363,7 @@ export interface CoreContract {
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly createDurableTask: typeof createDurableTask;
+  readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly advanceDurableTask: typeof advanceDurableTask;
   readonly archiveDurableTask: typeof archiveDurableTask;
   readonly addDurableContextManifestEntry: typeof addDurableContextManifestEntry;
@@ -396,6 +404,7 @@ export const coreContract: CoreContract = Object.freeze({
   adoptWorkflowBaseline,
   recordContextManifestChange,
   createDurableTask,
+  createDurableTaskHandoff,
   advanceDurableTask,
   archiveDurableTask,
   addDurableContextManifestEntry,

@@ -114,6 +114,29 @@ The manifest does not contain credentials, machine-specific absolute paths, or s
 - Initiative parents MUST reference a graph before leaving Plan.
 - Initiative parents MUST NOT enter Implement unless an explicit Build node represents parent-owned implementation.
 
+### 4.2 Durable Task Handoff
+
+`tasks/<task-id>/handoff.json` records the durable session-continuity material for a Task at a safe boundary:
+
+```json
+{
+  "schemaVersion": 1,
+  "taskId": "opaque-task-id",
+  "phase": "implement",
+  "step": "writing",
+  "projectionVersion": 17,
+  "blockers": [],
+  "repositoryFingerprint": "sha256:...",
+  "artifactReferences": ["context/implement.jsonl", "evidence/implement-gate.json"],
+  "createdAt": "2026-07-14T00:00:00Z"
+}
+```
+
+- A Handoff MUST be created against the current expected Projection version while no conflicting Task operation holds the Task lock.
+- `taskId`, `phase`, `step`, `projectionVersion`, and `blockers` MUST match the recovered Projection exactly.
+- `repositoryFingerprint` and every `artifactReferences` entry MUST be non-empty. `createdAt` MUST be RFC 3339 UTC.
+- Recovery MUST return the matching Handoff with the Projection. A missing Handoff is allowed; an invalid or stale Handoff MUST fail recovery without rewriting accepted Event history.
+
 ## 5. Workflow Events
 
 `events.jsonl` is append-only. A normal transition Event is:

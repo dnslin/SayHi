@@ -486,6 +486,12 @@ export function readRouteDefinition(route: WorkflowRoute): RouteDefinition {
   return routeDefinitions[route];
 }
 
+export function readGateEvidenceKinds(
+  gate: WorkflowGate,
+): readonly GateEvidenceKind[] {
+  return evidenceKindsByGate[gate];
+}
+
 export function startWorkflowTask(
   request: StartWorkflowTaskRequest,
 ): StartWorkflowTaskResult {

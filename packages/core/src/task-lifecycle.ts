@@ -110,7 +110,8 @@ export type TaskLifecycleDiagnosticCode =
   | "context_manifest.source.duplicate"
   | "context_manifest.approval_required"
   | "context_manifest.entry.missing"
-  | "context_manifest.stale";
+  | "context_manifest.stale"
+  | "task_lifecycle.handoff.invalid";
 
 export interface TaskLifecycleDiagnostic {
   readonly code: TaskLifecycleDiagnosticCode;
@@ -137,6 +138,27 @@ export interface ArchiveDurableTaskRequest {
 export interface RecoverDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly taskId: string;
+}
+
+export interface CreateDurableTaskHandoffRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly repositoryFingerprint: string;
+  readonly artifactReferences: readonly string[];
+  readonly createdAt: string;
+}
+
+export interface DurableTaskHandoff {
+  readonly schemaVersion: 1;
+  readonly taskId: string;
+  readonly phase: WorkflowPhase;
+  readonly step: string;
+  readonly projectionVersion: number;
+  readonly blockers: readonly string[];
+  readonly repositoryFingerprint: string;
+  readonly artifactReferences: readonly string[];
+  readonly createdAt: string;
 }
 export interface ReadDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
@@ -327,6 +349,15 @@ export type RecoverDurableTaskResult =
       contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
       state: WorkflowState;
       recovered: boolean;
+      handoff: DurableTaskHandoff | null;
+    }>
+  | TaskLifecycleFailure;
+
+export type CreateDurableTaskHandoffResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      handoff: DurableTaskHandoff;
     }>
   | TaskLifecycleFailure;
 
@@ -359,6 +390,7 @@ interface TaskPaths {
   readonly archiveTaskDirectory: string;
   readonly eventsPath: string;
   readonly projectionPath: string;
+  readonly handoffPath: string;
   readonly lockPath: string;
 }
 
@@ -467,6 +499,18 @@ export async function archiveDurableTask(
   );
 }
 
+export async function createDurableTaskHandoff(
+  request: CreateDurableTaskHandoffRequest,
+): Promise<CreateDurableTaskHandoffResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    createDurableTaskHandoffLocked(request, paths),
+  );
+}
+
 export async function recoverDurableTask(
   request: RecoverDurableTaskRequest,
 ): Promise<RecoverDurableTaskResult> {
@@ -475,7 +519,7 @@ export async function recoverDurableTask(
     return paths;
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-    recoverDurableTaskLocked(request),
+    recoverDurableTaskLocked(request, paths),
   );
 }
 
@@ -1334,6 +1378,7 @@ async function advanceDurableTaskLocked(
 
 async function recoverDurableTaskLocked(
   request: RecoverDurableTaskRequest,
+  paths: TaskPaths,
 ): Promise<RecoverDurableTaskResult> {
   const loaded = await loadTask(request.fileSystem, request.taskId);
   if (!loaded.ok) {
@@ -1345,14 +1390,68 @@ async function recoverDurableTaskLocked(
       loaded.projectionPath,
       loaded.state.projection,
     );
+    const handoff = await loadDurableTaskHandoff(
+      request.fileSystem,
+      paths.handoffPath,
+      loaded.state,
+    );
+    if (!handoff.ok) {
+      return handoff;
+    }
     return Object.freeze({
       ok: true,
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       state: loaded.state,
       recovered,
+      handoff: handoff.value,
     });
   } catch {
     return ioFailure(loaded.projectionPath);
+  }
+}
+
+async function createDurableTaskHandoffLocked(
+  request: CreateDurableTaskHandoffRequest,
+  paths: TaskPaths,
+): Promise<CreateDurableTaskHandoffResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  if (loaded.state.projection.version !== request.expectedVersion) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedVersion",
+        "The durable Task changed before its Handoff could be recorded.",
+        "Reload the current Projection and retry with its version.",
+      ),
+    ]);
+  }
+  const invalid = validateHandoffInput(request);
+  if (invalid !== null) {
+    return invalid;
+  }
+  const handoff = Object.freeze({
+    schemaVersion: 1 as const,
+    taskId: loaded.state.projection.id,
+    phase: loaded.state.projection.phase,
+    step: loaded.state.projection.step,
+    projectionVersion: loaded.state.projection.version,
+    blockers: Object.freeze([...loaded.state.projection.blockers]),
+    repositoryFingerprint: request.repositoryFingerprint,
+    artifactReferences: Object.freeze([...request.artifactReferences]),
+    createdAt: request.createdAt,
+  });
+  try {
+    await request.fileSystem.writeFile(paths.handoffPath, serializeHandoff(handoff));
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      handoff,
+    });
+  } catch {
+    return ioFailure(paths.handoffPath);
   }
 }
 
@@ -1421,14 +1520,14 @@ async function archiveDurableTaskLocked(
         archived.state,
         request.transition,
       );
-      if (repeated !== null) {
+      if (!repeated.ok) {
         return repeated;
       }
       return Object.freeze({
         ok: true,
         contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
         state: archived.state,
-        moved: false,
+        moved: repeated.matchesAcceptedEvent,
       });
     }
 
@@ -1439,7 +1538,7 @@ async function archiveDurableTaskLocked(
     let state = loaded.state;
     if (state.projection.lifecycle === "archived") {
       const repeated = validateRepeatedArchiveTransition(state, request.transition);
-      if (repeated !== null) {
+      if (!repeated.ok) {
         return repeated;
       }
       failurePath = loaded.projectionPath;
@@ -1486,16 +1585,20 @@ async function archiveDurableTaskLocked(
 function validateRepeatedArchiveTransition(
   state: WorkflowState,
   transition: TransitionWorkflowRequest,
-): TaskLifecycleFailure | null {
+):
+  | Readonly<{ ok: true; matchesAcceptedEvent: boolean }>
+  | TaskLifecycleFailure {
   if (
     !state.events.some(
       (event) => event.idempotencyKey === transition.event.idempotencyKey,
     )
   ) {
-    return null;
+    return Object.freeze({ ok: true, matchesAcceptedEvent: false });
   }
   const retried = transitionWorkflow(state, transition);
-  return retried.ok ? null : failure(retried.diagnostics);
+  return retried.ok
+    ? Object.freeze({ ok: true, matchesAcceptedEvent: true })
+    : failure(retried.diagnostics);
 }
 
 async function adoptDurableTaskBaselineLocked(
@@ -2186,6 +2289,7 @@ function taskPaths(taskId: string):
     eventsPath: `${taskDirectory}/events.jsonl`,
     projectionPath: `${taskDirectory}/task.json`,
     lockPath: `.sayhi/.runtime/task-${taskId}.lock`,
+    handoffPath: `${taskDirectory}/handoff.json`,
   });
 }
 
@@ -2205,6 +2309,156 @@ function serializeEvent(event: WorkflowEvent): string {
 
 function serializeProjection(projection: TaskProjection): string {
   return `${JSON.stringify(projection, null, 2)}\n`;
+}
+
+function serializeHandoff(handoff: DurableTaskHandoff): string {
+  return `${JSON.stringify(handoff, null, 2)}\n`;
+}
+
+async function loadDurableTaskHandoff(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  state: WorkflowState,
+): Promise<
+  | Readonly<{ ok: true; value: DurableTaskHandoff | null }>
+  | TaskLifecycleFailure
+> {
+  try {
+    const entry = await fileSystem.inspect(path);
+    if (entry.kind === "missing") {
+      return Object.freeze({ ok: true, value: null });
+    }
+    if (entry.kind !== "file") {
+      return invalidHandoff(
+        path,
+        "The durable Task Handoff is missing or unsafe.",
+        "Restore handoff.json as a regular file or remove it before retrying.",
+      );
+    }
+    return parseDurableTaskHandoff(path, await fileSystem.readFile(path), state);
+  } catch {
+    return ioFailure(path);
+  }
+}
+
+function parseDurableTaskHandoff(
+  path: string,
+  content: string,
+  state: WorkflowState,
+): Readonly<{ ok: true; value: DurableTaskHandoff }> | TaskLifecycleFailure {
+  let value: unknown;
+  try {
+    value = JSON.parse(content);
+  } catch {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff is not valid JSON.",
+      "Restore a complete handoff.json file before retrying.",
+    );
+  }
+  if (!isHandoffRecord(value)) {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff does not match the recovered Task state.",
+      "Record a new Handoff at the current durable Task version before retrying.",
+    );
+  }
+  if (
+    value.schemaVersion !== 1 ||
+    value.taskId !== state.projection.id ||
+    value.phase !== state.projection.phase ||
+    value.step !== state.projection.step ||
+    value.projectionVersion !== state.projection.version ||
+    !sameStrings(value.blockers, state.projection.blockers) ||
+    typeof value.repositoryFingerprint !== "string" ||
+    value.repositoryFingerprint.trim().length === 0 ||
+    !isNonEmptyStringArray(value.artifactReferences) ||
+    !isRfc3339Timestamp(value.createdAt)
+  ) {
+    return invalidHandoff(
+      path,
+      "The durable Task Handoff does not match the recovered Task state.",
+      "Record a new Handoff at the current durable Task version before retrying.",
+    );
+  }
+  return Object.freeze({
+    ok: true,
+    value: Object.freeze({
+      schemaVersion: 1 as const,
+      taskId: state.projection.id,
+      phase: state.projection.phase,
+      step: state.projection.step,
+      projectionVersion: state.projection.version,
+      blockers: Object.freeze([...state.projection.blockers]),
+      repositoryFingerprint: value.repositoryFingerprint,
+      artifactReferences: Object.freeze([...value.artifactReferences]),
+      createdAt: value.createdAt,
+    }),
+  });
+}
+
+function validateHandoffInput(
+  request: CreateDurableTaskHandoffRequest,
+): TaskLifecycleFailure | null {
+  if (request.repositoryFingerprint.trim().length === 0) {
+    return invalidHandoff(
+      "$.repositoryFingerprint",
+      "A Handoff requires the current repository fingerprint.",
+      "Provide the fingerprint captured at the safe Handoff boundary.",
+    );
+  }
+  if (!isNonEmptyStringArray(request.artifactReferences)) {
+    return invalidHandoff(
+      "$.artifactReferences",
+      "A Handoff requires non-empty artifact references.",
+      "Provide the Context, Evidence, or other durable artifact references needed to resume.",
+    );
+  }
+  if (!isRfc3339Timestamp(request.createdAt)) {
+    return invalidHandoff(
+      "$.createdAt",
+      "A Handoff requires an RFC 3339 UTC creation time.",
+      "Record the Handoff with its UTC creation time.",
+    );
+  }
+  return null;
+}
+
+function isHandoffRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function sameStrings(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((item, index) => item === expected[index])
+  );
+}
+
+function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((item) => typeof item === "string" && item.trim().length > 0)
+  );
+}
+
+function isRfc3339Timestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function invalidHandoff(
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([
+    diagnostic("task_lifecycle.handoff.invalid", path, message, remediation),
+  ]);
 }
 
 function prefixWorkflowDiagnostic(

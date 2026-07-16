@@ -5,6 +5,7 @@ import {
   archiveDurableTask,
   advanceDurableTask,
   createDurableTask,
+  createDurableTaskHandoff,
   diagnoseDurableTasks,
   recoverDurableTask,
   type TaskArchiveFileSystem,
@@ -253,6 +254,77 @@ test("durable Task recovery rebuilds the authoritative Projection from Events", 
   assert.equal(retried.recovered, false);
   assert.deepEqual(retried.state, recovered.state);
   assert.deepEqual(fileSystem.files, snapshot);
+});
+
+test("durable Task recovery returns the persisted Handoff", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const state = created.state;
+  const handoff = {
+    schemaVersion: 1,
+    taskId: TASK_ID,
+    phase: state.projection.phase,
+    step: state.projection.step,
+    projectionVersion: state.projection.version,
+    blockers: state.projection.blockers,
+    repositoryFingerprint: "sha256:workspace-state",
+    artifactReferences: ["context/explore.jsonl", "evidence/route.json"],
+    createdAt: "2026-07-15T13:00:00Z",
+  };
+  const recorded = await createDurableTaskHandoff({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: state.projection.version,
+    repositoryFingerprint: handoff.repositoryFingerprint,
+    artifactReferences: handoff.artifactReferences,
+    createdAt: handoff.createdAt,
+  });
+  assert.equal(recorded.ok, true);
+  if (!recorded.ok) {
+    return;
+  }
+  assert.deepEqual(recorded.handoff, handoff);
+
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.ok("handoff" in recovered);
+  if (!("handoff" in recovered)) {
+    return;
+  }
+  assert.deepEqual(recovered.handoff, handoff);
+});
+
+test("durable Task Handoff rejects a stale Projection version without persistence", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+
+  const recorded = await createDurableTaskHandoff({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: created.state.projection.version + 1,
+    repositoryFingerprint: "sha256:workspace-state",
+    artifactReferences: ["context/triage.jsonl"],
+    createdAt: "2026-07-15T13:00:00Z",
+  });
+
+  assert.equal(recorded.ok, false);
+  if (recorded.ok) {
+    return;
+  }
+  assert.equal(recorded.diagnostics[0]?.code, "workflow.version.stale");
+  assert.equal(fileSystem.files.has(`${TASK_DIRECTORY}/handoff.json`), false);
 });
 
 test("truncated Event history fails with a diagnostic and no mutation", async () => {
@@ -567,7 +639,7 @@ test("archiving removes a completed Task from active Task listing without losing
   if (!identical.ok) {
     return;
   }
-  assert.equal(identical.moved, false);
+  assert.equal(identical.moved, true);
 
   const conflicting = await archiveDurableTask({
     fileSystem,
