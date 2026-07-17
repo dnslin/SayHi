@@ -2,9 +2,12 @@ import {
   advanceDurableTask,
   coreContract,
   createDurableTask,
+  decideDurableBuildPlan,
+  freezeDurableContextManifest,
   readGateEvidenceKinds,
+  recordDurableBuildPlan,
+  type ContextManifestFileSystem,
   type StartWorkflowTaskRequest,
-  type TaskLifecycleFileSystem,
   type TransitionWorkflowRequest,
   type WorkflowEventMetadata,
   type WorkflowLifecycle,
@@ -152,7 +155,7 @@ export function taskLifecycleTransition(
 }
 
 export async function createCompletedDurableTask(
-  fileSystem: TaskLifecycleFileSystem,
+  fileSystem: ContextManifestFileSystem,
   fixture: TaskLifecycleFixture,
   createdAt: string,
   transitionedAt: string,
@@ -168,7 +171,68 @@ export async function createCompletedDurableTask(
   for (const [lifecycle, phase] of [
     ["active", "explore"],
     ["active", "plan"],
-    ["active", "implement"],
+  ] as const) {
+    const advanced = await advanceDurableTask({
+      fileSystem,
+      transition: taskLifecycleTransition(
+        fixture,
+        state,
+        lifecycle,
+        phase,
+        `${lifecycle}-${phase}`,
+        transitionedAt,
+      ),
+    });
+    if (!advanced.ok) {
+      throw new Error(advanced.diagnostics[0]?.message ?? "Task advancement failed");
+    }
+    state = advanced.state;
+  }
+  const frozen = await freezeDurableContextManifest({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: state.projection.version,
+    phase: "implement",
+    event: taskLifecycleEventMetadata(fixture, "IMPLEMENT-CONTEXT", transitionedAt),
+  });
+  if (!frozen.ok) {
+    throw new Error(frozen.diagnostics[0]?.message ?? "Context freeze failed");
+  }
+  const planned = await recordDurableBuildPlan({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: frozen.state.projection.version,
+    content: `# ${fixture.title}\n\n${fixture.goal}\n`,
+    event: taskLifecycleEventMetadata(fixture, "PLAN-RECORDED", transitionedAt),
+  });
+  if (!planned.ok) {
+    throw new Error(planned.diagnostics[0]?.message ?? "Plan recording failed");
+  }
+  const approved = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: fixture.taskId,
+    expectedVersion: planned.state.projection.version,
+    decision: "approved",
+    planIdentity: planned.plan.identity,
+    contextManifestIdentity: planned.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(fixture, "PLAN-APPROVED", transitionedAt),
+      actor: {
+        kind: "user",
+        id: "sayhi-test-user",
+        sessionRef: fixture.sessionRef,
+      },
+    },
+  });
+  if (!approved.ok || approved.decision !== "approved") {
+    throw new Error(
+      !approved.ok
+        ? approved.diagnostics[0]?.message ?? "Plan approval failed"
+        : "Plan approval was rejected",
+    );
+  }
+  state = approved.state;
+  for (const [lifecycle, phase] of [
     ["active", "review"],
     ["active", "finish"],
     ["completed", "finish"],

@@ -24,6 +24,7 @@ import {
   startWorkflowTask,
   escalateQuickToBuild,
   recordContextManifestChange,
+  recordBuildPlanChange,
   transitionWorkflow,
 } from "./workflow.js";
 import {
@@ -46,6 +47,8 @@ import {
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
   inspectDurableContextManifest,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
   inspectDurableInitiativeGraph,
 } from "./task-lifecycle.js";
 
@@ -170,6 +173,12 @@ export type {
 
 export type { ContractIdentity } from "./identity.js";
 
+export { DURABLE_BUILD_PLAN_SCHEMA_VERSION } from "./build-plan.js";
+export type {
+  DurableBuildPlan,
+  ParseDurableBuildPlanResult,
+} from "./build-plan.js";
+
 export { CONTEXT_MANIFEST_CONTRACT_VERSION } from "./context-manifest.js";
 export type { ContextManifestDiagnostic } from "./context-manifest.js";
 export {
@@ -241,6 +250,7 @@ export {
   escalateQuickToBuild,
   transitionWorkflow,
   recordContextManifestChange,
+  recordBuildPlanChange,
 } from "./workflow.js";
 export type {
   DependencyGraph,
@@ -254,12 +264,16 @@ export type {
   AdoptWorkflowBaselineRequest,
   AdoptWorkflowBaselineResult,
   BaselineAdoptedEvent,
+  BuildPlanChange,
+  BuildPlanChangedEvent,
   ContextManifestChange,
   ContextManifestChangedEvent,
   EscalateQuickToBuildRequest,
   EscalateQuickToBuildResult,
   RecordContextManifestChangeRequest,
   RecordContextManifestChangeResult,
+  RecordBuildPlanChangeRequest,
+  RecordBuildPlanChangeResult,
   BaselineAdoptedPath,
   RouteDefinition,
   RouteEscalatedEvent,
@@ -312,6 +326,8 @@ export {
   inspectDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
 } from "./task-lifecycle.js";
 export type {
   ArchiveDurableTaskRequest,
@@ -369,6 +385,10 @@ export type {
   ScopedTaskWriter,
   WithDurableTaskWriterRequest,
   WithDurableTaskWriterResult,
+  DecideDurableBuildPlanRequest,
+  DecideDurableBuildPlanResult,
+  RecordDurableBuildPlanRequest,
+  RecordDurableBuildPlanResult,
 } from "./task-lifecycle.js";
 
 export interface BootstrapContract {
@@ -397,6 +417,7 @@ export interface CoreContract {
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
+  readonly recordBuildPlanChange: typeof recordBuildPlanChange;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly readDurableQuickResult: typeof readDurableQuickResult;
@@ -417,6 +438,8 @@ export interface CoreContract {
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
+  readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
+  readonly recordDurableBuildPlan: typeof recordDurableBuildPlan;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -445,6 +468,7 @@ export const coreContract: CoreContract = Object.freeze({
   replayWorkflowEvents,
   adoptWorkflowBaseline,
   recordContextManifestChange,
+  recordBuildPlanChange,
   createDurableTask,
   createDurableTaskHandoff,
   readDurableQuickResult,
@@ -465,4 +489,6 @@ export const coreContract: CoreContract = Object.freeze({
   withDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  decideDurableBuildPlan,
+  recordDurableBuildPlan,
 });

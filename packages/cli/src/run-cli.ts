@@ -181,6 +181,32 @@ interface ParsedContextArguments {
 }
 
 type ContextArgumentResult = ParsedContextArguments | InvalidCliArguments;
+
+type PlanSubcommand = "approve" | "record" | "reject";
+interface ParsedPlanArguments {
+  readonly ok: true;
+  readonly command: "plan";
+  readonly subcommand: PlanSubcommand;
+  readonly cwd: string;
+  readonly json: boolean;
+  readonly taskId: string;
+  readonly source: string;
+}
+type PlanArgumentResult = ParsedPlanArguments | InvalidCliArguments;
+
+interface PlanRecordRequest {
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly content: string;
+  readonly event: WorkflowEventMetadata;
+}
+interface PlanDecisionRequest {
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly planIdentity: string;
+  readonly contextManifestIdentity: string;
+  readonly event: WorkflowEventMetadata;
+}
 type TaskSubcommand =
   | "adopt"
   | "advance"
@@ -259,6 +285,18 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           2,
           context.message,
           "Run sayhi context add, list, or validate.",
+          args.includes("--json"),
+        );
+  }
+  const plan = parsePlanArguments(args);
+  if (plan !== null) {
+    return plan.ok
+      ? runPlanCli(plan)
+      : cliFailure(
+          "plan",
+          2,
+          plan.message,
+          "Run sayhi plan record, approve, or reject <task-id> --from <request.json>.",
           args.includes("--json"),
         );
   }
@@ -617,6 +655,99 @@ async function runContextCli(
           );
     }
   }
+}
+
+async function runPlanCli(parsed: ParsedPlanArguments): Promise<CliRunResult> {
+  const operation = `plan.${parsed.subcommand}`;
+  const repositoryRoot = await resolveCliRepositoryRoot(
+    parsed.cwd,
+    operation,
+    parsed.json,
+  );
+  if (typeof repositoryRoot !== "string") {
+    return repositoryRoot;
+  }
+  const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
+  const request = await readTaskJsonRequest(
+    fileSystem,
+    parsed.source,
+    operation,
+    parsed.json,
+  );
+  if (!request.ok) {
+    return request.result;
+  }
+  const taskIdFailure = taskRequestIdFailure(
+    request.value,
+    parsed.taskId,
+    operation,
+    parsed.json,
+  );
+  if (taskIdFailure !== undefined) {
+    return taskIdFailure;
+  }
+  if (parsed.subcommand === "record") {
+    const record = parsePlanRecordRequest(request.value);
+    if (record === null) {
+      return taskRequestFailure(
+        operation,
+        "Plan record request requires expectedVersion, content, and Event metadata.",
+        parsed.json,
+      );
+    }
+    const result = await coreContract.recordDurableBuildPlan({
+      fileSystem,
+      taskId: record.taskId,
+      expectedVersion: record.expectedVersion,
+      content: record.content,
+      event: record.event,
+    });
+    return result.ok
+      ? cliSuccess(
+          operation,
+          Object.freeze({
+            taskId: record.taskId,
+            projection: result.state.projection,
+            plan: result.plan,
+            created: result.created,
+            event: result.event,
+            appended: result.appended,
+          }),
+          parsed.json,
+        )
+      : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
+  }
+  const decision = parsePlanDecisionRequest(request.value);
+  if (decision === null) {
+    return taskRequestFailure(
+      operation,
+      "Plan decision request requires expectedVersion, Plan and Context Manifest identities, and Event metadata.",
+      parsed.json,
+    );
+  }
+  const result = await coreContract.decideDurableBuildPlan({
+    fileSystem,
+    taskId: decision.taskId,
+    expectedVersion: decision.expectedVersion,
+    decision: parsed.subcommand === "approve" ? "approved" : "rejected",
+    planIdentity: decision.planIdentity,
+    contextManifestIdentity: decision.contextManifestIdentity,
+    event: decision.event,
+  });
+  return result.ok
+    ? cliSuccess(
+        operation,
+        Object.freeze({
+          taskId: decision.taskId,
+          decision: result.decision,
+          projection: result.state.projection,
+          plan: result.plan,
+          event: result.event,
+          appended: result.appended,
+        }),
+        parsed.json,
+      )
+    : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
 }
 
 
@@ -2052,6 +2183,61 @@ function taskRequestFailure(
   );
 }
 
+function parsePlanRecordRequest(value: Record<string, unknown>): PlanRecordRequest | null {
+  return (
+    typeof value.taskId === "string" &&
+    typeof value.expectedVersion === "number" &&
+    Number.isSafeInteger(value.expectedVersion) &&
+    typeof value.content === "string" &&
+    isWorkflowEventMetadata(value.event)
+  )
+    ? Object.freeze({
+        taskId: value.taskId,
+        expectedVersion: value.expectedVersion,
+        content: value.content,
+        event: value.event,
+      })
+    : null;
+}
+
+function parsePlanDecisionRequest(
+  value: Record<string, unknown>,
+): PlanDecisionRequest | null {
+  return (
+    typeof value.taskId === "string" &&
+    typeof value.expectedVersion === "number" &&
+    Number.isSafeInteger(value.expectedVersion) &&
+    typeof value.planIdentity === "string" &&
+    typeof value.contextManifestIdentity === "string" &&
+    isWorkflowEventMetadata(value.event)
+  )
+    ? Object.freeze({
+        taskId: value.taskId,
+        expectedVersion: value.expectedVersion,
+        planIdentity: value.planIdentity,
+        contextManifestIdentity: value.contextManifestIdentity,
+        event: value.event,
+      })
+    : null;
+}
+
+function isWorkflowEventMetadata(value: unknown): value is WorkflowEventMetadata {
+  return (
+    isRecord(value) &&
+    typeof value.eventId === "string" &&
+    typeof value.reason === "string" &&
+    typeof value.idempotencyKey === "string" &&
+    typeof value.occurredAt === "string" &&
+    isRecord(value.actor) &&
+    (value.actor.kind === "agent" ||
+      value.actor.kind === "orchestrator" ||
+      value.actor.kind === "system" ||
+      value.actor.kind === "user") &&
+    typeof value.actor.id === "string" &&
+    typeof value.actor.sessionRef === "string"
+  );
+}
+
 async function resolveCliRepositoryRoot(
   cwd: string,
   operation: string,
@@ -2729,6 +2915,64 @@ function parseContextArguments(
     taskId,
     ...(phase === undefined ? {} : { phase }),
   };
+}
+
+function parsePlanArguments(args: readonly string[]): PlanArgumentResult | null {
+  if (leadingCliCommand(args) !== "plan") {
+    return null;
+  }
+  let cwd = process.cwd();
+  let json = false;
+  let source: string | undefined;
+  let planCount = 0;
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (isGlobalPresentationOption(argument)) {
+      continue;
+    }
+    if (argument === "--cwd" || argument === "--from") {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, message: `${argument} requires a path.` };
+      }
+      if (argument === "--cwd") {
+        cwd = value;
+      } else if (source !== undefined) {
+        return { ok: false, message: "Specify --from exactly once." };
+      } else {
+        source = value;
+      }
+      index += 1;
+      continue;
+    }
+    if (argument === "plan") {
+      planCount += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      return { ok: false, message: `Unknown argument: ${argument}` };
+    }
+    values.push(argument);
+  }
+  if (planCount !== 1) {
+    return { ok: false, message: "Specify exactly one plan command." };
+  }
+  const [subcommand, taskId, extra] = values;
+  if (subcommand !== "record" && subcommand !== "approve" && subcommand !== "reject") {
+    return { ok: false, message: "Plan command is not supported." };
+  }
+  if (taskId === undefined || extra !== undefined || source === undefined) {
+    return {
+      ok: false,
+      message: `plan ${subcommand} requires <task-id> and --from <request.json>.`,
+    };
+  }
+  return { ok: true, command: "plan", subcommand, cwd, json, taskId, source };
 }
 
 

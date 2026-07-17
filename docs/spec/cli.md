@@ -88,6 +88,10 @@ sayhi task complete <task-id> --from <transition-request.json>
 sayhi task archive <task-id> --from <transition-request.json>
 sayhi task recover <task-id> --apply
 
+sayhi plan record <task-id> --from <plan-record-request.json>
+sayhi plan approve <task-id> --from <plan-decision-request.json>
+sayhi plan reject <task-id> --from <plan-decision-request.json>
+
 sayhi quick complete --from <completion-request.json>
 sayhi quick show <task-id>
 sayhi quick archive <task-id> --from <transition-request.json>
@@ -101,6 +105,8 @@ A completion request with a non-empty `writes` array of `{ path, content }` obje
 Every persisted no-change audit MUST record `outcome: "no-change"`; `quick complete`, `quick show`, and `quick archive` return that validated outcome in their JSON result.
 
 `task create`, `task advance`, `task block`, `task unblock`, `task complete`, and `task archive` read their request JSON from a regular, repository-relative file. The CLI transports that request to Core; Core remains the sole validator of Task state, versions, Gates, Events, and archive eligibility.
+
+`plan record` is available only to an active Build in Plan with a frozen Implement Context Manifest. It stores the current requirements snapshot, reviewable Plan text, and frozen Manifest identity as immutable hash-named Task evidence, then appends an attributable `build_plan_changed` Event binding those exact identities. `plan reject` appends an equally bound `rejected` Event, leaves the Task in Plan, and seals that Plan until a revised Plan is recorded. `plan approve` requires a `user` Event actor, the exact returned Plan and Context Manifest identities, an accepted record Event for that exact Plan, and the still-current frozen Context Manifest; it is the only CLI path from Build Plan to Implement. Its human-approval Gate evidence persists both `plans/<plan-hash>.json` and `<manifest-path>#<manifest-hash>`. `task advance` MUST reject that transition. Each successful Plan command returns the current Projection and material Event so the next request uses its version. Stale Context Manifest content rejects approval before any Implement Event is appended.
 
 ### 4.3 Baseline and Git
 
