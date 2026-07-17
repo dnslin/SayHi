@@ -23,11 +23,20 @@ import type {
   ManagedProjectPathKind,
   TaskBaselineCaptureRequest,
   TaskBaselineFileSystem,
+  TaskCommitPort,
+  TaskCommitRepositoryState,
+  TaskCommitRequest,
+  TaskCommitResult,
   TaskWriter,
 } from "@dnslin/sayhi-core";
 
+const TASK_BASELINE_EXCLUDED_PREFIXES = [
+  ".sayhi/tasks",
+  ".sayhi/.runtime",
+] as const;
+
 export class NodeManagedProjectFileSystem
-  implements ManagedProjectMutationFileSystem, TaskBaselineFileSystem
+  implements ManagedProjectMutationFileSystem, TaskBaselineFileSystem, TaskCommitPort
 {
   readonly #repositoryRoot: string;
 
@@ -124,11 +133,9 @@ export class NodeManagedProjectFileSystem
   async captureBaseline(
     request: TaskBaselineCaptureRequest,
   ): Promise<BaselineRecord> {
-    const excludedPrefixes = [
-      ".sayhi/tasks",
-      ".sayhi/.runtime",
-    ];
+    const excludedPrefixes = TASK_BASELINE_EXCLUDED_PREFIXES;
     const [
+      repositoryRoot,
       head,
       stagedPaths,
       unstagedPaths,
@@ -136,6 +143,7 @@ export class NodeManagedProjectFileSystem
       ignoredPaths,
       submodules,
     ] = await Promise.all([
+      realpath(this.#repositoryRoot),
       readGitHead(this.#repositoryRoot),
       listGitPaths(this.#repositoryRoot, [
         "diff",
@@ -234,7 +242,7 @@ export class NodeManagedProjectFileSystem
     return Object.freeze({
       schemaVersion: 1,
       capturedAt: new Date().toISOString(),
-      repositoryRootIdentity: digestBytes(Buffer.from(this.#repositoryRoot)),
+      repositoryRootIdentity: digestBytes(Buffer.from(repositoryRoot)),
       head,
       indexDigest: digestNamedBuffers(
         trackedChanges.map((change) => ({
@@ -260,6 +268,95 @@ export class NodeManagedProjectFileSystem
       }),
     });
   }
+  async inspectRepository(): Promise<TaskCommitRepositoryState> {
+    const [head, stagedPaths] = await Promise.all([
+      readGitHead(this.#repositoryRoot),
+      listGitPaths(this.#repositoryRoot, [
+        "diff",
+        "--cached",
+        "--name-only",
+        "-z",
+        "--no-renames",
+      ]),
+    ]);
+    return Object.freeze({
+      head,
+      stagedPaths: Object.freeze(
+        stagedPaths.filter((path) => !isTaskCommitExcludedPath(path)).sort(),
+      ),
+    });
+  }
+
+  async commit(request: TaskCommitRequest): Promise<TaskCommitResult> {
+    const paths = Object.freeze([...new Set(request.paths)].sort());
+    if (paths.length === 0) {
+      throw new Error("Constrained Task commit requires at least one path.");
+    }
+    for (const path of paths) {
+      this.#resolveRepositoryPath(path);
+    }
+    const head = await readGitHead(this.#repositoryRoot);
+    if (head !== request.expectedHead) {
+      throw new Error("Repository HEAD changed before constrained Task commit.");
+    }
+    const currentBaseline = await this.captureBaseline({
+      taskId: "task-commit",
+      declaredScope: request.expectedBaseline.declaredScope,
+      adoptedPaths: request.expectedBaseline.adoptedPaths,
+    });
+    if (!sameBaselineMaterial(request.expectedBaseline, currentBaseline)) {
+      throw new Error("Repository state changed before constrained Task commit.");
+    }
+    const stagedTaskPaths = await listGitPaths(this.#repositoryRoot, [
+      "diff",
+      "--cached",
+      "--name-only",
+      "-z",
+      "--no-renames",
+      "--",
+      ...paths,
+    ]);
+    if (stagedTaskPaths.length > 0) {
+      throw new Error("Task-owned paths already contain staged content.");
+    }
+    await runGit(this.#repositoryRoot, ["add", "--all", "--", ...paths]);
+    await runGit(this.#repositoryRoot, [
+      "commit",
+      "--no-verify",
+      "--only",
+      "-m",
+      request.message,
+      "--",
+      ...paths,
+    ]);
+    const commit = await readGitHead(this.#repositoryRoot);
+    if (commit === null) {
+      throw new Error("Constrained Task commit did not produce a Git HEAD.");
+    }
+    const parent = (await runGit(this.#repositoryRoot, ["rev-parse", `${commit}^`]))
+      .toString("utf8")
+      .trim();
+    const committedPaths = await listGitPaths(this.#repositoryRoot, [
+      "diff-tree",
+      "--no-commit-id",
+      "--name-only",
+      "-r",
+      "-z",
+      commit,
+    ]);
+    const finalBaseline = await this.captureBaseline({
+      taskId: "task-commit",
+      declaredScope: request.expectedBaseline.declaredScope,
+      adoptedPaths: request.expectedBaseline.adoptedPaths,
+    });
+    return Object.freeze({
+      commit,
+      parent: parent.length === 0 ? null : parent,
+      paths: Object.freeze([...committedPaths].sort()),
+      finalBaseline,
+    });
+  }
+
 
   async withWriterMutationLock<Result>(
     operation: (writer: TaskWriter) => Promise<Result>,
@@ -482,6 +579,21 @@ async function listGitPaths(
       .filter((path) => path.length > 0),
   );
 }
+function isTaskCommitExcludedPath(path: string): boolean {
+  return isExcludedBaselinePath(path, TASK_BASELINE_EXCLUDED_PREFIXES);
+}
+
+function sameBaselineMaterial(
+  expected: BaselineRecord,
+  observed: BaselineRecord,
+): boolean {
+  const { capturedAt: expectedCapturedAt, ...expectedMaterial } = expected;
+  const { capturedAt: observedCapturedAt, ...observedMaterial } = observed;
+  void expectedCapturedAt;
+  void observedCapturedAt;
+  return JSON.stringify(expectedMaterial) === JSON.stringify(observedMaterial);
+}
+
 
 function uniquePaths(paths: readonly string[]): readonly string[] {
   const unique = new Set<string>();

@@ -214,6 +214,8 @@ type TaskSubcommand =
   | "baseline"
   | "block"
   | "complete"
+  | "commit"
+  | "commit-plan"
   | "create"
   | "events"
   | "list"
@@ -1879,6 +1881,38 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
           )
         : cliDomainFailure("task.archive", result.diagnostics[0], parsed.json);
     }
+    case "commit-plan": {
+      const result = await coreContract.planDurableTaskCommit({
+        fileSystem,
+        git: fileSystem,
+        taskId: parsed.taskId!,
+      });
+      if (!result.ok) {
+        return cliDomainFailure("task.commit-plan", result.diagnostics[0], parsed.json);
+      }
+      const { baseline: _baseline, ...plan } = result.plan;
+      return cliSuccess("task.commit-plan", Object.freeze(plan), parsed.json);
+    }
+    case "commit": {
+      const result = await coreContract.finishDurableTaskCommit({
+        fileSystem,
+        git: fileSystem,
+        taskId: parsed.taskId!,
+        event: createCliTaskEvent("Finish accepted Build with constrained Task commit."),
+      });
+      return result.ok
+        ? cliSuccess(
+            "task.commit",
+            Object.freeze({
+              taskId: result.state.projection.id,
+              commit: result.commit.commit,
+              projection: result.state.projection,
+              archived: result.archived,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("task.commit", result.diagnostics[0], parsed.json);
+    }
     case "baseline": {
       const captured = await captureTaskBaseline(
         fileSystem,
@@ -2452,6 +2486,8 @@ function parseTaskArguments(args: readonly string[]): TaskArgumentResult | null 
     subcommand !== "baseline" &&
     subcommand !== "block" &&
     subcommand !== "complete" &&
+    subcommand !== "commit" &&
+    subcommand !== "commit-plan" &&
     subcommand !== "create" &&
     subcommand !== "events" &&
     subcommand !== "list" &&
@@ -2488,10 +2524,15 @@ function parseTaskArguments(args: readonly string[]): TaskArgumentResult | null 
         }
       : { ok: false, message: "task adopt requires one or more repository paths." };
   }
-  if (subcommand === "show" || subcommand === "events" || subcommand === "baseline") {
+  if (subcommand === "show" || subcommand === "events" || subcommand === "baseline" || subcommand === "commit-plan") {
     return source === undefined && mode === undefined && tail.length === 0
       ? { ok: true, command: "task", subcommand, cwd, json, taskId }
       : { ok: false, message: `task ${subcommand} is read-only.` };
+  }
+  if (subcommand === "commit") {
+    return source === undefined && mode === undefined && tail.length === 0
+      ? { ok: true, command: "task", subcommand, cwd, json, taskId }
+      : { ok: false, message: "task commit does not accept a request source." };
   }
   if (subcommand === "recover") {
     return source === undefined && mode === "apply" && tail.length === 0

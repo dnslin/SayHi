@@ -1680,6 +1680,166 @@ test("packaged CLI stops a changed Quick write outside its approved scope", asyn
   assertQuickProjection(recoveredEnvelope.result?.projection, "completed");
   assert.equal(await readFile(join(repository, "README.md"), "utf8"), "recovered by Quick\n");
 });
+test("packaged CLI commits only accepted Build scope and archives the Task", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await mkdir(join(repository, "packages", "core"), { recursive: true });
+  await writeFile(
+    join(repository, "packages", "core", "foundation.ts"),
+    "export const foundation = 'clean';\n",
+    "utf8",
+  );
+  const initialized = await executeCliResult("init", "--cwd", repository, "--json");
+  const start = taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-17T12:00:00Z");
+  await writeTaskRequest(repository, "task-create.json", {
+    ...start,
+    task: {
+      ...start.task,
+      policies: { ...start.task.policies, commit: "auto-after-review" },
+    },
+  });
+  assert.equal(initialized.exitCode, 0);
+  await runGit(repository, "add", ".");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  await writeFile(
+    join(repository, "packages", "core", "foundation.ts"),
+    "export const foundation = 'adopted';\n",
+    "utf8",
+  );
+  const created = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-create.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(created.exitCode, 0);
+  const adopted = await executeCliResult(
+    "task",
+    "adopt",
+    FOUNDATION_TASK.taskId,
+    "packages/core/foundation.ts",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(adopted.exitCode, 0);
+
+  let state = await showTaskState(repository);
+  state = await advanceFoundationTask(
+    repository,
+    state,
+    [
+      ["active", "explore"],
+      ["active", "plan"],
+      ["active", "implement"],
+    ],
+    "2026-07-17T12:01:00Z",
+  );
+  const changed = await withDurableTaskWriter({
+    fileSystem: new NodeManagedProjectFileSystem(repository),
+    taskId: FOUNDATION_TASK.taskId,
+    expectedVersion: state.projection.version,
+    operation: (writer) =>
+      writer.writeFile(
+        "packages/core/foundation.ts",
+        "export const foundation = 'committed';\n",
+      ),
+  });
+  if (!changed.ok) {
+    assert.fail(changed.diagnostics[0]?.message ?? "Scoped Writer unexpectedly failed");
+  }
+  state = await advanceFoundationTask(
+    repository,
+    state,
+    [
+      ["active", "review"],
+      ["active", "finish"],
+    ],
+    "2026-07-17T12:02:00Z",
+  );
+  assert.equal(state.projection.phase, "finish");
+
+  await writeFile(join(repository, "user-staged.txt"), "keep staged\n", "utf8");
+  await runGit(repository, "add", "user-staged.txt");
+  await writeFile(join(repository, "user-untracked.txt"), "keep untracked\n", "utf8");
+  const headBefore = await readGitHead(repository);
+
+  const planned = await executeCliResult(
+    "task",
+    "commit-plan",
+    FOUNDATION_TASK.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(planned.exitCode, 0);
+  const plan = (JSON.parse(planned.stdout) as CliJsonEnvelope).result as {
+    ready: boolean;
+    paths: readonly string[];
+    stagedPaths: readonly string[];
+    excludedPaths: readonly string[];
+  };
+  assert.equal(plan.ready, true);
+  assert.deepEqual(plan.paths, ["packages/core/foundation.ts"]);
+  assert.deepEqual(plan.stagedPaths, ["user-staged.txt"]);
+  assert.deepEqual(plan.excludedPaths, ["user-staged.txt", "user-untracked.txt"]);
+
+  const committed = await executeCliResult(
+    "task",
+    "commit",
+    FOUNDATION_TASK.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(committed.exitCode, 0);
+  const result = (JSON.parse(committed.stdout) as CliJsonEnvelope).result as {
+    commit: string;
+    projection: { lifecycle: string; phase: string };
+    archived: boolean;
+  };
+  assert.equal(result.projection.lifecycle, "archived");
+  assert.equal(result.projection.phase, "finish");
+  assert.equal(result.archived, true);
+  assert.equal(await readGitHead(repository), result.commit);
+  const commitParents = await executeFile("git", ["show", "-s", "--format=%P", result.commit], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.equal(commitParents.stdout.trim(), headBefore);
+  const committedPaths = await executeFile("git", ["show", "--format=", "--name-only", result.commit], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.deepEqual(
+    committedPaths.stdout.split(/\r?\n/u).filter(Boolean),
+    ["packages/core/foundation.ts"],
+  );
+  assert.equal(await readFile(join(repository, "user-staged.txt"), "utf8"), "keep staged\n");
+  assert.equal(await readFile(join(repository, "user-untracked.txt"), "utf8"), "keep untracked\n");
+  const status = await executeFile("git", ["status", "--porcelain"], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.match(status.stdout, /A  user-staged\.txt/u);
+  assert.match(status.stdout, /\?\? user-untracked\.txt/u);
+  const evidence = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "tasks", "archive", FOUNDATION_TASK.taskId, "evidence", "commit.json"),
+      "utf8",
+    ),
+  ) as { commit: string; paths: readonly string[] };
+  assert.equal(evidence.commit, result.commit);
+  assert.deepEqual(evidence.paths, ["packages/core/foundation.ts"]);
+});
+
 async function showTaskState(repository: string): Promise<WorkflowState> {
   const shown = await executeCliResult(
     "task",
@@ -1806,7 +1966,7 @@ async function advanceFoundationTask(
 
     await writeTaskRequest(
       repository,
-      "task-transition.json",
+      ".sayhi/.runtime/task-transition.json",
       taskLifecycleTransition(
         FOUNDATION_TASK,
         state,
@@ -1821,7 +1981,7 @@ async function advanceFoundationTask(
       "advance",
       FOUNDATION_TASK.taskId,
       "--from",
-      "task-transition.json",
+      ".sayhi/.runtime/task-transition.json",
       "--cwd",
       repository,
       "--json",
