@@ -325,7 +325,11 @@ A dispatch request binds execution to state:
 }
 ```
 
-Every Agent result MUST echo these binding values and include a schema-valid `outcome`, artifacts, Evidence, findings, and observed final fingerprint. A result cannot declare a Task transition accepted.
+Every Agent result MUST echo these binding values and include a schema-valid `outcome`, artifacts, Evidence, legacy diagnostic `findings`, and observed final fingerprint. A result cannot declare a Task transition accepted.
+
+`findings` remains the version-1 array of diagnostic strings so previously persisted Agent results remain readable. New Review results additionally include structured `reviewFindings`. Each Review finding has a stable `id`, `severity` (`blocking` or `advisory`), `subject` (`acceptance-criterion` or `approved-spec`), `reference`, `message`, and actionable `remediation`. Only Standards Review and Spec Review results may include `reviewFindings`. A failed or blocked Review result MUST contain at least one blocking `reviewFinding`; a successful Review result MUST NOT contain one.
+
+Standards Review and Spec Review Capability Contracts MUST have `read-only` repository access and independently assess the exact Implementation final fingerprint. Their `baseFingerprint` and `observedFinalFingerprint` MUST both equal that fingerprint. A Build may enter Review only after a successful current-cycle Implementation result. It may enter Finish only after both independent Review results succeed without blocking findings. A blocking finding permits the explicit Review repair transition. When the configured repair-attempt limit is exhausted, Core blocks the Task with the accepted Review Evidence preserved.
 
 For an active Build Phase, Core accepts a `phase_execution_dispatched` Workflow Event that binds the exact approved Plan identity to the complete dispatch binding, including Context Manifest, Phase Agent Capability Contract, and ordered locked Skill identities. Core accepts at most one result for that dispatch as a `phase_execution_result_accepted` Event.
 

@@ -14,15 +14,21 @@ import { NodeManagedProjectFileSystem } from "@dnslin/sayhi-cli";
 import {
   coreContract,
   withDurableTaskWriter,
+  type ContractIdentity,
   type WorkflowLifecycle,
   type WorkflowPhase,
   type WorkflowState,
 } from "@dnslin/sayhi-core";
 
 import {
+  IMPLEMENTATION_AGENT,
+  REVIEW_AGENTS,
+  recordTestPhaseResult,
+  taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
   taskLifecycleTransition,
   type TaskLifecycleFixture,
+  type TestPhaseAgent,
 } from "./task-lifecycle-test-support.js";
 import {
   requireRecord,
@@ -48,6 +54,7 @@ const FOUNDATION_TASK = Object.freeze({
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
+
 
 
 
@@ -1764,6 +1771,39 @@ async function advanceFoundationTask(
       state = await approveFoundationPlan(repository, state, occurredAt);
       continue;
     }
+    if (
+      state.projection.route === "build" &&
+      state.projection.lifecycle === "active" &&
+      state.projection.phase === "implement" &&
+      lifecycle === "active" &&
+      phase === "review"
+    ) {
+      state = await recordFoundationPhaseResult(
+        repository,
+        state,
+        "implement",
+        IMPLEMENTATION_AGENT,
+        occurredAt,
+      );
+    }
+    if (
+      state.projection.route === "build" &&
+      state.projection.lifecycle === "active" &&
+      state.projection.phase === "review" &&
+      lifecycle === "active" &&
+      phase === "finish"
+    ) {
+      for (const reviewAgent of REVIEW_AGENTS) {
+        state = await recordFoundationPhaseResult(
+          repository,
+          state,
+          "review",
+          reviewAgent,
+          occurredAt,
+        );
+      }
+    }
+
     await writeTaskRequest(
       repository,
       "task-transition.json",
@@ -1874,6 +1914,81 @@ async function approveFoundationPlan(
   const approvedProjection = requireRecord(approvedResult.projection, "Plan approval Projection");
   assert.equal(requireString(approvedProjection, "phase"), "implement");
   return showTaskState(repository);
+}
+
+async function recordFoundationPhaseResult(
+  repository: string,
+  state: WorkflowState,
+  phase: "implement" | "review",
+  agent: TestPhaseAgent,
+  occurredAt: string,
+): Promise<WorkflowState> {
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const material = foundationBuildPlanMaterial(state);
+  const manifest = await coreContract.inspectDurableContextManifest({
+    fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    phase: "implement",
+  });
+  if (!manifest.ok || manifest.state !== "valid") {
+    assert.fail("Foundation Implement Context Manifest was not valid");
+  }
+  const currentContext = await Promise.all(
+    manifest.entries.map(async (entry) => ({
+      source: entry.source,
+      content: await fileSystem.readRepositoryFile(entry.source.value),
+    })),
+  );
+  const suffix = `${state.projection.version}-${agent.role}`;
+  return recordTestPhaseResult({
+    fileSystem,
+    fixture: FOUNDATION_TASK,
+    planIdentity: material.planIdentity,
+    contextManifestIdentity: material.contextManifestIdentity,
+    state,
+    phase,
+    agent,
+    materials: {
+      manifest: manifest.entries,
+      currentContext,
+    },
+    outcome: "succeeded",
+    suffix,
+    occurredAt,
+  });
+}
+
+function foundationBuildPlanMaterial(
+  state: WorkflowState,
+): Readonly<{
+  planIdentity: ContractIdentity;
+  contextManifestIdentity: ContractIdentity;
+}> {
+  const approval = [...state.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "workflow_transitioned" &&
+        event.from.phase === "plan" &&
+        event.to.phase === "implement",
+    );
+  assert.ok(approval, "Foundation Build Plan approval Event is missing");
+  const planReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) => evidence.reference.startsWith("plans/"));
+  const contextReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) =>
+      evidence.reference.startsWith("context/implement.jsonl#"),
+    );
+  assert.ok(planReference, "Foundation Build Plan reference is missing");
+  assert.ok(contextReference, "Foundation Context reference is missing");
+  return {
+    planIdentity: `sha256:${planReference.reference.slice("plans/".length, -".json".length)}` as ContractIdentity,
+    contextManifestIdentity: contextReference.reference.slice(
+      "context/implement.jsonl#".length,
+    ) as ContractIdentity,
+  };
 }
 
 async function executeCli(...args: readonly string[]) {

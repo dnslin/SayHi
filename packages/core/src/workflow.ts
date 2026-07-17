@@ -11,6 +11,12 @@ import {
   type DependencyGraphDiagnostic,
   type DependencyGraphDiagnosticCode,
 } from "./dependency-graph.js";
+import {
+  parsePhaseExecutionBinding,
+  parsePhaseExecutionResult,
+  phaseExecutionResultMatchesBinding,
+} from "./execution.js";
+
 
 import { isRepositoryRelativePath } from "./repository-path.js";
 import {
@@ -734,6 +740,25 @@ export function transitionWorkflow(
   if (buildPlanDiagnostic !== null) {
     return transitionFailure(state, buildPlanDiagnostic);
   }
+  const implementationResultDiagnostic =
+    validateBuildImplementationResultTransition(
+      state.projection,
+      state.events,
+      request.to,
+    );
+  if (implementationResultDiagnostic !== null) {
+    return transitionFailure(state, implementationResultDiagnostic);
+  }
+  const reviewResultDiagnostic = validateBuildReviewResultTransition(
+    state.projection,
+    state.events,
+    request.to,
+  );
+  if (reviewResultDiagnostic !== null) {
+    return transitionFailure(state, reviewResultDiagnostic);
+  }
+
+
 
   const invariantDiagnostic = validateTransitionInvariants(
     state.projection,
@@ -1534,9 +1559,10 @@ export function replayWorkflowEvents(
 
 
     if (projection !== null && sourceEvent.type === "phase_execution_dispatched") {
+      const binding = parsePhaseExecutionBinding(sourceEvent.binding);
       if (
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
-        !isUnknownRecord(sourceEvent.binding) ||
+        binding === null ||
         sourceEvent.planIdentity !== approvedBuildPlanIdentity(acceptedEvents)
       ) {
         return replayFailure(
@@ -1548,6 +1574,27 @@ export function replayWorkflowEvents(
           ),
         );
       }
+      const dispatchBindingDiagnostic = validatePhaseExecutionDispatchBinding(
+        projection,
+        binding,
+      );
+      if (dispatchBindingDiagnostic !== null) {
+        return replayFailure({
+          ...dispatchBindingDiagnostic,
+          path: `$[${index}].binding`,
+        });
+      }
+      const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
+        projection,
+        acceptedEvents,
+        binding,
+      );
+      if (reviewDispatchDiagnostic !== null) {
+        return replayFailure({
+          ...reviewDispatchDiagnostic,
+          path: `$[${index}].binding`,
+        });
+      }
       const event = copyPhaseExecutionDispatchedEvent(sourceEvent);
       projection = projectPhaseExecutionEvent(projection, event);
       acceptedEvents.push(event);
@@ -1557,15 +1604,31 @@ export function replayWorkflowEvents(
       projection !== null &&
       sourceEvent.type === "phase_execution_result_accepted"
     ) {
+      const result = parsePhaseExecutionResult(sourceEvent.result);
+      const resultBindingDiagnostic =
+        result === null
+          ? null
+          : validatePhaseExecutionResultBinding(
+              projection,
+              acceptedEvents,
+              result,
+            );
       if (
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
-        !isUnknownRecord(sourceEvent.result)
+        result === null ||
+        resultBindingDiagnostic !== null ||
+        validateBuildReviewResultPayload(
+          projection,
+          acceptedEvents,
+          result,
+          false,
+        ) !== null
       ) {
         return replayFailure(
           diagnostic(
             "workflow.event.invalid",
             `$[${index}]`,
-            "Phase execution result does not preserve the active Build position.",
+            "Phase execution result does not preserve the active Build position, binding, or schema-valid result payload.",
             "Restore the accepted Agent result Event or record the result through Core.",
           ),
         );
@@ -1619,6 +1682,27 @@ export function replayWorkflowEvents(
     if (buildPlanDiagnostic !== null) {
       return replayFailure({ ...buildPlanDiagnostic, path: `$[${index}]` });
     }
+    const implementationResultDiagnostic =
+      validateBuildImplementationResultTransition(
+        projection,
+        acceptedEvents,
+        sourceEvent.to,
+      );
+    if (implementationResultDiagnostic !== null) {
+      return replayFailure({
+        ...implementationResultDiagnostic,
+        path: `$[${index}]`,
+      });
+    }
+    const reviewResultDiagnostic = validateBuildReviewResultTransition(
+      projection,
+      acceptedEvents,
+      sourceEvent.to,
+    );
+    if (reviewResultDiagnostic !== null) {
+      return replayFailure({ ...reviewResultDiagnostic, path: `$[${index}]` });
+    }
+
 
     const invariantDiagnostic = validateTransitionInvariants(
       projection,
@@ -2267,11 +2351,19 @@ function validatePhaseExecutionDispatchRequest(
       "Phase execution dispatch requires an approved Build Plan identity.",
     );
   }
-  if (!isUnknownRecord(request.binding)) {
+  const binding = parsePhaseExecutionBinding(request.binding);
+  if (binding === null) {
     return invalidRequest(
       "$.binding",
-      "Phase execution dispatch requires a readable immutable payload.",
+      "Phase execution dispatch requires a schema-valid immutable binding.",
     );
+  }
+  const bindingDiagnostic = validatePhaseExecutionDispatchBinding(
+    state.projection,
+    binding,
+  );
+  if (bindingDiagnostic !== null) {
+    return bindingDiagnostic;
   }
   if (approvedBuildPlanIdentity(state.events) !== request.planIdentity) {
     return diagnostic(
@@ -2280,6 +2372,14 @@ function validatePhaseExecutionDispatchRequest(
       "Phase execution dispatch requires the exact currently approved Build Plan.",
       "Record and approve the current Build Plan before dispatching the Phase Agent.",
     );
+  }
+  const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
+    state.projection,
+    state.events,
+    binding,
+  );
+  if (reviewDispatchDiagnostic !== null) {
+    return reviewDispatchDiagnostic;
   }
   return null;
 }
@@ -2307,10 +2407,193 @@ function validatePhaseExecutionResultRequest(
       "Rebuild the Projection from a complete valid Event stream before mutation.",
     );
   }
-  if (!isUnknownRecord(request.result)) {
+  const result = parsePhaseExecutionResult(request.result);
+  if (result === null) {
     return invalidRequest(
       "$.result",
-      "Phase execution result requires a readable immutable payload.",
+      "Phase execution result requires a schema-valid immutable Agent result.",
+    );
+  }
+  const bindingDiagnostic = validatePhaseExecutionResultBinding(
+    state.projection,
+    state.events,
+    result,
+  );
+  if (bindingDiagnostic !== null) {
+    return bindingDiagnostic;
+  }
+  const reviewResultDiagnostic = validateBuildReviewResultPayload(
+    state.projection,
+    state.events,
+    result,
+  );
+  if (reviewResultDiagnostic !== null) {
+    return reviewResultDiagnostic;
+  }
+  return null;
+}
+
+function validateBuildReviewDispatchBinding(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  binding: unknown,
+): WorkflowDiagnostic | null {
+  if (projection.route !== "build" || projection.phase !== "review") {
+    return null;
+  }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding.baseFingerprint",
+      "Build Review dispatch requires the current successful Implementation result.",
+      "Record the current Implementation result before dispatching either Review Agent.",
+    );
+  }
+  if (
+    !isUnknownRecord(binding) ||
+    binding.baseFingerprint !== implementation.observedFinalFingerprint
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding.baseFingerprint",
+      "Build Review dispatch must use the Implementation final fingerprint.",
+      "Dispatch both Review Agents from the exact frozen Implementation result.",
+    );
+  }
+  return null;
+}
+
+function validateBuildReviewResultPayload(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  result: unknown,
+  requireStructured = true,
+): WorkflowDiagnostic | null {
+  if (projection.route !== "build" || projection.phase !== "review") {
+    return null;
+  }
+  if (
+    !isUnknownRecord(result) ||
+    (requireStructured && !Array.isArray(result.reviewFindings))
+  ) {
+    return invalidRequest(
+      "$.result.reviewFindings",
+      "New Build Review results require structured reviewFindings.",
+    );
+  }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.baseFingerprint",
+      "Build Review results require the current successful Implementation result.",
+      "Record the current Implementation result before accepting a Review result.",
+    );
+  }
+  return result.baseFingerprint === implementation.observedFinalFingerprint &&
+    result.observedFinalFingerprint === implementation.observedFinalFingerprint
+    ? null
+    : diagnostic(
+        "workflow.transition.illegal",
+        "$.result.observedFinalFingerprint",
+        "Build Review results must assess the same frozen Implementation fingerprint.",
+        "Rerun the Review Agent from the exact Implementation final fingerprint.",
+      );
+}
+
+function validatePhaseExecutionDispatchBinding(
+  projection: TaskProjection,
+  binding: Readonly<{
+    taskId: string;
+    expectedTaskVersion: number;
+    phase: WorkflowPhase;
+  }>,
+): WorkflowDiagnostic | null {
+  if (
+    binding.taskId !== projection.id ||
+    binding.expectedTaskVersion !== projection.version ||
+    binding.phase !== projection.phase
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding",
+      "Phase execution dispatch must bind the active Task version and Phase.",
+      "Dispatch the Agent from the current Task state.",
+    );
+  }
+  return null;
+}
+
+function validatePhaseExecutionResultBinding(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  result: ReturnType<typeof parsePhaseExecutionResult> & {},
+): WorkflowDiagnostic | null {
+  if (result.phase !== projection.phase) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.phase",
+      "Phase execution result must match the active Phase.",
+      "Record the result only while its dispatched Phase remains active.",
+    );
+  }
+  const bindings = [] as ReturnType<typeof parsePhaseExecutionBinding>[];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.phase === projection.phase
+    ) {
+      break;
+    }
+    if (event.type !== "phase_execution_dispatched") {
+      continue;
+    }
+    const binding = parsePhaseExecutionBinding(event.binding);
+    if (binding !== null && binding.phase === projection.phase) {
+      bindings.push(binding);
+    }
+  }
+  const binding = bindings.find(
+    (candidate) => candidate?.dispatchId === result.dispatchId,
+  );
+  if (binding === undefined || binding === null) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "Phase execution result requires an accepted dispatch binding.",
+      "Dispatch the Phase Agent before recording its result.",
+    );
+  }
+  if (bindings[0]?.dispatchId !== result.dispatchId) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "Phase execution result must use the latest active Phase dispatch.",
+      "Record a result only for the most recently accepted dispatch.",
+    );
+  }
+  if (!phaseExecutionResultMatchesBinding(result, binding)) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result",
+      "Phase execution result does not match its accepted dispatch binding.",
+      "Echo every binding value returned by the Phase dispatch.",
+    );
+  }
+  if (
+    events.some(
+      (event) =>
+        event.type === "phase_execution_result_accepted" &&
+        parsePhaseExecutionResult(event.result)?.dispatchId === result.dispatchId,
+    )
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "A Phase dispatch accepts at most one result.",
+      "Reuse the accepted result on retry instead of recording another result.",
     );
   }
   return null;
@@ -3179,6 +3462,172 @@ function validateBuildPlanImplementationTransition(
   }
   return null;
 }
+function validateBuildImplementationResultTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+): WorkflowDiagnostic | null {
+  if (
+    projection.route !== "build" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "implement" ||
+    to.lifecycle !== "active" ||
+    to.phase !== "review"
+  ) {
+    return null;
+  }
+  return currentBuildImplementationResult(events) === undefined
+    ? diagnostic(
+        "workflow.transition.illegal",
+        "$.to",
+        "Build Review requires an accepted successful Implementation result for the current cycle.",
+        "Record a new bound Implementation Agent result before entering Review.",
+      )
+    : null;
+}
+function validateBuildReviewResultTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+): WorkflowDiagnostic | null {
+  if (
+    projection.route !== "build" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "review" ||
+    to.lifecycle !== "active" ||
+    (to.phase !== "finish" && to.phase !== "implement")
+  ) {
+    return null;
+  }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      "Build Review requires the current successful Implementation result.",
+      "Return to Implement and record a new bound Implementation result.",
+    );
+  }
+  const results = currentBuildReviewResults(events);
+  const requiredRoles = ["standards-review", "spec-review"] as const;
+  const missingRoles = requiredRoles.filter((role) => !results.has(role));
+  if (missingRoles.length > 0) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      `Build Review requires accepted ${missingRoles.join(" and ")} results.`,
+      "Record both independent read-only Review Agent results before leaving Review.",
+    );
+  }
+  const reviewResults = requiredRoles.map((role) => results.get(role)!);
+  if (
+    reviewResults.some(
+      (result) =>
+        result.baseFingerprint !== implementation.observedFinalFingerprint ||
+        result.observedFinalFingerprint !== implementation.observedFinalFingerprint,
+    )
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      "Build Review results must assess the same frozen Implementation fingerprint.",
+      "Rerun both independent Review Agents from the exact Implementation final fingerprint.",
+    );
+  }
+  const hasBlockingFinding = reviewResults.some(hasBlockingReviewFinding);
+  if (to.phase === "finish") {
+    return hasBlockingFinding ||
+      reviewResults.some((result) => result.outcome !== "succeeded")
+      ? diagnostic(
+          "workflow.transition.illegal",
+          "$.to",
+          "Build Review has unresolved blocking findings.",
+          "Resolve findings through Repair or record an authorized waiver before entering Finish.",
+        )
+      : null;
+  }
+  return hasBlockingFinding
+    ? null
+    : diagnostic(
+        "workflow.transition.illegal",
+        "$.to",
+        "Build Repair requires a blocking Review finding.",
+        "Return to Implement only to address recorded blocking Review findings.",
+      );
+}
+
+function currentBuildImplementationResult(
+  events: readonly WorkflowEvent[],
+): Readonly<Record<string, unknown>> | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.lifecycle === "active" &&
+      event.to.phase === "implement"
+    ) {
+      break;
+    }
+    if (
+      event.type === "phase_execution_result_accepted" &&
+      event.from.phase === "implement" &&
+      isUnknownRecord(event.result) &&
+      event.result.phase === "implement" &&
+      event.result.agentRole === "implementation" &&
+      event.result.outcome === "succeeded" &&
+      isContractIdentity(event.result.observedFinalFingerprint)
+    ) {
+      return event.result;
+    }
+  }
+  return undefined;
+}
+
+function currentBuildReviewResults(
+  events: readonly WorkflowEvent[],
+): ReadonlyMap<"standards-review" | "spec-review", Record<string, unknown>> {
+  const results = new Map<
+    "standards-review" | "spec-review",
+    Record<string, unknown>
+  >();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.lifecycle === "active" &&
+      event.to.phase === "review"
+    ) {
+      break;
+    }
+    if (
+      event.type !== "phase_execution_result_accepted" ||
+      event.from.phase !== "review" ||
+      !isUnknownRecord(event.result) ||
+      event.result.phase !== "review" ||
+      (event.result.agentRole !== "standards-review" &&
+        event.result.agentRole !== "spec-review") ||
+      !Array.isArray(event.result.reviewFindings)
+    ) {
+      continue;
+    }
+    if (!results.has(event.result.agentRole)) {
+      results.set(event.result.agentRole, event.result);
+    }
+  }
+  return results;
+}
+
+function hasBlockingReviewFinding(result: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(result.reviewFindings) &&
+    result.reviewFindings.some(
+      (finding) =>
+        isUnknownRecord(finding) && finding.severity === "blocking",
+    )
+  );
+}
+
+
 
 function buildPlanApprovalEvidence(
   gates: readonly GateAcceptance[],

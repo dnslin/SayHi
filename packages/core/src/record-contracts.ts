@@ -158,6 +158,17 @@ export type LeaseRecord = Readonly<Record<string, unknown>> & {
 };
 
 export type AgentResultOutcome = "succeeded" | "failed" | "blocked";
+export type ReviewFindingSeverity = "blocking" | "advisory";
+export type ReviewFindingSubject = "acceptance-criterion" | "approved-spec";
+export interface ReviewFinding {
+  readonly id: string;
+  readonly severity: ReviewFindingSeverity;
+  readonly subject: ReviewFindingSubject;
+  readonly reference: string;
+  readonly message: string;
+  readonly remediation: string;
+}
+
 
 export type AgentResultRecord = Readonly<Record<string, unknown>> & {
   readonly schemaVersion: typeof DURABLE_RECORD_SCHEMA_VERSION;
@@ -173,6 +184,7 @@ export type AgentResultRecord = Readonly<Record<string, unknown>> & {
   readonly artifacts: readonly string[];
   readonly evidence: readonly string[];
   readonly findings: readonly string[];
+  readonly reviewFindings?: readonly ReviewFinding[];
   readonly observedFinalFingerprint: ContractIdentity;
 };
 
@@ -966,7 +978,7 @@ function validateAgentResult(
       "outcome must be succeeded, failed, or blocked.",
     );
   }
-  for (const field of ["artifacts", "evidence", "findings"] as const) {
+  for (const field of ["artifacts", "evidence"] as const) {
     if (!isUniqueStringArray(record[field], false)) {
       return invalidMilestoneRecord(
         "record_contract.agent_result.invalid",
@@ -975,6 +987,93 @@ function validateAgentResult(
         `${field} must contain unique non-empty references.`,
       );
     }
+  }
+  return validateAgentResultFindings(record);
+}
+
+function validateAgentResultFindings(
+  record: UnknownRecord,
+): ContractRecordValidationFailure | null {
+  if (!isUniqueStringArray(record.findings, false)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.findings",
+      "findings must contain unique non-empty diagnostic strings.",
+    );
+  }
+  if (record.reviewFindings === undefined) {
+    return null;
+  }
+  if (!Array.isArray(record.reviewFindings)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.reviewFindings",
+      "reviewFindings must be an array.",
+    );
+  }
+  if (record.phase !== "review") {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.reviewFindings",
+      "Only Review Agent results may include structured reviewFindings.",
+    );
+  }
+  if (
+    record.agentRole !== "standards-review" &&
+    record.agentRole !== "spec-review"
+  ) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.agentRole",
+      "Structured reviewFindings require a Standards Review or Spec Review Agent result.",
+    );
+  }
+  const ids = new Set<string>();
+  let blockingFindings = 0;
+  for (let index = 0; index < record.reviewFindings.length; index += 1) {
+    const finding = record.reviewFindings[index];
+    if (
+      !isRecord(finding) ||
+      !isIdentifier(finding.id) ||
+      ids.has(finding.id) ||
+      (finding.severity !== "blocking" && finding.severity !== "advisory") ||
+      (finding.subject !== "acceptance-criterion" &&
+        finding.subject !== "approved-spec") ||
+      !isNonEmptyString(finding.reference) ||
+      !isNonEmptyString(finding.message) ||
+      !isNonEmptyString(finding.remediation)
+    ) {
+      return invalidMilestoneRecord(
+        "record_contract.agent_result.invalid",
+        "Agent result",
+        `$.record.reviewFindings[${index}]`,
+        "Each Review finding needs unique id, severity, subject, reference, message, and remediation.",
+      );
+    }
+    ids.add(finding.id);
+    if (finding.severity === "blocking") {
+      blockingFindings += 1;
+    }
+  }
+  if (record.outcome === "succeeded" && blockingFindings > 0) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.outcome",
+      "A successful Review result cannot contain blocking findings.",
+    );
+  }
+  if (record.outcome !== "succeeded" && blockingFindings === 0) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.reviewFindings",
+      "A failed or blocked Review result requires a blocking finding.",
+    );
   }
   return null;
 }

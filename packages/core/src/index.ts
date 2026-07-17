@@ -26,6 +26,8 @@ import {
   recordContextManifestChange,
   recordBuildPlanChange,
   transitionWorkflow,
+  recordPhaseExecutionDispatch,
+  recordPhaseExecutionResult,
 } from "./workflow.js";
 import {
   advanceDurableTask,
@@ -46,6 +48,7 @@ import {
   addDurableContextManifestEntry,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
+  withBoundDurableTaskWriter,
   inspectDurableContextManifest,
   decideDurableBuildPlan,
   recordDurableBuildPlan,
@@ -62,6 +65,9 @@ export {
 export type {
   AgentResultOutcome,
   AgentResultRecord,
+  ReviewFinding,
+  ReviewFindingSeverity,
+  ReviewFindingSubject,
   BaselineRecord,
   BaselineUntrackedFile,
   BaselineDirtyPath,
@@ -254,6 +260,7 @@ export {
   transitionWorkflow,
   recordContextManifestChange,
   recordBuildPlanChange,
+  recordPhaseExecutionResult,
 } from "./workflow.js";
 export type {
   DependencyGraph,
@@ -329,6 +336,7 @@ export {
   inspectDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
+  withBoundDurableTaskWriter,
   decideDurableBuildPlan,
   recordDurableBuildPlan,
   dispatchDurablePhaseExecution,
@@ -391,6 +399,7 @@ export type {
   ScopedTaskWriter,
   WithDurableTaskWriterRequest,
   WithDurableTaskWriterResult,
+  WithBoundDurableTaskWriterRequest,
   DecideDurableBuildPlanRequest,
   DecideDurableBuildPlanResult,
   RecordDurableBuildPlanRequest,
@@ -430,6 +439,8 @@ export interface CoreContract {
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly recordBuildPlanChange: typeof recordBuildPlanChange;
+  readonly recordPhaseExecutionDispatch: typeof recordPhaseExecutionDispatch;
+  readonly recordPhaseExecutionResult: typeof recordPhaseExecutionResult;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly readDurableQuickResult: typeof readDurableQuickResult;
@@ -448,6 +459,7 @@ export interface CoreContract {
   readonly diagnoseDurableTasks: typeof diagnoseDurableTasks;
   readonly listDurableTasks: typeof listDurableTasks;
   readonly withDurableTaskWriter: typeof withDurableTaskWriter;
+  readonly withBoundDurableTaskWriter: typeof withBoundDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
   readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
@@ -484,6 +496,8 @@ export const coreContract: CoreContract = Object.freeze({
   adoptWorkflowBaseline,
   recordContextManifestChange,
   recordBuildPlanChange,
+  recordPhaseExecutionDispatch,
+  recordPhaseExecutionResult,
   createDurableTask,
   createDurableTaskHandoff,
   readDurableQuickResult,
@@ -502,6 +516,7 @@ export const coreContract: CoreContract = Object.freeze({
   diagnoseDurableTasks,
   listDurableTasks,
   withDurableTaskWriter,
+  withBoundDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
   decideDurableBuildPlan,

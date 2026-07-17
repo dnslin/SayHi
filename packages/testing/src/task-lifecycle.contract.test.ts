@@ -3,7 +3,10 @@ import test from "node:test";
 
 import {
   coreContract,
+  type BindPhaseExecutionRequest,
   type PhaseExecutionMaterials,
+  type ContractIdentity,
+  type ReviewFinding,
   advanceDurableTask,
   addDurableContextManifestEntry,
   archiveDurableTask,
@@ -25,6 +28,9 @@ import {
 
 import {
   createCompletedDurableTask,
+  IMPLEMENTATION_AGENT,
+  REVIEW_AGENTS,
+  recordTestPhaseResult,
   taskLifecycleEventMetadata,
   taskLifecycleExploreTransition,
   taskLifecycleStartRequest,
@@ -595,8 +601,12 @@ function parseJsonObject(source: string): object {
   return value;
 }
 
-function startRequest() {
-  return taskLifecycleStartRequest(TASK_FIXTURE, "2026-07-14T10:00:00Z");
+function startRequest(maxRepairAttempts = 2) {
+  return taskLifecycleStartRequest(
+    TASK_FIXTURE,
+    "2026-07-14T10:00:00Z",
+    maxRepairAttempts,
+  );
 }
 
 test("archiving removes a completed Task from active Task listing without losing audit history", async () => {
@@ -1359,40 +1369,7 @@ test("a superseded Build Plan cannot be rejected", async () => {
 
 const PHASE_CONTEXT_SOURCE = "docs/phase-context.md";
 const PHASE_CONTEXT_CONTENT = "Stable implementation context.\n";
-const PHASE_AGENT_CONTRACT = {
-  schemaVersion: 1,
-  role: "implementation",
-  runtimeName: "sayhi-v1-implementation",
-  contractVersion: 1,
-  tools: ["read", "edit", "bash"],
-  network: "none",
-  skills: ["implement", "tdd"],
-  spawns: [],
-  repositoryAccess: "exclusive-write",
-  outputSchema: "schemas/agent/implementation-output.json",
-  promptBaseIdentity: `sha256:${"a".repeat(64)}`,
-  overridePolicy: "prompt-body-only",
-} as const;
-const PHASE_AGENT_CONTRACT_ID =
-  "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08";
-const PHASE_SKILLS = [
-  {
-    name: "implement",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-    },
-    content: "implement skill\n",
-  },
-  {
-    name: "tdd",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-    },
-    content: "tdd skill\n",
-  },
-] as const;
+
 
 test("Build resume returns an accepted Agent result without dispatching it again", async () => {
   const fileSystem = new MemoryTaskLifecycleFileSystem();
@@ -1510,6 +1487,12 @@ test("Build resume rejects modified approved Plan evidence", async () => {
 test("Build dispatch rejects a mismatched Plan Manifest outside Implement", async () => {
   const fileSystem = new MemoryTaskLifecycleFileSystem();
   const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-REVIEW");
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "PHASE-REVIEW-IMPLEMENTED",
+    "2026-07-17T10:01:45Z",
+  );
   const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
   assert.equal(recovered.ok, true);
   if (!recovered.ok) {
@@ -1593,6 +1576,12 @@ test("Build dispatch rejects a mismatched Plan Manifest outside Implement", asyn
 test("Build dispatch rejects an Agent for a different active Phase", async () => {
   const fileSystem = new MemoryTaskLifecycleFileSystem();
   const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-CROSS-PHASE");
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "PHASE-CROSS-PHASE-IMPLEMENTED",
+    "2026-07-17T10:01:45Z",
+  );
   const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
   assert.equal(recovered.ok, true);
   if (!recovered.ok) {
@@ -1694,11 +1683,49 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
   if (!reviewed.ok) {
     return;
   }
+  let reviewState = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewed.state,
+    "standards-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-FRESH-DISPATCH-STANDARDS",
+        severity: "blocking",
+        subject: "approved-spec",
+        reference: "docs/spec/workflow.md#5.5",
+        message: "The reviewed implementation needs repair.",
+        remediation: "Apply the repair before dispatching a new Implement Agent.",
+      },
+    ],
+    "PHASE-REPAIR-STANDARDS",
+    "2026-07-17T10:02:20Z",
+  );
+  reviewState = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewState,
+    "spec-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-FRESH-DISPATCH-SPEC",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: TASK_FIXTURE.acceptanceCriterion,
+        message: "The accepted result omits required behavior.",
+        remediation: "Repair the missing behavior before a new dispatch.",
+      },
+    ],
+    "PHASE-REPAIR-SPEC",
+    "2026-07-17T10:02:25Z",
+  );
   const repaired = await advanceDurableTask({
     fileSystem,
     transition: taskLifecycleTransition(
       TASK_FIXTURE,
-      reviewed.state,
+      reviewState,
       "active",
       "implement",
       "PHASE-REPAIR-IMPLEMENT",
@@ -1826,12 +1853,604 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
     }
   }
 });
+test("Build cannot enter Review before an accepted Implementation result", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-21-IMPLEMENT-GATE");
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+
+  const rejected = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "IMPLEMENT-RESULT-REQUIRED",
+      "2026-07-17T10:04:00Z",
+    ),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+test("Build cannot finish Review before both review axes accept it", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REVIEW-GATE",
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REVIEW-GATE-IMPLEMENTED",
+    "2026-07-17T10:04:15Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REVIEW-GATE-ENTERED",
+      "2026-07-17T10:04:30Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+
+  const rejected = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      reviewed.state,
+      "active",
+      "finish",
+      "REVIEW-RESULTS-REQUIRED",
+      "2026-07-17T10:04:45Z",
+    ),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+test("Build enters Repair only for blocking Review findings", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REPAIR-GATE",
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REPAIR-GATE-IMPLEMENTED",
+    "2026-07-17T10:05:00Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REPAIR-GATE-ENTERED",
+      "2026-07-17T10:05:15Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  let state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewed.state,
+    "standards-review",
+    "succeeded",
+    [],
+    "REPAIR-GATE-STANDARDS",
+    "2026-07-17T10:05:30Z",
+  );
+  state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    state,
+    "spec-review",
+    "succeeded",
+    [],
+    "REPAIR-GATE-SPEC",
+    "2026-07-17T10:05:45Z",
+  );
+
+  const rejected = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      state,
+      "active",
+      "implement",
+      "REPAIR-GATE-WITHOUT-FINDING",
+      "2026-07-17T10:06:00Z",
+    ),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    state,
+    "standards-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-STANDARDS",
+        severity: "blocking",
+        subject: "approved-spec",
+        reference: "docs/spec/workflow.md#5.5",
+        message: "The change violates an Approved Spec requirement.",
+        remediation: "Repair the violation and rerun both review axes.",
+      },
+    ],
+    "REPAIR-GATE-STANDARDS-BLOCKED",
+    "2026-07-17T10:06:15Z",
+  );
+  state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    state,
+    "spec-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-SPEC",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: TASK_FIXTURE.acceptanceCriterion,
+        message: "The change omits required recovery behavior.",
+        remediation: "Implement recovery and rerun both review axes.",
+      },
+    ],
+    "REPAIR-GATE-SPEC-BLOCKED",
+    "2026-07-17T10:06:30Z",
+  );
+  const repaired = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      state,
+      "active",
+      "implement",
+      "REPAIR-GATE-BLOCKING",
+      "2026-07-17T10:06:45Z",
+    ),
+  });
+  assert.equal(repaired.ok, true);
+  if (!repaired.ok) {
+    return;
+  }
+  assert.equal(repaired.state.projection.phase, "implement");
+  const missingImplementation = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      repaired.state,
+      "active",
+      "review",
+      "REPAIR-GATE-FRESH-IMPLEMENTATION-REQUIRED",
+      "2026-07-17T10:07:00Z",
+    ),
+  });
+  assert.equal(missingImplementation.ok, false);
+  if (!missingImplementation.ok) {
+    assert.equal(
+      missingImplementation.diagnostics[0]?.code,
+      "workflow.transition.illegal",
+    );
+  }
+});
+
+
+
+
+test("Build Review dispatch requires the Implementation final fingerprint", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REVIEW-FINGERPRINT",
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REVIEW-FINGERPRINT-IMPLEMENTED",
+    "2026-07-17T10:07:15Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REVIEW-FINGERPRINT-ENTERED",
+      "2026-07-17T10:07:30Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const reviewAgent = REVIEW_AGENTS[0];
+  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: prepared.planIdentity,
+    execution: {
+      ...prepared.execution,
+      dispatch: {
+        ...prepared.execution.dispatch,
+        dispatchId: "DISPATCH-21-REVIEW-FINGERPRINT-MISMATCH",
+        expectedTaskVersion: reviewed.state.projection.version,
+        phase: "review",
+        agentRole: reviewAgent.role,
+        baseFingerprint: `sha256:${"e".repeat(64)}`,
+        requestedAt: "2026-07-17T10:07:45Z",
+        agentContractIdentity: reviewAgent.contractIdentity,
+      },
+      agentContract: reviewAgent.contract,
+      skills: [],
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "REVIEW-FINGERPRINT-DISPATCHED",
+      "2026-07-17T10:08:00Z",
+    ),
+  });
+  assert.equal(dispatched.ok, false);
+  if (!dispatched.ok) {
+    assert.equal(dispatched.diagnostics[0]?.code, "workflow.transition.illegal");
+    assert.equal(
+      dispatched.diagnostics[0]?.path,
+      "$.binding.baseFingerprint",
+    );
+  }
+});
+
+test("Build blocks when configured Review repair attempts are exhausted", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REPAIR-EXHAUSTED",
+    0,
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REPAIR-EXHAUSTED-IMPLEMENTED",
+    "2026-07-17T10:08:15Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REPAIR-EXHAUSTED-ENTERED",
+      "2026-07-17T10:08:30Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  let state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewed.state,
+    "standards-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-EXHAUSTED-STANDARDS",
+        severity: "blocking",
+        subject: "approved-spec",
+        reference: "docs/spec/workflow.md#5.5",
+        message: "The Build still violates the Approved Spec.",
+        remediation: "Repair the violation before retrying Review.",
+      },
+    ],
+    "REPAIR-EXHAUSTED-STANDARDS",
+    "2026-07-17T10:08:45Z",
+  );
+  state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    state,
+    "spec-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-EXHAUSTED-SPEC",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: TASK_FIXTURE.acceptanceCriterion,
+        message: "The Build misses required recovery behavior.",
+        remediation: "Repair the behavior before retrying Review.",
+      },
+    ],
+    "REPAIR-EXHAUSTED-SPEC",
+    "2026-07-17T10:09:00Z",
+  );
+  const exhausted = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      state,
+      "active",
+      "implement",
+      "REPAIR-EXHAUSTED-BLOCKED",
+      "2026-07-17T10:09:15Z",
+    ),
+  });
+  assert.equal(exhausted.ok, true);
+  if (!exhausted.ok) {
+    return;
+  }
+  assert.equal(exhausted.state.projection.lifecycle, "blocked");
+  assert.equal(exhausted.state.projection.phase, "review");
+  assert.deepEqual(exhausted.state.projection.blockers, [
+    "Configured Review repair attempts are exhausted.",
+  ]);
+  assert.equal(exhausted.event.type, "workflow_transitioned");
+  assert.deepEqual(exhausted.event.gates, [
+    {
+      gate: "block",
+      evidence: [
+        { kind: "workflow", reference: `events/${state.events.at(-1)!.eventId}` },
+      ],
+    },
+  ]);
+});
+
+test("durable Build rejects a mismatched Review result before appending it", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REVIEW-INVALID-EVIDENCE",
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REVIEW-INVALID-EVIDENCE-IMPLEMENTED",
+    "2026-07-17T10:09:30Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REVIEW-INVALID-EVIDENCE-ENTERED",
+      "2026-07-17T10:09:45Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewed.state,
+    "standards-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-INVALID-EVIDENCE-STANDARDS",
+        severity: "blocking",
+        subject: "approved-spec",
+        reference: "docs/spec/workflow.md#5.5",
+        message: "The Build still violates the Approved Spec.",
+        remediation: "Repair the violation before retrying Review.",
+      },
+    ],
+    "REVIEW-INVALID-EVIDENCE-STANDARDS",
+    "2026-07-17T10:10:00Z",
+  );
+  await assert.rejects(
+    recordReviewResult(
+      fileSystem,
+      prepared,
+      state,
+      "spec-review",
+      "blocked",
+      [
+        {
+          id: "FINDING-21-INVALID-EVIDENCE-SPEC",
+          severity: "blocking",
+          subject: "acceptance-criterion",
+          reference: TASK_FIXTURE.acceptanceCriterion,
+          message: "The Build misses required recovery behavior.",
+          remediation: "Repair the behavior before retrying Review.",
+        },
+      ],
+      "REVIEW-INVALID-EVIDENCE-SPEC",
+      "2026-07-17T10:10:15Z",
+      `sha256:${"e".repeat(64)}`,
+    ),
+    /Build Review results must assess the same frozen Implementation fingerprint/,
+  );
+  const after = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(after.ok, true);
+  if (after.ok) {
+    assert.equal(after.state.projection.lifecycle, "active");
+    assert.equal(after.state.projection.phase, "review");
+    assert.equal(after.state.events.length, state.events.length + 1);
+    assert.equal(after.state.events.at(-1)?.type, "phase_execution_dispatched");
+  }
+});
+
+test("Bound Writer blocks invalid capability material with a deterministic Event id", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-BOUND-WRITER",
+  );
+  const before = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  let entered = false;
+  const blocked = await coreContract.withBoundDurableTaskWriter({
+    fileSystem: fileSystem as unknown as Parameters<
+      typeof coreContract.withBoundDurableTaskWriter
+    >[0]["fileSystem"],
+    taskId: TASK_ID,
+    materials: {
+      ...prepared.materials,
+      agentContract: {
+        ...prepared.materials.agentContract,
+        tools: [...prepared.materials.agentContract.tools, "validate"],
+      },
+    },
+    operation: async () => {
+      entered = true;
+    },
+  });
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) {
+    assert.equal(blocked.diagnostics[0]?.code, "execution.agent_invalid");
+  }
+  assert.equal(entered, false);
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.ok(
+    recovered.state.events.some(
+      (event) =>
+        event.eventId ===
+        `EVENT-BOUND-WRITER-${TASK_ID}-${before.state.projection.version}`,
+    ),
+  );
+});
+
+async function recordSucceededImplementation(
+  fileSystem: MemoryTaskLifecycleFileSystem,
+  execution: BindPhaseExecutionRequest,
+  suffix: string,
+  occurredAt: string,
+): Promise<void> {
+  const accepted = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: TASK_ID,
+    result: {
+      schemaVersion: 1,
+      dispatchId: execution.dispatch.dispatchId,
+      taskId: TASK_ID,
+      expectedTaskVersion: execution.dispatch.expectedTaskVersion,
+      phase: "implement",
+      agentRole: "implementation",
+      contextManifestIdentity: execution.dispatch.contextManifestIdentity,
+      agentContractIdentity: execution.dispatch.agentContractIdentity,
+      baseFingerprint: execution.dispatch.baseFingerprint,
+      outcome: "succeeded",
+      artifacts: ["artifacts/implementation.md"],
+      evidence: ["evidence/implementation.json"],
+      findings: [],
+      observedFinalFingerprint: execution.dispatch.baseFingerprint,
+    },
+    event: taskLifecycleEventMetadata(TASK_FIXTURE, suffix, occurredAt),
+  });
+  if (!accepted.ok) {
+    assert.fail(accepted.diagnostics[0]?.message ?? "Implementation result failed");
+  }
+}
+async function recordReviewResult(
+  fileSystem: MemoryTaskLifecycleFileSystem,
+  prepared: Readonly<{
+    planIdentity: ContractIdentity;
+    execution: BindPhaseExecutionRequest;
+  }>,
+  state: WorkflowState,
+  role: "standards-review" | "spec-review",
+  outcome: "succeeded" | "failed" | "blocked",
+  findings: readonly ReviewFinding[],
+  suffix: string,
+  occurredAt: string,
+  observedFinalFingerprint?: ContractIdentity,
+): Promise<WorkflowState> {
+  const reviewAgent = REVIEW_AGENTS.find((agent) => agent.role === role);
+  assert.ok(reviewAgent, `Missing Review Agent fixture for ${role}`);
+  return recordTestPhaseResult({
+    fileSystem,
+    fixture: TASK_FIXTURE,
+    planIdentity: prepared.planIdentity,
+    contextManifestIdentity: prepared.execution.dispatch.contextManifestIdentity,
+    state,
+    phase: "review",
+    agent: reviewAgent,
+    materials: {
+      manifest: prepared.execution.manifest,
+      currentContext: prepared.execution.currentContext,
+    },
+    outcome,
+    reviewFindings: findings,
+    ...(observedFinalFingerprint === undefined
+      ? {}
+      : { observedFinalFingerprint }),
+    suffix,
+    occurredAt,
+  });
+}
+
 
 async function dispatchApprovedBuildPhase(
   fileSystem: MemoryTaskLifecycleFileSystem,
   dispatchId: string,
+  maxRepairAttempts = 2,
 ) {
-  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  const created = await createDurableTask({
+    fileSystem,
+    start: startRequest(maxRepairAttempts),
+  });
   if (!created.ok) {
     assert.fail(created.diagnostics[0]?.message ?? "Task creation failed");
   }
@@ -1866,6 +2485,7 @@ async function dispatchApprovedBuildPhase(
     event: taskLifecycleEventMetadata(
       TASK_FIXTURE,
       "PHASE-CONTEXT-ADDED",
+
       "2026-07-17T10:00:15Z",
     ),
   });
@@ -1939,7 +2559,7 @@ async function dispatchApprovedBuildPhase(
       baseFingerprint: `sha256:${"d".repeat(64)}`,
       requestedAt: "2026-07-17T10:01:15Z",
       contextManifestIdentity: recorded.plan.contextManifestIdentity,
-      agentContractIdentity: PHASE_AGENT_CONTRACT_ID,
+      agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
     },
     manifest: manifest.entries,
     currentContext: [
@@ -1948,8 +2568,8 @@ async function dispatchApprovedBuildPhase(
         content: PHASE_CONTEXT_CONTENT,
       },
     ],
-    agentContract: PHASE_AGENT_CONTRACT,
-    skills: PHASE_SKILLS,
+    agentContract: IMPLEMENTATION_AGENT.contract,
+    skills: IMPLEMENTATION_AGENT.skills,
   } as const;
   const dispatched = await coreContract.dispatchDurablePhaseExecution({
     fileSystem,

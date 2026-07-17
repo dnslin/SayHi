@@ -23,6 +23,8 @@ import {
   freezeDurableContextManifest,
   recoverDurableTask,
   withDurableTaskWriter,
+  dispatchDurablePhaseExecution,
+  withBoundDurableTaskWriter,
   recordDurableQuickResult,
   recordDurableBuildPlan,
   type BaselineRecord,
@@ -32,6 +34,7 @@ import {
 
 import {
   createCompletedDurableTask,
+  IMPLEMENTATION_AGENT,
   taskLifecycleExploreTransition,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
@@ -505,10 +508,62 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
     assert.fail(approved.diagnostics[0]?.message ?? "Build Plan approval failed");
   }
   assert.equal(approved.ok, true);
-  const admitted = await withDurableTaskWriter({
+  const materials = {
+    manifest: frozen.entries,
+    currentContext: [
+      {
+        source: { type: "project-path", value: "docs/plan-context.md" },
+        content: "Stable implementation context.\n",
+      },
+    ],
+    agentContract: IMPLEMENTATION_AGENT.contract,
+    skills: IMPLEMENTATION_AGENT.skills,
+  } as const;
+  const dispatched = await dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: recorded.plan.identity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: "WRITER-SEAL-DISPATCH",
+        taskId: TASK_ID,
+        expectedTaskVersion: approved.state.projection.version,
+        phase: "implement",
+        agentRole: "implementation",
+        baseFingerprint: `sha256:${"d".repeat(64)}`,
+        requestedAt: "2026-07-15T10:05:15Z",
+        contextManifestIdentity: recorded.plan.contextManifestIdentity,
+        agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
+      },
+      ...materials,
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "WRITER-SEAL-DISPATCH",
+      "2026-07-15T10:05:30Z",
+    ),
+  });
+  if (!dispatched.ok) {
+    assert.fail(dispatched.diagnostics[0]?.message ?? "Implementation dispatch failed");
+  }
+  const outOfScope = await withBoundDurableTaskWriter({
     fileSystem,
     taskId: TASK_ID,
-    expectedVersion: approved.state.projection.version,
+    materials,
+    operation: async (writer) => {
+      await writer.writeFile("README.md", "outside approved scope\n");
+    },
+  });
+  assert.equal(outOfScope.ok, false);
+  if (!outOfScope.ok) {
+    assert.equal(outOfScope.diagnostics[0]?.code, "task_lifecycle.writer.scope");
+  }
+  await assert.rejects(readFile(join(repository, "README.md"), "utf8"));
+  const admitted = await withBoundDurableTaskWriter({
+    fileSystem,
+    taskId: TASK_ID,
+    materials,
     operation: async (writer) => {
       await writer.writeFile("packages/core/admitted.ts", "export {};\n");
     },
@@ -527,10 +582,10 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
     "utf8",
   );
   let staleWriterEntered = false;
-  const staleWriter = await withDurableTaskWriter({
+  const staleWriter = await withBoundDurableTaskWriter({
     fileSystem,
     taskId: TASK_ID,
-    expectedVersion: approved.state.projection.version,
+    materials,
     operation: async (writer) => {
       staleWriterEntered = true;
       await writer.writeFile("packages/core/after-drift.ts", "export {};\n");

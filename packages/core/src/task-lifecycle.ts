@@ -313,6 +313,13 @@ export interface WithDurableTaskWriterRequest<Value> {
   readonly expectedVersion: number;
   readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
 }
+export interface WithBoundDurableTaskWriterRequest<Value> {
+  readonly fileSystem: ContextManifestFileSystem & TaskBaselineFileSystem;
+  readonly taskId: string;
+  readonly materials: PhaseExecutionMaterials;
+  readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
+}
+
 export interface AddDurableContextManifestEntryRequest {
   readonly fileSystem: ContextManifestFileSystem;
   readonly taskId: string;
@@ -887,6 +894,72 @@ export async function withDurableTaskWriter<Value>(
   } catch {
     return writerUnavailable();
   }
+}
+
+export async function withBoundDurableTaskWriter<Value>(
+  request: WithBoundDurableTaskWriterRequest<Value>,
+): Promise<WithDurableTaskWriterResult<Value>> {
+  const current = await readDurableTask({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+  });
+  if (!current.ok) {
+    return current;
+  }
+  const revalidationId =
+    `BOUND-WRITER-${request.taskId}-${current.state.projection.version}`;
+  const now = new Date();
+  const timestamp = now.toISOString();
+  const resumed = await resumeDurablePhaseExecution({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+    materials: request.materials,
+    blockEvent: {
+      eventId: `EVENT-${revalidationId}`,
+      actor: {
+        kind: "system",
+        id: "sayhi-core",
+        sessionRef: "bound-writer",
+      },
+      reason: "Bound Implementation Writer revalidation failed.",
+      idempotencyKey: revalidationId,
+      occurredAt: timestamp,
+    },
+  });
+  if (!resumed.ok) {
+    return resumed;
+  }
+  if (resumed.status === "blocked") {
+    return failure(resumed.diagnostics);
+  }
+  if (resumed.status !== "ready") {
+    return phaseExecutionResultInvalid(
+      "Bound Implementation dispatch is not ready for a Writer operation.",
+    );
+  }
+  if (
+    resumed.binding.phase !== "implement" ||
+    resumed.binding.agentRole !== "implementation"
+  ) {
+    return phaseExecutionResultInvalid(
+      "Bound Writer requires the active Implementation Agent dispatch.",
+    );
+  }
+  const authorized = authorizePhaseExecution({
+    contractVersion: 1,
+    binding: resumed.binding,
+    ...request.materials,
+    capability: { kind: "repository", access: "write" },
+  });
+  if (!authorized.ok) {
+    return phaseExecutionFailure(authorized.diagnostics);
+  }
+  return withDurableTaskWriter({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+    expectedVersion: resumed.state.projection.version,
+    operation: request.operation,
+  });
 }
 export async function recordDurableQuickResult(
   request: RecordDurableQuickResultRequest,
@@ -3165,12 +3238,44 @@ async function advanceDurableTaskLocked(
   if (!loaded.ok) {
     return loaded;
   }
+  if (request.transition.expectedVersion !== loaded.state.projection.version) {
+    const retried = transitionWorkflow(loaded.state, request.transition);
+    if (!retried.ok) {
+      return failure(retried.diagnostics);
+    }
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: retried.state,
+      event: retried.event,
+      appended: false,
+    });
+  }
   if (isBuildPlanTransition(loaded.state, request.transition)) {
     return buildPlanApprovalRequired();
   }
-  const transitioned = transitionWorkflow(loaded.state, request.transition);
+  const resealed = await resealBuildImplementationAfterContextDrift(
+    request.fileSystem,
+    paths,
+    loaded.state,
+  );
+  if (resealed !== null) {
+    return resealed;
+  }
+  let transitioned = transitionWorkflow(loaded.state, request.transition);
   if (!transitioned.ok) {
-    return failure(transitioned.diagnostics);
+    const blocked = blockExhaustedDurableRepair(
+      loaded.state,
+      request.transition,
+      transitioned.diagnostics,
+    );
+    if (blocked === null) {
+      return failure(transitioned.diagnostics);
+    }
+    transitioned = blocked;
+    if (!transitioned.ok) {
+      return failure(transitioned.diagnostics);
+    }
   }
   if (transitioned.state.events.length === loaded.state.events.length) {
     return Object.freeze({
@@ -3180,14 +3285,6 @@ async function advanceDurableTaskLocked(
       event: transitioned.event,
       appended: false,
     });
-  }
-  const resealed = await resealBuildImplementationAfterContextDrift(
-    request.fileSystem,
-    paths,
-    loaded.state,
-  );
-  if (resealed !== null) {
-    return resealed;
   }
   const graph = transitioned.event.initiativeGraph;
   let activePath = loaded.eventsPath;
@@ -3236,6 +3333,50 @@ async function advanceDurableTaskLocked(
   } catch {
     return ioFailure(activePath);
   }
+}
+
+function blockExhaustedDurableRepair(
+  state: WorkflowState,
+  transition: TransitionWorkflowRequest,
+  diagnostics: readonly WorkflowDiagnostic[],
+): ReturnType<typeof transitionWorkflow> | null {
+  if (
+    !diagnostics.some(
+      (diagnostic) => diagnostic.code === "workflow.repair.exhausted",
+    ) ||
+    state.projection.route !== "build" ||
+    state.projection.lifecycle !== "active" ||
+    state.projection.phase !== "review"
+  ) {
+    return null;
+  }
+  const reviewResult = [...state.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "phase_execution_result_accepted" &&
+        event.from.phase === "review",
+    );
+  if (reviewResult === undefined) {
+    return null;
+  }
+  return transitionWorkflow(state, {
+    ...transition,
+    to: {
+      lifecycle: "blocked",
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    gates: [
+      {
+        gate: "block",
+        evidence: [
+          { kind: "workflow", reference: `events/${reviewResult.eventId}` },
+        ],
+      },
+    ],
+    blockers: ["Configured Review repair attempts are exhausted."],
+  });
 }
 
 async function escalateDurableQuickToBuildLocked(
