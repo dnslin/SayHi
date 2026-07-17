@@ -279,11 +279,36 @@ export class NodeManagedProjectFileSystem
         "--no-renames",
       ]),
     ]);
+    const filteredStagedPaths = Object.freeze(
+      stagedPaths.filter((path) => !isTaskCommitExcludedPath(path)).sort(),
+    );
+    if (head === null) {
+      return Object.freeze({
+        head: null,
+        headParent: null,
+        headMessage: null,
+        headPaths: Object.freeze([]),
+        stagedPaths: filteredStagedPaths,
+      });
+    }
+    const [headParent, headMessage, headPaths] = await Promise.all([
+      readGitCommitParent(this.#repositoryRoot, head),
+      readGitCommitMessage(this.#repositoryRoot, head),
+      listGitPaths(this.#repositoryRoot, [
+        "diff-tree",
+        "--no-commit-id",
+        "--name-only",
+        "-r",
+        "-z",
+        head,
+      ]),
+    ]);
     return Object.freeze({
       head,
-      stagedPaths: Object.freeze(
-        stagedPaths.filter((path) => !isTaskCommitExcludedPath(path)).sort(),
-      ),
+      headParent,
+      headMessage,
+      headPaths: Object.freeze([...headPaths].sort()),
+      stagedPaths: filteredStagedPaths,
     });
   }
 
@@ -565,6 +590,32 @@ async function readGitHead(repositoryRoot: string): Promise<string | null> {
     }
     throw error;
   }
+}
+
+async function readGitCommitParent(
+  repositoryRoot: string,
+  commit: string,
+): Promise<string | null> {
+  try {
+    const parent = (await runGit(repositoryRoot, ["rev-parse", `${commit}^`]))
+      .toString("utf8")
+      .trim();
+    return parent.length === 0 ? null : parent;
+  } catch (error) {
+    if (error instanceof GitCommandError && error.exitCode === 128) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function readGitCommitMessage(
+  repositoryRoot: string,
+  commit: string,
+): Promise<string> {
+  return (await runGit(repositoryRoot, ["log", "-1", "--format=%B", commit]))
+    .toString("utf8")
+    .trimEnd();
 }
 
 async function listGitPaths(
