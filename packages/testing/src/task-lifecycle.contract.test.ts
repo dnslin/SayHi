@@ -5,6 +5,7 @@ import {
   coreContract,
   type BindPhaseExecutionRequest,
   type PhaseExecutionMaterials,
+  type ContractIdentity,
   type ReviewFinding,
   advanceDurableTask,
   addDurableContextManifestEntry,
@@ -29,6 +30,7 @@ import {
   createCompletedDurableTask,
   IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
+  recordTestPhaseResult,
   taskLifecycleEventMetadata,
   taskLifecycleExploreTransition,
   taskLifecycleStartRequest,
@@ -2320,7 +2322,7 @@ async function recordSucceededImplementation(
 async function recordReviewResult(
   fileSystem: MemoryTaskLifecycleFileSystem,
   prepared: Readonly<{
-    planIdentity: string;
+    planIdentity: ContractIdentity;
     execution: BindPhaseExecutionRequest;
   }>,
   state: WorkflowState,
@@ -2332,54 +2334,23 @@ async function recordReviewResult(
 ): Promise<WorkflowState> {
   const reviewAgent = REVIEW_AGENTS.find((agent) => agent.role === role);
   assert.ok(reviewAgent, `Missing Review Agent fixture for ${role}`);
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  return recordTestPhaseResult({
     fileSystem,
+    fixture: TASK_FIXTURE,
     planIdentity: prepared.planIdentity,
-    execution: {
-      ...prepared.execution,
-      dispatch: {
-        ...prepared.execution.dispatch,
-        dispatchId: `DISPATCH-${suffix}`,
-        expectedTaskVersion: state.projection.version,
-        phase: "review",
-        agentRole: role,
-        requestedAt: occurredAt,
-        agentContractIdentity: reviewAgent.contractIdentity,
-      },
-      agentContract: reviewAgent.contract,
-      skills: [],
+    contextManifestIdentity: prepared.execution.dispatch.contextManifestIdentity,
+    state,
+    phase: "review",
+    agent: reviewAgent,
+    materials: {
+      manifest: prepared.execution.manifest,
+      currentContext: prepared.execution.currentContext,
     },
-    event: taskLifecycleEventMetadata(TASK_FIXTURE, `${suffix}-DISPATCH`, occurredAt),
+    outcome,
+    reviewFindings: findings,
+    suffix,
+    occurredAt,
   });
-  if (!dispatched.ok) {
-    assert.fail(dispatched.diagnostics[0]?.message ?? "Review dispatch failed");
-  }
-  const result = await coreContract.recordDurablePhaseExecutionResult({
-    fileSystem,
-    taskId: TASK_ID,
-    result: {
-      schemaVersion: 1,
-      dispatchId: dispatched.binding.dispatchId,
-      taskId: TASK_ID,
-      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
-      phase: "review",
-      agentRole: role,
-      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
-      agentContractIdentity: dispatched.binding.agentContractIdentity,
-      baseFingerprint: dispatched.binding.baseFingerprint,
-      outcome,
-      artifacts: [`artifacts/${role}.md`],
-      evidence: [`evidence/${role}.json`],
-      findings: [],
-      reviewFindings: findings,
-      observedFinalFingerprint: dispatched.binding.baseFingerprint,
-    },
-    event: taskLifecycleEventMetadata(TASK_FIXTURE, `${suffix}-RESULT`, occurredAt),
-  });
-  if (!result.ok) {
-    assert.fail(result.diagnostics[0]?.message ?? "Review result failed");
-  }
-  return result.state;
 }
 
 

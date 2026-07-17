@@ -9,6 +9,12 @@ import {
   dispatchDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
   type ContextManifestFileSystem,
+  type AgentResultOutcome,
+  type BindPhaseExecutionRequest,
+  type ContractIdentity,
+  type PhaseAgentContract,
+  type ReviewFinding,
+  type SkillMaterial,
   type StartWorkflowTaskRequest,
   type TransitionWorkflowRequest,
   type WorkflowEventMetadata,
@@ -25,6 +31,13 @@ export interface TaskLifecycleFixture {
   readonly files: readonly string[];
   readonly eventNamespace: string;
   readonly sessionRef: string;
+}
+
+export interface TestPhaseAgent {
+  readonly role: "implementation" | "standards-review" | "spec-review";
+  readonly contractIdentity: ContractIdentity;
+  readonly contract: PhaseAgentContract;
+  readonly skills?: readonly SkillMaterial[];
 }
 
 export const IMPLEMENTATION_AGENT = {
@@ -63,7 +76,7 @@ export const IMPLEMENTATION_AGENT = {
       content: "tdd skill\n",
     },
   ],
-} as const;
+} as const satisfies TestPhaseAgent;
 export const REVIEW_AGENTS = [
   {
     role: "standards-review",
@@ -103,7 +116,7 @@ export const REVIEW_AGENTS = [
       overridePolicy: "prompt-body-only",
     },
   },
-] as const;
+] as const satisfies readonly TestPhaseAgent[];
 
 
 export function taskLifecycleStartRequest(
@@ -236,6 +249,87 @@ export function taskLifecycleTransition(
   };
 }
 
+export async function recordTestPhaseResult(
+  request: Readonly<{
+    fileSystem: ContextManifestFileSystem;
+    fixture: TaskLifecycleFixture;
+    planIdentity: ContractIdentity;
+    contextManifestIdentity: ContractIdentity;
+    state: WorkflowState;
+    phase: "implement" | "review";
+    agent: TestPhaseAgent;
+    materials: Pick<BindPhaseExecutionRequest, "manifest" | "currentContext">;
+    outcome: AgentResultOutcome;
+    reviewFindings?: readonly ReviewFinding[];
+    suffix: string;
+    occurredAt: string;
+  }>,
+): Promise<WorkflowState> {
+  const dispatched = await dispatchDurablePhaseExecution({
+    fileSystem: request.fileSystem,
+    planIdentity: request.planIdentity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: `DISPATCH-${request.fixture.eventNamespace}-${request.suffix}`,
+        taskId: request.fixture.taskId,
+        expectedTaskVersion: request.state.projection.version,
+        phase: request.phase,
+        agentRole: request.agent.role,
+        baseFingerprint: `sha256:${"d".repeat(64)}`,
+        requestedAt: request.occurredAt,
+        contextManifestIdentity: request.contextManifestIdentity,
+        agentContractIdentity: request.agent.contractIdentity,
+      },
+      manifest: request.materials.manifest,
+      currentContext: request.materials.currentContext,
+      agentContract: request.agent.contract,
+      skills: request.agent.skills ?? [],
+    },
+    event: taskLifecycleEventMetadata(
+      request.fixture,
+      `${request.suffix}-DISPATCHED`,
+      request.occurredAt,
+    ),
+  });
+  if (!dispatched.ok) {
+    throw new Error(dispatched.diagnostics[0]?.message ?? "Phase dispatch failed");
+  }
+  const result = await recordDurablePhaseExecutionResult({
+    fileSystem: request.fileSystem,
+    taskId: request.fixture.taskId,
+    result: {
+      schemaVersion: 1,
+      dispatchId: dispatched.binding.dispatchId,
+      taskId: request.fixture.taskId,
+      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
+      phase: request.phase,
+      agentRole: request.agent.role,
+      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
+      agentContractIdentity: dispatched.binding.agentContractIdentity,
+      baseFingerprint: dispatched.binding.baseFingerprint,
+      outcome: request.outcome,
+      artifacts: [`artifacts/${request.agent.role}.md`],
+      evidence: [`evidence/${request.agent.role}.json`],
+      findings: [],
+      ...(request.phase === "review"
+        ? { reviewFindings: request.reviewFindings ?? [] }
+        : {}),
+      observedFinalFingerprint: dispatched.binding.baseFingerprint,
+    },
+    event: taskLifecycleEventMetadata(
+      request.fixture,
+      `${request.suffix}-RESULT`,
+      request.occurredAt,
+    ),
+  });
+  if (!result.ok) {
+    throw new Error(result.diagnostics[0]?.message ?? "Phase result failed");
+  }
+  return result.state;
+}
+
 export async function createCompletedDurableTask(
   fileSystem: ContextManifestFileSystem,
   fixture: TaskLifecycleFixture,
@@ -314,66 +408,19 @@ export async function createCompletedDurableTask(
     );
   }
   state = approved.state;
-  const dispatched = await dispatchDurablePhaseExecution({
+  state = await recordTestPhaseResult({
     fileSystem,
+    fixture,
     planIdentity: planned.plan.identity,
-    execution: {
-      contractVersion: 1,
-      dispatch: {
-        schemaVersion: 1,
-        dispatchId: `DISPATCH-${fixture.eventNamespace}-IMPLEMENT`,
-        taskId: fixture.taskId,
-        expectedTaskVersion: state.projection.version,
-        phase: "implement",
-        agentRole: "implementation",
-        baseFingerprint: `sha256:${"d".repeat(64)}`,
-        requestedAt: transitionedAt,
-        contextManifestIdentity: planned.plan.contextManifestIdentity,
-        agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
-      },
-      manifest: [],
-      currentContext: [],
-      agentContract: IMPLEMENTATION_AGENT.contract,
-      skills: IMPLEMENTATION_AGENT.skills,
-    },
-    event: taskLifecycleEventMetadata(
-      fixture,
-      "IMPLEMENT-DISPATCHED",
-      transitionedAt,
-    ),
+    contextManifestIdentity: planned.plan.contextManifestIdentity,
+    state,
+    phase: "implement",
+    agent: IMPLEMENTATION_AGENT,
+    materials: { manifest: [], currentContext: [] },
+    outcome: "succeeded",
+    suffix: "IMPLEMENT",
+    occurredAt: transitionedAt,
   });
-  if (!dispatched.ok) {
-    throw new Error(dispatched.diagnostics[0]?.message ?? "Implement dispatch failed");
-  }
-  const implemented = await recordDurablePhaseExecutionResult({
-    fileSystem,
-    taskId: fixture.taskId,
-    result: {
-      schemaVersion: 1,
-      dispatchId: dispatched.binding.dispatchId,
-      taskId: fixture.taskId,
-      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
-      phase: "implement",
-      agentRole: "implementation",
-      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
-      agentContractIdentity: dispatched.binding.agentContractIdentity,
-      baseFingerprint: dispatched.binding.baseFingerprint,
-      outcome: "succeeded",
-      artifacts: ["artifacts/implementation.md"],
-      evidence: ["evidence/implementation.json"],
-      findings: [],
-      observedFinalFingerprint: dispatched.binding.baseFingerprint,
-    },
-    event: taskLifecycleEventMetadata(
-      fixture,
-      "IMPLEMENT-RESULT",
-      transitionedAt,
-    ),
-  });
-  if (!implemented.ok) {
-    throw new Error(implemented.diagnostics[0]?.message ?? "Implement result failed");
-  }
-  state = implemented.state;
   const reviewed = await advanceDurableTask({
     fileSystem,
     transition: taskLifecycleTransition(
@@ -390,67 +437,19 @@ export async function createCompletedDurableTask(
   }
   state = reviewed.state;
   for (const reviewAgent of REVIEW_AGENTS) {
-    const dispatched = await dispatchDurablePhaseExecution({
+    state = await recordTestPhaseResult({
       fileSystem,
+      fixture,
       planIdentity: planned.plan.identity,
-      execution: {
-        contractVersion: 1,
-        dispatch: {
-          schemaVersion: 1,
-          dispatchId: `DISPATCH-${fixture.eventNamespace}-${reviewAgent.role}`,
-          taskId: fixture.taskId,
-          expectedTaskVersion: state.projection.version,
-          phase: "review",
-          agentRole: reviewAgent.role,
-          baseFingerprint: `sha256:${"d".repeat(64)}`,
-          requestedAt: transitionedAt,
-          contextManifestIdentity: planned.plan.contextManifestIdentity,
-          agentContractIdentity: reviewAgent.contractIdentity,
-        },
-        manifest: [],
-        currentContext: [],
-        agentContract: reviewAgent.contract,
-        skills: [],
-      },
-      event: taskLifecycleEventMetadata(
-        fixture,
-        `${reviewAgent.role}-DISPATCHED`,
-        transitionedAt,
-      ),
+      state,
+      contextManifestIdentity: planned.plan.contextManifestIdentity,
+      phase: "review",
+      agent: reviewAgent,
+      materials: { manifest: [], currentContext: [] },
+      outcome: "succeeded",
+      suffix: reviewAgent.role,
+      occurredAt: transitionedAt,
     });
-    if (!dispatched.ok) {
-      throw new Error(dispatched.diagnostics[0]?.message ?? "Review dispatch failed");
-    }
-    const result = await recordDurablePhaseExecutionResult({
-      fileSystem,
-      taskId: fixture.taskId,
-      result: {
-        schemaVersion: 1,
-        dispatchId: dispatched.binding.dispatchId,
-        taskId: fixture.taskId,
-        expectedTaskVersion: dispatched.binding.expectedTaskVersion,
-        phase: "review",
-        agentRole: reviewAgent.role,
-        contextManifestIdentity: dispatched.binding.contextManifestIdentity,
-        agentContractIdentity: dispatched.binding.agentContractIdentity,
-        baseFingerprint: dispatched.binding.baseFingerprint,
-        outcome: "succeeded",
-        artifacts: [`artifacts/${reviewAgent.role}.md`],
-        evidence: [`evidence/${reviewAgent.role}.json`],
-        findings: [],
-        reviewFindings: [],
-        observedFinalFingerprint: dispatched.binding.baseFingerprint,
-      },
-      event: taskLifecycleEventMetadata(
-        fixture,
-        `${reviewAgent.role}-RESULT`,
-        transitionedAt,
-      ),
-    });
-    if (!result.ok) {
-      throw new Error(result.diagnostics[0]?.message ?? "Review result failed");
-    }
-    state = result.state;
   }
   for (const [lifecycle, phase] of [
     ["active", "finish"],

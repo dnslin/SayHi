@@ -3494,7 +3494,8 @@ function validateBuildReviewResultTransition(
   if (
     reviewResults.some(
       (result) =>
-        result.baseFingerprint !== implementation.observedFinalFingerprint,
+        result.baseFingerprint !== implementation.observedFinalFingerprint ||
+        result.observedFinalFingerprint !== implementation.observedFinalFingerprint,
     )
   ) {
     return diagnostic(

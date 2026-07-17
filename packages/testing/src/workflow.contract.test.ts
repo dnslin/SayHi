@@ -1023,6 +1023,53 @@ test("Build repair transitions stop at the configured attempt limit", () => {
 });
 
 
+test("Build Review requires matching observed final fingerprints", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `observed-fingerprint-${phase}`);
+  }
+  state = recordWorkflowAgentResult(
+    state,
+    "review",
+    "standards-review",
+    "succeeded",
+    [],
+    "observed-fingerprint-standards",
+  );
+  state = recordWorkflowAgentResult(
+    state,
+    "review",
+    "spec-review",
+    "succeeded",
+    [],
+    "observed-fingerprint-spec",
+    undefined,
+    `sha256:${"e".repeat(64)}`,
+  );
+  const rejected = coreContract.transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "finish", step: "ready" },
+    gates: [
+      {
+        gate: "review",
+        evidence: [{ kind: "review", reference: "evidence/review.json" }],
+      },
+    ],
+    event: eventMetadata("observed-fingerprint-finish"),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+
 test("Core rejects malformed, unbound, and duplicate Phase results", () => {
   let state = startTask("build");
   for (const [lifecycle, phase] of [
@@ -2022,6 +2069,7 @@ function recordWorkflowAgentResult(
   findings: readonly Record<string, unknown>[],
   suffix: string,
   baseFingerprint?: ContractIdentity,
+  observedFinalFingerprint?: ContractIdentity,
 ): WorkflowState {
   const planApproval = state.events.find(
     (event) =>
@@ -2082,7 +2130,7 @@ function recordWorkflowAgentResult(
       evidence: [],
       findings: [],
       ...(phase === "review" ? { reviewFindings: findings } : {}),
-      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
+      observedFinalFingerprint: observedFinalFingerprint ?? `sha256:${"d".repeat(64)}`, 
     },
     event: eventMetadata(`RESULT-${suffix}`),
   });
