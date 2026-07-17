@@ -1759,6 +1759,42 @@ async function writeInitiativeGraphIfChanged(
     serializeInitiativeGraph(graph),
   );
 }
+type InitiativeGraphPersistenceResult =
+  | Readonly<{ ok: true }>
+  | Readonly<{ ok: false; appended: boolean; path: string }>;
+
+async function persistInitiativeGraphEvent(
+  fileSystem: TaskLifecycleFileSystem,
+  paths: TaskPaths,
+  event: WorkflowTransitionedEvent | InitiativeGraphRevisedEvent,
+  state: WorkflowState,
+  graph: DependencyGraph,
+): Promise<InitiativeGraphPersistenceResult> {
+  try {
+    await fileSystem.appendFile(paths.eventsPath, serializeEvent(event));
+  } catch {
+    return Object.freeze({ ok: false, appended: false, path: paths.eventsPath });
+  }
+  try {
+    await writeInitiativeGraphIfChanged(fileSystem, paths.graphPath, graph);
+  } catch {
+    return Object.freeze({ ok: false, appended: true, path: paths.graphPath });
+  }
+  try {
+    await writeProjectionIfChanged(
+      fileSystem,
+      paths.projectionPath,
+      state.projection,
+    );
+  } catch {
+    return Object.freeze({
+      ok: false,
+      appended: true,
+      path: paths.projectionPath,
+    });
+  }
+  return Object.freeze({ ok: true });
+}
 
 async function createDurableTaskLocked(
   fileSystem: TaskLifecycleFileSystem,
@@ -3492,10 +3528,8 @@ async function advanceDurableTaskLocked(
     });
   }
   const graph = transitioned.event.initiativeGraph;
-  let activePath = loaded.eventsPath;
-  try {
-    if (graph !== null) {
-      activePath = paths.graphPath;
+  if (graph !== null) {
+    try {
       const preflight = await preflightInitiativeGraphRecord(
         request.fileSystem,
         paths,
@@ -3505,21 +3539,34 @@ async function advanceDurableTaskLocked(
       if (preflight !== null) {
         return preflight;
       }
+      const persisted = await persistInitiativeGraphEvent(
+        request.fileSystem,
+        paths,
+        transitioned.event,
+        transitioned.state,
+        graph,
+      );
+      if (!persisted.ok) {
+        return ioFailure(persisted.path);
+      }
+      return Object.freeze({
+        ok: true,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        state: transitioned.state,
+        event: transitioned.event,
+        appended: true,
+      });
+    } catch {
+      return ioFailure(paths.graphPath);
     }
-    const appended = transitioned.state.events.length > loaded.state.events.length;
-    activePath = loaded.eventsPath;
+  }
+  const appended = transitioned.state.events.length > loaded.state.events.length;
+  let activePath = loaded.eventsPath;
+  try {
     if (appended) {
       await request.fileSystem.appendFile(
         loaded.eventsPath,
         serializeEvent(transitioned.event),
-      );
-    }
-    if (graph !== null) {
-      activePath = paths.graphPath;
-      await writeInitiativeGraphIfChanged(
-        request.fileSystem,
-        paths.graphPath,
-        graph,
       );
     }
     activePath = loaded.projectionPath;
@@ -3578,8 +3625,6 @@ async function reviseDurableInitiativeGraphLocked(
       ),
     ]);
   }
-  let activePath = paths.graphPath;
-  let appended = false;
   try {
     const preflight = await preflightInitiativeGraphRecord(
       request.fileSystem,
@@ -3590,33 +3635,23 @@ async function reviseDurableInitiativeGraphLocked(
     if (preflight !== null) {
       return preflight;
     }
-    activePath = loaded.eventsPath;
-    await request.fileSystem.appendFile(
-      loaded.eventsPath,
-      serializeEvent(revised.event),
-    );
-    appended = true;
-    activePath = paths.graphPath;
-    await writeInitiativeGraphIfChanged(
+    const persisted = await persistInitiativeGraphEvent(
       request.fileSystem,
-      paths.graphPath,
+      paths,
+      revised.event,
+      revised.state,
       revised.event.initiativeGraph,
     );
-    activePath = loaded.projectionPath;
-    await writeProjectionIfChanged(
-      request.fileSystem,
-      loaded.projectionPath,
-      revised.state.projection,
-    );
-    return Object.freeze({
-      ok: true,
-      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
-      state: revised.state,
-      event: revised.event,
-      appended,
-    });
-  } catch {
-    if (appended) {
+    if (persisted.ok) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        state: revised.state,
+        event: revised.event,
+        appended: true,
+      });
+    }
+    if (persisted.appended) {
       const recovered = await recoverDurableTaskLocked(
         { fileSystem: request.fileSystem, taskId: request.taskId },
         paths,
@@ -3627,11 +3662,13 @@ async function reviseDurableInitiativeGraphLocked(
           contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
           state: revised.state,
           event: revised.event,
-          appended,
+          appended: true,
         });
       }
     }
-    return ioFailure(activePath);
+    return ioFailure(persisted.path);
+  } catch {
+    return ioFailure(paths.graphPath);
   }
 }
 
