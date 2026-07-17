@@ -24,6 +24,7 @@ import {
   startWorkflowTask,
   escalateQuickToBuild,
   recordContextManifestChange,
+  recordBuildPlanChange,
   transitionWorkflow,
 } from "./workflow.js";
 import {
@@ -249,6 +250,7 @@ export {
   escalateQuickToBuild,
   transitionWorkflow,
   recordContextManifestChange,
+  recordBuildPlanChange,
 } from "./workflow.js";
 export type {
   DependencyGraph,
@@ -262,12 +264,16 @@ export type {
   AdoptWorkflowBaselineRequest,
   AdoptWorkflowBaselineResult,
   BaselineAdoptedEvent,
+  BuildPlanChange,
+  BuildPlanChangedEvent,
   ContextManifestChange,
   ContextManifestChangedEvent,
   EscalateQuickToBuildRequest,
   EscalateQuickToBuildResult,
   RecordContextManifestChangeRequest,
   RecordContextManifestChangeResult,
+  RecordBuildPlanChangeRequest,
+  RecordBuildPlanChangeResult,
   BaselineAdoptedPath,
   RouteDefinition,
   RouteEscalatedEvent,
@@ -411,6 +417,7 @@ export interface CoreContract {
   readonly replayWorkflowEvents: typeof replayWorkflowEvents;
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
+  readonly recordBuildPlanChange: typeof recordBuildPlanChange;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly readDurableQuickResult: typeof readDurableQuickResult;
@@ -461,6 +468,7 @@ export const coreContract: CoreContract = Object.freeze({
   replayWorkflowEvents,
   adoptWorkflowBaseline,
   recordContextManifestChange,
+  recordBuildPlanChange,
   createDurableTask,
   createDurableTaskHandoff,
   readDurableQuickResult,

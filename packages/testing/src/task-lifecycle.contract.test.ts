@@ -12,6 +12,7 @@ import {
   freezeDurableContextManifest,
   listDurableTasks,
   recordDurableBuildPlan,
+  refreshDurableContextManifest,
   recoverDurableTask,
   type TaskArchiveFileSystem,
   type TransitionWorkflowRequest,
@@ -1173,11 +1174,175 @@ test("only a durable hash-bound approved Build Plan enters Implement", async () 
   }
   assert.equal(repeatedApproval.appended, false);
   assert.deepEqual(repeatedApproval.state, approved.state);
+  const staleAdvance = await advanceDurableTask({
+    fileSystem,
+    transition: {
+      ...taskLifecycleTransition(
+        TASK_FIXTURE,
+        repeatedApproval.state,
+        "active",
+        "review",
+        "CONTEXT-DRIFT-STALE-REVIEW",
+        "2026-07-15T14:06:15Z",
+      ),
+      expectedVersion: repeatedApproval.state.projection.version - 1,
+    },
+  });
+  assert.equal(staleAdvance.ok, false);
+  if (!staleAdvance.ok) {
+    assert.equal(staleAdvance.diagnostics[0]?.code, "workflow.version.stale");
+  }
+  const beforeReseal = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(beforeReseal.ok, true);
+  if (!beforeReseal.ok) {
+    return;
+  }
+  assert.equal(beforeReseal.state.projection.phase, "implement");
+  assert.equal(
+    beforeReseal.state.projection.version,
+    repeatedApproval.state.projection.version,
+  );
+  const driftedAdvance = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      repeatedApproval.state,
+      "active",
+      "review",
+      "CONTEXT-DRIFT-REVIEW",
+      "2026-07-15T14:06:30Z",
+    ),
+  });
+  assert.equal(driftedAdvance.ok, false);
+  if (!driftedAdvance.ok) {
+    assert.equal(driftedAdvance.diagnostics[0]?.code, "build_plan.context_stale");
+  }
 
   const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
   assert.equal(recovered.ok, true);
   if (!recovered.ok) {
     return;
   }
-  assert.deepEqual(recovered.state, approved.state);
+  assert.equal(recovered.state.projection.phase, "plan");
+  const refreshedContext = await refreshDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: recovered.state.projection.version,
+    phase: "implement",
+    acceptRequiredApprovedSpecChanges: false,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "CONTEXT-REFRESH-AFTER-APPROVAL",
+      "2026-07-15T14:07:00Z",
+    ),
+  });
+  if (!refreshedContext.ok) {
+    assert.fail(
+      refreshedContext.diagnostics[0]?.message ?? "Context refresh unexpectedly failed.",
+    );
+  }
+  assert.equal(refreshedContext.ok, true);
+  assert.equal(refreshedContext.state.projection.phase, "plan");
+  const resealed = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(resealed.ok, true);
+  if (!resealed.ok) {
+    return;
+  }
+  assert.equal(resealed.state.projection.phase, "plan");
+});
+
+test("a superseded Build Plan cannot be rejected", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  if (!created.ok) {
+    assert.fail(created.diagnostics[0]?.message ?? "Task creation failed");
+  }
+  const explored = await advanceDurableTask({
+    fileSystem,
+    transition: exploreTransition(created.state.projection.version),
+  });
+  if (!explored.ok) {
+    assert.fail(explored.diagnostics[0]?.message ?? "Explore transition failed");
+  }
+  const planned = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      explored.state,
+      "active",
+      "plan",
+      "SUPERSEDED-PLAN",
+      "2026-07-15T14:08:00Z",
+    ),
+  });
+  if (!planned.ok) {
+    assert.fail(planned.diagnostics[0]?.message ?? "Plan transition failed");
+  }
+  const frozen = await freezeDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: planned.state.projection.version,
+    phase: "implement",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "SUPERSEDED-CONTEXT",
+      "2026-07-15T14:08:30Z",
+    ),
+  });
+  if (!frozen.ok) {
+    assert.fail(frozen.diagnostics[0]?.message ?? "Context freeze failed");
+  }
+  const original = await recordDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: frozen.state.projection.version,
+    content: "# Original Plan\n\nReview the first approach.\n",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "SUPERSEDED-ORIGINAL",
+      "2026-07-15T14:09:00Z",
+    ),
+  });
+  if (!original.ok) {
+    assert.fail(original.diagnostics[0]?.message ?? "Original Plan record failed");
+  }
+  const revised = await recordDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: original.state.projection.version,
+    content: "# Revised Plan\n\nReview the revised approach.\n",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "SUPERSEDED-REVISED",
+      "2026-07-15T14:09:30Z",
+    ),
+  });
+  if (!revised.ok) {
+    assert.fail(revised.diagnostics[0]?.message ?? "Revised Plan record failed");
+  }
+  const rejection = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: revised.state.projection.version,
+    decision: "rejected",
+    planIdentity: original.plan.identity,
+    contextManifestIdentity: original.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(
+        TASK_FIXTURE,
+        "SUPERSEDED-REJECTION",
+        "2026-07-15T14:10:00Z",
+      ),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "approval-session" },
+    },
+  });
+  assert.equal(rejection.ok, false);
+  if (!rejection.ok) {
+    assert.equal(rejection.diagnostics[0]?.code, "build_plan.rejected");
+  }
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (recovered.ok) {
+    assert.deepEqual(recovered.state, revised.state);
+  }
 });

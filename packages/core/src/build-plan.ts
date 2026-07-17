@@ -188,9 +188,9 @@ function isTaskIntent(value: unknown): value is TaskIntent {
     return false;
   }
   return (
-    isNonEmptyStringArray(value.goals) &&
-    isNonEmptyStringArray(value.nonGoals) &&
-    isNonEmptyStringArray(value.acceptanceCriteria)
+    isStringArray(value.goals) &&
+    isStringArray(value.nonGoals) &&
+    isStringArray(value.acceptanceCriteria)
   );
 }
 
@@ -208,7 +208,7 @@ function isWorkflowActor(value: unknown): value is WorkflowActor {
   );
 }
 
-function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+function isStringArray(value: unknown): value is readonly string[] {
   return (
     Array.isArray(value) &&
     value.every((item) => typeof item === "string" && item.trim().length > 0)

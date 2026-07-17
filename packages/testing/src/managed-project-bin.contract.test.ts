@@ -24,6 +24,11 @@ import {
   taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
+import {
+  requireRecord,
+  requireString,
+  requireVersion,
+} from "./json-test-support.js";
 
 const executeFile = promisify(execFile);
 const CLI_BINARY = fileURLToPath(
@@ -44,32 +49,6 @@ const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    assert.fail(`${label} must be a JSON object.`);
-  }
-  return value;
-}
-
-function requireString(record: Record<string, unknown>, field: string): string {
-  const value = record[field];
-  if (typeof value !== "string") {
-    assert.fail(`${field} must be a string.`);
-  }
-  return value;
-}
-
-function requireVersion(record: Record<string, unknown>, field: string): number {
-  const value = record[field];
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
-    assert.fail(`${field} must be a positive safe integer.`);
-  }
-  return value;
-}
 
 
 test("packaged CLI binary executes Managed Project lifecycle commands", async (t) => {
@@ -251,7 +230,7 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
   assert.equal(blockedWriterEntered, false);
   assert.equal(
     blockedWriter.diagnostics[0]?.code,
-    "task_lifecycle.baseline.missing",
+    "build_plan.approval_required",
   );
   assert.equal(
     await readFile(
@@ -376,6 +355,25 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
   assert.equal(diagnosed.ok, true);
   assert.equal(diagnosed.operation, "project.doctor");
   assert.equal(diagnosed.result?.taskCount, 1);
+  const refreshedContext = await executeCliResult(
+    "context",
+    "refresh",
+    FOUNDATION_TASK.taskId,
+    "implement",
+    "--apply",
+    "--accept-approved-spec-change",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  if (refreshedContext.exitCode !== 0) {
+    const envelope = JSON.parse(refreshedContext.stdout) as CliJsonEnvelope;
+    assert.fail(envelope.error?.message ?? "Context refresh unexpectedly failed");
+  }
+  assert.equal(refreshedContext.exitCode, 0);
+  state = await showTaskState(repository);
+  assert.equal(state.projection.phase, "plan");
+  state = await approveFoundationPlan(repository, state, "2026-07-15T12:03:30Z");
 
   state = await advanceFoundationTask(
     repository,
@@ -1814,15 +1812,16 @@ async function approveFoundationPlan(
   const frozenState = await showTaskState(repository);
   assert.equal(frozenState.projection.version > state.projection.version, true);
 
+  const planEventSuffix = `${state.projection.version}`;
   await writeTaskRequest(repository, ".sayhi/.runtime/plan-record.json", {
     taskId: FOUNDATION_TASK.taskId,
     expectedVersion: frozenState.projection.version,
     content: "# Foundation Implementation Plan\n\nAdvance only after human approval.\n",
     event: {
-      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED`,
+      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED-${planEventSuffix}`,
       actor: { kind: "agent", id: "planning-agent", sessionRef: FOUNDATION_TASK.sessionRef },
       reason: "Record the Foundation implementation Plan.",
-      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED`,
+      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-RECORDED-${planEventSuffix}`,
       occurredAt,
     },
   });
@@ -1852,10 +1851,10 @@ async function approveFoundationPlan(
     planIdentity: requireString(plan, "identity"),
     contextManifestIdentity: requireString(plan, "contextManifestIdentity"),
     event: {
-      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED`,
+      eventId: `EVENT-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED-${planEventSuffix}`,
       actor: { kind: "user", id: "foundation-reviewer", sessionRef: FOUNDATION_TASK.sessionRef },
       reason: "Approve the Foundation implementation Plan.",
-      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED`,
+      idempotencyKey: `IDEMPOTENCY-${FOUNDATION_TASK.eventNamespace}-PLAN-APPROVED-${planEventSuffix}`,
       occurredAt,
     },
   });

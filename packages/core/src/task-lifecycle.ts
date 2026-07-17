@@ -39,6 +39,7 @@ import {
 } from "./spec-approval.js";
 import {
   adoptWorkflowBaseline,
+  currentImplementContextChange,
   isRepositoryRelativePath,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -114,6 +115,7 @@ export interface TaskBaselineFileSystem extends TaskLifecycleFileSystem {
     operation: (writer: TaskWriter) => Promise<Result>,
   ): Promise<Result>;
 }
+
 
 
 export type TaskLifecycleDiagnosticCode =
@@ -1490,7 +1492,6 @@ async function addDurableContextManifestEntryLocked(
     entries: nextEntries,
     previousEventCount: loaded.state.events.length,
     state: changed.state,
-    event: changed.event,
     persist: request.persist ?? true,
   });
   if (persisted !== null) {
@@ -1588,18 +1589,59 @@ async function refreshDurableContextManifestLocked(
     );
   }
   const frozenEntries = Object.freeze(nextEntries);
+  const refreshedContextIdentity = hashCanonicalJson(frozenEntries);
   const changed = recordContextManifestChange(loaded.state, {
     contractVersion: 1,
     taskId: request.taskId,
     expectedVersion: request.expectedVersion,
     phase: request.phase,
     manifestPath: manifest.manifestReference,
-    manifestIdentity: hashCanonicalJson(frozenEntries),
+    manifestIdentity: refreshedContextIdentity,
     change: "refreshed",
     event: request.event,
   });
   if (!changed.ok) {
     return failure(changed.diagnostics);
+  }
+  let state = changed.state;
+  if (
+    loaded.state.projection.route === "build" &&
+    loaded.state.projection.lifecycle === "active" &&
+    loaded.state.projection.phase === "implement" &&
+    !hasFrozenImplementContext(
+      loaded.state,
+      "context/implement.jsonl",
+      refreshedContextIdentity,
+    )
+  ) {
+    const replanned = transitionWorkflow(changed.state, {
+      contractVersion: 1,
+      taskId: request.taskId,
+      expectedVersion: changed.state.projection.version,
+      to: { lifecycle: "active", phase: "plan", step: "ready" },
+      gates: [
+        {
+          gate: "replan",
+          evidence: [
+            {
+              kind: "workflow",
+              reference: `context/implement.jsonl#${refreshedContextIdentity}`,
+            },
+          ],
+        },
+      ],
+      event: {
+        eventId: `${request.event.eventId}-REPLAN`,
+        actor: request.event.actor,
+        reason: `${request.event.reason} Replan after Implement Context refresh.`,
+        idempotencyKey: `${request.event.idempotencyKey}-REPLAN`,
+        occurredAt: request.event.occurredAt,
+      },
+    });
+    if (!replanned.ok) {
+      return failure(replanned.diagnostics);
+    }
+    state = replanned.state;
   }
   const persisted = await persistContextManifestChange({
     fileSystem: request.fileSystem,
@@ -1607,8 +1649,7 @@ async function refreshDurableContextManifestLocked(
     manifestPath: manifest.manifestPath,
     entries: frozenEntries,
     previousEventCount: loaded.state.events.length,
-    state: changed.state,
-    event: changed.event,
+    state,
     persist: request.persist ?? true,
   });
   if (persisted !== null) {
@@ -1635,7 +1676,7 @@ async function refreshDurableContextManifestLocked(
   return Object.freeze({
     ok: true,
     contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
-    state: changed.state,
+    state,
     event: changed.event,
     entries: frozenEntries,
     planned: request.persist === false,
@@ -1707,7 +1748,6 @@ async function freezeDurableContextManifestLocked(
     entries,
     previousEventCount: loaded.state.events.length,
     state: changed.state,
-    event: changed.event,
     persist: request.persist ?? true,
   });
   if (persisted !== null) {
@@ -1771,7 +1811,6 @@ async function removeDurableContextManifestEntryLocked(
     entries,
     previousEventCount: loaded.state.events.length,
     state: changed.state,
-    event: changed.event,
     persist: request.persist ?? true,
   });
   if (persisted !== null) {
@@ -1917,7 +1956,6 @@ interface PersistContextManifestChangeRequest {
   readonly entries: readonly ContextManifestEntry[];
   readonly previousEventCount: number;
   readonly state: WorkflowState;
-  readonly event: ContextManifestChangedEvent;
   readonly persist: boolean;
 }
 
@@ -1942,10 +1980,10 @@ async function persistContextManifestChange(
     if (request.persist === false) {
       return null;
     }
-    if (request.state.events.length > request.previousEventCount) {
+    for (const event of request.state.events.slice(request.previousEventCount)) {
       await request.fileSystem.appendFile(
         request.paths.eventsPath,
-        serializeEvent(request.event),
+        serializeEvent(event),
       );
     }
     await request.fileSystem.writeFile(
@@ -2231,6 +2269,19 @@ async function decideDurableBuildPlanLocked(
       "Record the immutable Plan through Core before deciding it.",
     );
   }
+  const currentPlan = currentBuildPlanChange(loaded.state);
+  const isRejectionRetry =
+    request.decision === "rejected" &&
+    findBuildPlanChange(loaded.state, "rejected", plan.plan)?.idempotencyKey ===
+      request.event.idempotencyKey;
+  if (
+    !isRejectionRetry &&
+    (currentPlan === undefined ||
+      !matchesBuildPlanBinding(currentPlan, plan.plan) ||
+      currentPlan.change !== "recorded")
+  ) {
+    return buildPlanRejected();
+  }
   if (request.decision === "rejected") {
     const rejected = recordBuildPlanChange(loaded.state, {
       contractVersion: 1,
@@ -2401,23 +2452,33 @@ function isBuildPlanTransition(
   );
 }
 
+
 function hasFrozenImplementContext(
   state: WorkflowState,
   manifestPath: string,
   manifestIdentity: string,
 ): boolean {
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (event.type !== "context_manifest_changed" || event.phase !== "implement") {
-      continue;
-    }
-    return (
-      event.change === "frozen" &&
-      event.manifestPath === manifestPath &&
-      event.manifestIdentity === manifestIdentity
-    );
-  }
-  return false;
+  const event = currentImplementContextChange(state.events);
+  return (
+    event !== undefined &&
+    event.change === "frozen" &&
+    event.manifestPath === manifestPath &&
+    event.manifestIdentity === manifestIdentity
+  );
+}
+
+
+function matchesBuildPlanBinding(
+  event: WorkflowEvent,
+  plan: DurableBuildPlan,
+): event is BuildPlanChangedEvent {
+  return (
+    event.type === "build_plan_changed" &&
+    event.planIdentity === plan.identity &&
+    event.requirementsIdentity === plan.requirementsIdentity &&
+    event.contextManifestPath === plan.contextManifestPath &&
+    event.contextManifestIdentity === plan.contextManifestIdentity
+  );
 }
 
 function findBuildPlanChange(
@@ -2427,14 +2488,19 @@ function findBuildPlanChange(
 ): BuildPlanChangedEvent | undefined {
   for (let index = state.events.length - 1; index >= 0; index -= 1) {
     const event = state.events[index]!;
-    if (
-      event.type === "build_plan_changed" &&
-      event.change === change &&
-      event.planIdentity === plan.identity &&
-      event.requirementsIdentity === plan.requirementsIdentity &&
-      event.contextManifestPath === plan.contextManifestPath &&
-      event.contextManifestIdentity === plan.contextManifestIdentity
-    ) {
+    if (matchesBuildPlanBinding(event, plan) && event.change === change) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function currentBuildPlanChange(
+  state: WorkflowState,
+): BuildPlanChangedEvent | undefined {
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type === "build_plan_changed") {
       return event;
     }
   }
@@ -2445,20 +2511,97 @@ function isCurrentBuildPlanRecord(
   state: WorkflowState,
   plan: DurableBuildPlan,
 ): boolean {
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const event = state.events[index]!;
-    if (
-      event.type === "build_plan_changed" &&
-      event.planIdentity === plan.identity &&
-      event.requirementsIdentity === plan.requirementsIdentity &&
-      event.contextManifestPath === plan.contextManifestPath &&
-      event.contextManifestIdentity === plan.contextManifestIdentity
-    ) {
-      return event.change === "recorded";
-    }
-  }
-  return false;
+  const currentPlan = currentBuildPlanChange(state);
+  return (
+    currentPlan !== undefined &&
+    matchesBuildPlanBinding(currentPlan, plan) &&
+    currentPlan.change === "recorded"
+  );
 }
+async function resealBuildImplementationAfterContextDrift(
+  fileSystem: TaskLifecycleFileSystem,
+  paths: TaskPaths,
+  state: WorkflowState,
+): Promise<TaskLifecycleFailure | null> {
+  if (
+    state.projection.route !== "build" ||
+    state.projection.lifecycle !== "active" ||
+    state.projection.phase !== "implement"
+  ) {
+    return null;
+  }
+  const currentContext = currentImplementContextChange(state.events);
+  if (
+    typeof (fileSystem as Partial<ContextManifestFileSystem>)
+      .readRepositoryFile !== "function"
+  ) {
+    return buildPlanContextFailure(undefined);
+  }
+  const contextFileSystem = fileSystem as ContextManifestFileSystem;
+  const context = await inspectDurableContextManifest({
+    fileSystem: contextFileSystem,
+    taskId: state.projection.id,
+    phase: "implement",
+  });
+  if (
+    context.ok &&
+    context.state === "valid" &&
+    currentContext !== undefined &&
+    currentContext.change === "frozen" &&
+    hasFrozenImplementContext(
+      state,
+      "context/implement.jsonl",
+      hashCanonicalJson(context.entries),
+    )
+  ) {
+    return null;
+  }
+  const contextManifestIdentity =
+    currentContext?.manifestIdentity ?? `sha256:${"0".repeat(64)}`;
+  const replanned = transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "plan", step: "ready" },
+    gates: [
+      {
+        gate: "replan",
+        evidence: [
+          {
+            kind: "workflow",
+            reference: `context/implement.jsonl#${contextManifestIdentity}`,
+          },
+        ],
+      },
+    ],
+    event: {
+      eventId: `EVENT-${state.projection.id}-CONTEXT-DRIFT-${state.projection.version + 1}`,
+      actor: {
+        kind: "system",
+        id: "sayhi-core",
+        sessionRef: "context-drift",
+      },
+      reason: "Implement Context drift requires Build replanning.",
+      idempotencyKey: `CONTEXT-DRIFT-${state.projection.id}-${state.projection.version}`,
+      occurredAt: new Date().toISOString(),
+    },
+  });
+  if (!replanned.ok) {
+    return failure(replanned.diagnostics);
+  }
+  try {
+    await fileSystem.appendFile(paths.eventsPath, serializeEvent(replanned.event));
+    await writeProjectionIfChanged(
+      fileSystem,
+      paths.projectionPath,
+      replanned.state.projection,
+    );
+  } catch {
+    return ioFailure(paths.eventsPath);
+  }
+  return buildPlanContextFailure(context);
+}
+
 
 async function advanceDurableTaskLocked(
   request: AdvanceDurableTaskRequest,
@@ -2474,6 +2617,23 @@ async function advanceDurableTaskLocked(
   const transitioned = transitionWorkflow(loaded.state, request.transition);
   if (!transitioned.ok) {
     return failure(transitioned.diagnostics);
+  }
+  if (transitioned.state.events.length === loaded.state.events.length) {
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: transitioned.state,
+      event: transitioned.event,
+      appended: false,
+    });
+  }
+  const resealed = await resealBuildImplementationAfterContextDrift(
+    request.fileSystem,
+    paths,
+    loaded.state,
+  );
+  if (resealed !== null) {
+    return resealed;
   }
   const graph = transitioned.event.initiativeGraph;
   let activePath = loaded.eventsPath;
@@ -2904,6 +3064,22 @@ async function withDurableTaskWriterLocked<Value>(
         "Reload the current Task before requesting the Writer.",
       ),
     ]);
+  }
+  if (loaded.state.projection.route === "build") {
+    if (
+      loaded.state.projection.lifecycle !== "active" ||
+      loaded.state.projection.phase !== "implement"
+    ) {
+      return buildPlanApprovalRequired();
+    }
+    const resealed = await resealBuildImplementationAfterContextDrift(
+      request.fileSystem,
+      paths,
+      loaded.state,
+    );
+    if (resealed !== null) {
+      return resealed;
+    }
   }
   const baselinePath = taskBaselinePath(
     paths,

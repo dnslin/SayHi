@@ -17,6 +17,11 @@ import {
   taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
+import {
+  requireRecord,
+  requireString,
+  requireVersion,
+} from "./json-test-support.js";
 
 const TASK_ID = "TASK-12-CLI";
 const FIXTURE = Object.freeze({
@@ -48,32 +53,6 @@ async function createApprovedSpec(
   assert.equal(created.exitCode, 0);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    assert.fail(`${label} must be an object.`);
-  }
-  return value;
-}
-
-function requireString(record: Record<string, unknown>, field: string): string {
-  const value = record[field];
-  if (typeof value !== "string") {
-    assert.fail(`${field} must be a string.`);
-  }
-  return value;
-}
-
-function requireVersion(record: Record<string, unknown>, field: string): number {
-  const value = record[field];
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
-    assert.fail(`${field} must be a positive safe integer.`);
-  }
-  return value;
-}
 
 
 test("CLI adds, lists, and validates a hash-bound Context Manifest", async (t) => {

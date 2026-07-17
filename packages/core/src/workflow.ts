@@ -664,6 +664,16 @@ export function transitionWorkflow(
   if (gateDiagnostic !== null) {
     return transitionFailure(state, gateDiagnostic);
   }
+  const buildPlanDiagnostic = validateBuildPlanImplementationTransition(
+    state.projection,
+    state.events,
+    request.to,
+    request.event.actor,
+    request.gates,
+  );
+  if (buildPlanDiagnostic !== null) {
+    return transitionFailure(state, buildPlanDiagnostic);
+  }
 
   const invariantDiagnostic = validateTransitionInvariants(
     state.projection,
@@ -976,6 +986,10 @@ export function recordBuildPlanChange(
   state: WorkflowState,
   request: RecordBuildPlanChangeRequest,
 ): RecordBuildPlanChangeResult {
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return buildPlanChangeFailure(state, eventDiagnostic);
+  }
   const stateIsConsistent = stateMatchesAcceptedHistory(state);
   const repeatedEvent = state.events.find(
     (event) => event.idempotencyKey === request.event.idempotencyKey,
@@ -1268,11 +1282,13 @@ export function replayWorkflowEvents(
         );
       }
       const previousChange = latestBuildPlanChange(acceptedEvents, sourceEvent);
+      const currentPlan = currentBuildPlanChange(acceptedEvents);
       if (
         (sourceEvent.change === "rejected" &&
           (sourceEvent.actor.kind !== "user" ||
-            previousChange === undefined ||
-            previousChange.change !== "recorded")) ||
+            currentPlan === undefined ||
+            !matchesBuildPlanMaterial(currentPlan, sourceEvent) ||
+            currentPlan.change !== "recorded")) ||
         (sourceEvent.change === "recorded" && previousChange?.change === "rejected")
       ) {
         return replayFailure(
@@ -1323,6 +1339,16 @@ export function replayWorkflowEvents(
     const gateDiagnostic = validateGates(allowed.requiredGates, sourceEvent.gates);
     if (gateDiagnostic !== null) {
       return replayFailure({ ...gateDiagnostic, path: `$[${index}].gates` });
+    }
+    const buildPlanDiagnostic = validateBuildPlanImplementationTransition(
+      projection,
+      acceptedEvents,
+      sourceEvent.to,
+      sourceEvent.actor,
+      sourceEvent.gates,
+    );
+    if (buildPlanDiagnostic !== null) {
+      return replayFailure({ ...buildPlanDiagnostic, path: `$[${index}]` });
     }
 
     const invariantDiagnostic = validateTransitionInvariants(
@@ -1917,9 +1943,12 @@ function validateBuildPlanChangeRequest(
     );
   }
   const previousChange = latestBuildPlanChange(state.events, request);
+  const currentPlan = currentBuildPlanChange(state.events);
   if (
     request.change === "rejected" &&
-    (previousChange === undefined || previousChange.change !== "recorded")
+    (currentPlan === undefined ||
+      !matchesBuildPlanMaterial(currentPlan, request) ||
+      currentPlan.change !== "recorded")
   ) {
     return diagnostic(
       "workflow.transition.illegal",
@@ -2147,25 +2176,60 @@ function matchesBuildPlanChangeIntent(
   );
 }
 
+type BuildPlanMaterial = Pick<
+  BuildPlanChangedEvent,
+  | "planIdentity"
+  | "requirementsIdentity"
+  | "contextManifestPath"
+  | "contextManifestIdentity"
+>;
+
+function matchesBuildPlanMaterial(
+  event: BuildPlanChangedEvent,
+  material: BuildPlanMaterial,
+): boolean {
+  return (
+    event.planIdentity === material.planIdentity &&
+    event.requirementsIdentity === material.requirementsIdentity &&
+    event.contextManifestPath === material.contextManifestPath &&
+    event.contextManifestIdentity === material.contextManifestIdentity
+  );
+}
+
 function latestBuildPlanChange(
   events: readonly WorkflowEvent[],
-  material: Pick<
-    BuildPlanChangedEvent,
-    | "planIdentity"
-    | "requirementsIdentity"
-    | "contextManifestPath"
-    | "contextManifestIdentity"
-  >,
+  material: BuildPlanMaterial,
 ): BuildPlanChangedEvent | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
     if (
       event.type === "build_plan_changed" &&
-      event.planIdentity === material.planIdentity &&
-      event.requirementsIdentity === material.requirementsIdentity &&
-      event.contextManifestPath === material.contextManifestPath &&
-      event.contextManifestIdentity === material.contextManifestIdentity
+      matchesBuildPlanMaterial(event, material)
     ) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function currentBuildPlanChange(
+  events: readonly WorkflowEvent[],
+): BuildPlanChangedEvent | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type === "build_plan_changed") {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+export function currentImplementContextChange(
+  events: readonly WorkflowEvent[],
+): ContextManifestChangedEvent | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.type === "context_manifest_changed" && event.phase === "implement") {
       return event;
     }
   }
@@ -2176,18 +2240,13 @@ function hasFrozenImplementContext(
   events: readonly WorkflowEvent[],
   manifestIdentity: ContractIdentity,
 ): boolean {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]!;
-    if (event.type !== "context_manifest_changed" || event.phase !== "implement") {
-      continue;
-    }
-    return (
-      event.change === "frozen" &&
-      event.manifestPath === "context/implement.jsonl" &&
-      event.manifestIdentity === manifestIdentity
-    );
-  }
-  return false;
+  const event = currentImplementContextChange(events);
+  return (
+    event !== undefined &&
+    event.change === "frozen" &&
+    event.manifestPath === "context/implement.jsonl" &&
+    event.manifestIdentity === manifestIdentity
+  );
 }
 
 
@@ -2563,6 +2622,111 @@ function validateGates(
     }
   }
   return null;
+}
+
+function validateBuildPlanImplementationTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+  actor: WorkflowActor,
+  gates: readonly GateAcceptance[],
+): WorkflowDiagnostic | null {
+  if (
+    projection.route !== "build" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "plan" ||
+    to.lifecycle !== "active" ||
+    to.phase !== "implement"
+  ) {
+    return null;
+  }
+  if (actor.kind !== "user") {
+    return diagnostic(
+      "workflow.gate.evidence_invalid",
+      "$.event.actor.kind",
+      "Build Plan approval must be attributable to a user.",
+      "Record the human approver before entering Implement.",
+    );
+  }
+  const evidence = buildPlanApprovalEvidence(gates);
+  if (evidence === null) {
+    return diagnostic(
+      "workflow.gate.evidence_invalid",
+      "$.gates",
+      "Build Plan approval requires exact Plan and Implement Context evidence.",
+      "Provide plans/<plan-hash>.json and context/implement.jsonl#<manifest-hash> evidence.",
+    );
+  }
+  const plan = currentBuildPlanChange(events);
+  if (
+    plan === undefined ||
+    !matchesBuildPlanMaterial(plan, {
+      planIdentity: evidence.planIdentity,
+      requirementsIdentity: hashCanonicalJson(projection.intent),
+      contextManifestPath: evidence.contextManifestPath,
+      contextManifestIdentity: evidence.contextManifestIdentity,
+    }) ||
+    plan.change !== "recorded"
+  ) {
+    return diagnostic(
+      "workflow.gate.evidence_invalid",
+      "$.gates",
+      "Build Plan approval must reference a current recorded Plan.",
+      "Record a reviewable Plan and use its exact returned identity.",
+    );
+  }
+  if (!hasFrozenImplementContext(events, evidence.contextManifestIdentity)) {
+    return diagnostic(
+      "workflow.gate.evidence_invalid",
+      "$.gates",
+      "Build Plan approval Context is not currently frozen.",
+      "Freeze the exact Implement Context Manifest before approval.",
+    );
+  }
+  return null;
+}
+
+function buildPlanApprovalEvidence(
+  gates: readonly GateAcceptance[],
+):
+  | Readonly<{
+      planIdentity: ContractIdentity;
+      contextManifestPath: "context/implement.jsonl";
+      contextManifestIdentity: ContractIdentity;
+    }>
+  | null {
+  const planGate = gates.find((gate) => gate.gate === "plan");
+  if (planGate === undefined) {
+    return null;
+  }
+  const planReference = planGate.evidence.find(
+    (evidence) =>
+      evidence.kind === "human-approval" &&
+      /^plans\/([a-f0-9]{64})\.json$/u.test(evidence.reference),
+  );
+  const contextReference = planGate.evidence.find(
+    (evidence) =>
+      evidence.kind === "human-approval" &&
+      /^context\/implement\.jsonl#sha256:[a-f0-9]{64}$/u.test(evidence.reference),
+  );
+  if (planReference === undefined || contextReference === undefined) {
+    return null;
+  }
+  const planIdentity = `sha256:${planReference.reference.slice(
+    "plans/".length,
+    -".json".length,
+  )}`;
+  const contextManifestIdentity = contextReference.reference.slice(
+    "context/implement.jsonl#".length,
+  );
+  if (!isContractIdentity(planIdentity) || !isContractIdentity(contextManifestIdentity)) {
+    return null;
+  }
+  return Object.freeze({
+    planIdentity,
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity,
+  });
 }
 
 function findTransition(

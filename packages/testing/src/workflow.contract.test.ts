@@ -6,6 +6,7 @@ import {
   coreContract,
   readGateEvidenceKinds,
   type DependencyGraph,
+  type ContractIdentity,
   type StartWorkflowTaskRequest,
   type WorkflowGate,
   type WorkflowRoute,
@@ -121,44 +122,12 @@ test("accepted Quick, Build, and Initiative Events replay to the same Task Proje
     let state = startTask(route);
 
     for (const [lifecycle, phase] of happyTargets[route]) {
-      const definition = routeTransitions[route];
-      const allowed = definition.find(
-        (candidate) =>
-          candidate.from.lifecycle === state.projection.lifecycle &&
-          candidate.from.phase === state.projection.phase &&
-          candidate.to.lifecycle === lifecycle &&
-          candidate.to.phase === phase,
+      state = advanceTask(
+        state,
+        lifecycle,
+        phase,
+        `${route}-${state.projection.version + 1}`,
       );
-      assert.ok(allowed, `missing ${route} transition to ${lifecycle}/${phase}`);
-      const initiativeGraph =
-        route === "initiative" &&
-        state.projection.phase === "plan" &&
-        phase === "integrate"
-          ? validInitiativeGraphSnapshot(state)
-          : undefined;
-
-      const result = coreContract.transitionWorkflow(state, {
-        contractVersion: 1,
-        taskId: state.projection.id,
-        expectedVersion: state.projection.version,
-        to: { lifecycle, phase, step: allowed.to.step },
-        gates: allowed.requiredGates.map((gate) => ({
-          gate,
-          evidence: [
-            {
-              kind: evidenceKind(gate),
-              reference: `evidence/${gate}-${state.projection.version}.json`,
-            },
-          ],
-        })),
-        ...(initiativeGraph === undefined ? {} : { initiativeGraph }),
-        event: eventMetadata(`${route}-${state.projection.version + 1}`),
-      });
-
-      assert.equal(result.ok, true);
-      if (result.ok) {
-        state = result.state;
-      }
     }
 
     assert.equal(state.projection.lifecycle, "completed");
@@ -306,6 +275,218 @@ test("Quick escalation remains resumable after declined Route approval and requi
     "escalated-plan-approved",
   );
   assert.equal(implementing.projection.phase, "implement");
+});
+
+test("Core seals a Build Plan transition without durable Plan authority", () => {
+  let state = startTask("build");
+  state = advanceTask(state, "active", "explore", "sealed-plan-explore");
+  state = advanceTask(state, "active", "plan", "sealed-plan-plan");
+  const bypass = coreContract.transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "implement", step: "ready" },
+    gates: [
+      {
+        gate: "plan",
+        evidence: [
+          {
+            kind: "human-approval",
+            reference: "plans/forged-plan.json",
+          },
+        ],
+      },
+    ],
+    event: eventMetadata("sealed-plan-bypass"),
+  });
+
+  assert.equal(bypass.ok, false);
+  const replayBypassPayload = {
+    schemaVersion: state.events[0]!.schemaVersion,
+    eventId: "EVENT-sealed-plan-replay-bypass",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    type: "workflow_transitioned",
+    from: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    to: { lifecycle: "active", phase: "implement", step: "ready" },
+    actor: { kind: "orchestrator", id: "sayhi-test", sessionRef: "session-test" },
+    outcome: "accepted",
+    gates: [
+      {
+        gate: "plan",
+        evidence: [
+          {
+            kind: "human-approval",
+            reference: "plans/forged-plan.json",
+          },
+        ],
+      },
+    ],
+    blockers: state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Accept sealed-plan-replay-bypass",
+    idempotencyKey: "IDEMPOTENCY-sealed-plan-replay-bypass",
+    occurredAt: "2026-07-15T12:00:00Z",
+  };
+  const replayBypassEvent = {
+    ...replayBypassPayload,
+    chainDigest: digestReplayEvent(replayBypassPayload),
+  } as unknown as WorkflowEvent;
+  const replayBypass = coreContract.replayWorkflowEvents([
+    ...state.events,
+    replayBypassEvent,
+  ]);
+  assert.equal(replayBypass.ok, false);
+});
+
+test("Core rejects malformed Build Plan record metadata without throwing", () => {
+  let state = startTask("build");
+  state = advanceTask(state, "active", "explore", "malformed-plan-explore");
+  state = advanceTask(state, "active", "plan", "malformed-plan-ready");
+  const contextManifestIdentity: ContractIdentity = `sha256:${"e".repeat(64)}`;
+  const frozen = coreContract.recordContextManifestChange(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    phase: "implement",
+    manifestPath: "context/implement.jsonl",
+    manifestIdentity: contextManifestIdentity,
+    change: "frozen",
+    event: eventMetadata("malformed-plan-context"),
+  });
+  assert.equal(frozen.ok, true);
+  if (!frozen.ok) {
+    return;
+  }
+  const recorded = coreContract.recordBuildPlanChange(frozen.state, {
+    contractVersion: 1,
+    taskId: frozen.state.projection.id,
+    expectedVersion: frozen.state.projection.version,
+    change: "recorded",
+    planIdentity: `sha256:${"f".repeat(64)}` as ContractIdentity,
+    requirementsIdentity: hashTestValue(frozen.state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity,
+    event: undefined as never,
+  });
+  assert.equal(recorded.ok, false);
+  if (!recorded.ok) {
+    assert.equal(recorded.diagnostics[0]?.code, "workflow.request.invalid");
+  }
+});
+
+test("Core and replay reject decisions for a superseded Build Plan", () => {
+  let state = startTask("build");
+  state = advanceTask(state, "active", "explore", "superseded-core-explore");
+  state = advanceTask(state, "active", "plan", "superseded-core-plan");
+  const original = establishBuildPlanAuthority(state, "superseded-core-original");
+  const revisedPlanIdentity: ContractIdentity = `sha256:${"a".repeat(64)}`;
+  const revised = coreContract.recordBuildPlanChange(original.state, {
+    contractVersion: 1,
+    taskId: original.state.projection.id,
+    expectedVersion: original.state.projection.version,
+    change: "recorded",
+    planIdentity: revisedPlanIdentity,
+    requirementsIdentity: hashTestValue(original.state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity: original.contextManifestIdentity,
+    event: eventMetadata("superseded-core-revised"),
+  });
+  assert.equal(revised.ok, true);
+  if (!revised.ok) {
+    return;
+  }
+  const staleRejection = coreContract.recordBuildPlanChange(revised.state, {
+    contractVersion: 1,
+    taskId: revised.state.projection.id,
+    expectedVersion: revised.state.projection.version,
+    change: "rejected",
+    planIdentity: original.planIdentity,
+    requirementsIdentity: hashTestValue(revised.state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity: original.contextManifestIdentity,
+    event: {
+      ...eventMetadata("superseded-core-rejection"),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "review-session" },
+    },
+  });
+  assert.equal(staleRejection.ok, false);
+  if (!staleRejection.ok) {
+    assert.equal(staleRejection.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  const staleApproval = coreContract.transitionWorkflow(revised.state, {
+    contractVersion: 1,
+    taskId: revised.state.projection.id,
+    expectedVersion: revised.state.projection.version,
+    to: { lifecycle: "active", phase: "implement", step: "ready" },
+    gates: [
+      {
+        gate: "plan",
+        evidence: [
+          {
+            kind: "human-approval",
+            reference: `plans/${original.planIdentity.slice("sha256:".length)}.json`,
+          },
+          {
+            kind: "human-approval",
+            reference: `context/implement.jsonl#${original.contextManifestIdentity}`,
+          },
+        ],
+      },
+    ],
+    event: {
+      ...eventMetadata("superseded-core-approval"),
+      actor: { kind: "user", id: "reviewer-42", sessionRef: "review-session" },
+    },
+  });
+  assert.equal(staleApproval.ok, false);
+  if (!staleApproval.ok) {
+    assert.equal(staleApproval.diagnostics[0]?.code, "workflow.gate.evidence_invalid");
+  }
+  const position = {
+    lifecycle: revised.state.projection.lifecycle,
+    phase: revised.state.projection.phase,
+    step: revised.state.projection.step,
+  };
+  const staleRejectionPayload = {
+    schemaVersion: revised.state.events[0]!.schemaVersion,
+    eventId: "EVENT-superseded-core-replay-rejection",
+    taskId: revised.state.projection.id,
+    route: "build",
+    sequence: revised.state.projection.version + 1,
+    previousChainDigest: revised.state.events.at(-1)!.chainDigest,
+    type: "build_plan_changed",
+    from: position,
+    to: position,
+    actor: { kind: "user", id: "reviewer-42", sessionRef: "review-session" },
+    outcome: "accepted",
+    gates: [],
+    blockers: revised.state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Reject superseded Plan.",
+    idempotencyKey: "IDEMPOTENCY-superseded-core-replay-rejection",
+    occurredAt: "2026-07-15T12:10:00Z",
+    change: "rejected",
+    planIdentity: original.planIdentity,
+    requirementsIdentity: hashTestValue(revised.state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity: original.contextManifestIdentity,
+  };
+  const staleRejectionEvent = {
+    ...staleRejectionPayload,
+    chainDigest: digestReplayEvent(staleRejectionPayload),
+  } as unknown as WorkflowEvent;
+  const replayed = coreContract.replayWorkflowEvents([
+    ...revised.state.events,
+    staleRejectionEvent,
+  ]);
+  assert.equal(replayed.ok, false);
 });
 
 test("illegal, stale, and unmet-Gate transitions preserve the prior workflow state", () => {
@@ -1148,10 +1329,10 @@ function digestReplayEvent(event: Record<string, unknown>): string {
   return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
 }
 
-function hashTestValue(value: unknown): string {
+function hashTestValue(value: unknown): ContractIdentity {
   const serialized = stableTestJson(value);
   assert.ok(serialized);
-  return `sha256:${createHash("sha256").update(serialized).digest("hex")}`;
+  return `sha256:${createHash("sha256").update(serialized).digest("hex")}` as ContractIdentity;
 }
 
 function stableTestJson(value: unknown): string | undefined {
@@ -1188,6 +1369,17 @@ function advanceTask(
   suffix: string,
   blockers?: readonly string[],
 ): WorkflowState {
+  const buildPlanAuthority =
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "plan" &&
+    lifecycle === "active" &&
+    phase === "implement"
+      ? establishBuildPlanAuthority(state, suffix)
+      : undefined;
+  if (buildPlanAuthority !== undefined) {
+    state = buildPlanAuthority.state;
+  }
   const allowed = routeTransitions[state.projection.route].find(
     (candidate) =>
       candidate.from.lifecycle === state.projection.lifecycle &&
@@ -1203,6 +1395,40 @@ function advanceTask(
     phase === "integrate"
       ? validInitiativeGraphSnapshot(state)
       : undefined;
+  const gates =
+    buildPlanAuthority === undefined
+      ? allowed.requiredGates.map((gate) => ({
+          gate,
+          evidence: [
+            { kind: evidenceKind(gate), reference: `evidence/${suffix}-${gate}.json` },
+          ],
+        }))
+      : [
+          {
+            gate: "plan" as const,
+            evidence: [
+              {
+                kind: "human-approval" as const,
+                reference: `plans/${buildPlanAuthority.planIdentity.slice("sha256:".length)}.json`,
+              },
+              {
+                kind: "human-approval" as const,
+                reference: `context/implement.jsonl#${buildPlanAuthority.contextManifestIdentity}`,
+              },
+            ],
+          },
+        ];
+  const event =
+    buildPlanAuthority === undefined
+      ? eventMetadata(suffix)
+      : {
+          ...eventMetadata(suffix),
+          actor: {
+            kind: "user" as const,
+            id: "sayhi-test-user",
+            sessionRef: "session-3",
+          },
+        };
   const result = coreContract.transitionWorkflow(state, {
     contractVersion: 1,
     taskId: state.projection.id,
@@ -1212,20 +1438,52 @@ function advanceTask(
       phase,
       step: allowed.to.step,
     },
-    gates: allowed.requiredGates.map((gate) => ({
-      gate,
-      evidence: [
-        { kind: evidenceKind(gate), reference: `evidence/${suffix}-${gate}.json` },
-      ],
-    })),
+    gates,
     ...(blockers === undefined ? {} : { blockers }),
     ...(initiativeGraph === undefined ? {} : { initiativeGraph }),
-    event: eventMetadata(suffix),
+    event,
   });
   if (!result.ok) {
     assert.fail(result.diagnostics[0]?.message ?? "Workflow transition failed");
   }
   return result.state;
+}
+
+function establishBuildPlanAuthority(state: WorkflowState, suffix: string) {
+  const contextManifestIdentity: ContractIdentity = `sha256:${"c".repeat(64)}`;
+  const frozen = coreContract.recordContextManifestChange(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    phase: "implement",
+    manifestPath: "context/implement.jsonl",
+    manifestIdentity: contextManifestIdentity,
+    change: "frozen",
+    event: eventMetadata(`${suffix}-context`),
+  });
+  if (!frozen.ok) {
+    assert.fail(frozen.diagnostics[0]?.message ?? "Implement Context freeze failed");
+  }
+  const planIdentity: ContractIdentity = `sha256:${"d".repeat(64)}`;
+  const recorded = coreContract.recordBuildPlanChange(frozen.state, {
+    contractVersion: 1,
+    taskId: frozen.state.projection.id,
+    expectedVersion: frozen.state.projection.version,
+    change: "recorded",
+    planIdentity,
+    requirementsIdentity: hashTestValue(frozen.state.projection.intent),
+    contextManifestPath: "context/implement.jsonl",
+    contextManifestIdentity,
+    event: eventMetadata(`${suffix}-plan`),
+  });
+  if (!recorded.ok) {
+    assert.fail(recorded.diagnostics[0]?.message ?? "Build Plan record failed");
+  }
+  return Object.freeze({
+    state: recorded.state,
+    planIdentity,
+    contextManifestIdentity,
+  });
 }
 
 function validInitiativeGraphSnapshot(state: WorkflowState): DependencyGraph {
