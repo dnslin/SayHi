@@ -327,6 +327,10 @@ A dispatch request binds execution to state:
 
 Every Agent result MUST echo these binding values and include a schema-valid `outcome`, artifacts, Evidence, findings, and observed final fingerprint. A result cannot declare a Task transition accepted.
 
+For an active Build Phase, Core accepts a `phase_execution_dispatched` Workflow Event that binds the exact approved Plan identity to the complete dispatch binding, including Context Manifest, Phase Agent Capability Contract, and ordered locked Skill identities. Core accepts at most one result for that dispatch as a `phase_execution_result_accepted` Event.
+
+On resume, Core MUST load the bound Plan evidence and revalidate the live Context Manifest, Capability Contract, and Skill materials against the durable binding before work continues. A changed or missing Plan, Context, Agent capability, or Skill blocks the Phase with its actionable diagnostic. When a result is already accepted, resume returns that result and MUST NOT dispatch the Phase Agent again.
+
 ## 11. Evidence
 
 Evidence records include:
