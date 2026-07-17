@@ -1452,6 +1452,45 @@ test("replay validates structured Review findings", () => {
   }
 });
 
+test("replay preserves legacy Review results without reviewFindings", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `legacy-findings-${phase}`);
+  }
+  const recorded = recordWorkflowAgentResult(
+    state,
+    "review",
+    "standards-review",
+    "succeeded",
+    [],
+    "legacy-findings-result",
+  );
+  const resultEvent = recorded.events.at(-1)!;
+  assert.equal(resultEvent.type, "phase_execution_result_accepted");
+  if (resultEvent.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const { reviewFindings: _reviewFindings, ...legacyResult } =
+    resultEvent.result as Record<string, unknown>;
+  const payload: Record<string, unknown> = {
+    ...resultEvent,
+    result: legacyResult,
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...recorded.events.slice(0, -1),
+    { ...payload, chainDigest: digestReplayEvent(payload) },
+  ]);
+  assert.equal(replayed.ok, true);
+  if (replayed.ok) {
+    assert.equal(replayed.state.projection.phase, "review");
+  }
+});
+
 test("replay rejects unbound and duplicate Phase results", () => {
   let state = startTask("build");
   for (const [lifecycle, phase] of [

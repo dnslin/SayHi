@@ -1617,7 +1617,7 @@ export function replayWorkflowEvents(
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
         result === null ||
         resultBindingDiagnostic !== null ||
-        validateBuildReviewResultPayload(projection, result) !== null
+        validateBuildReviewResultPayload(projection, result, false) !== null
       ) {
         return replayFailure(
           diagnostic(
@@ -2461,11 +2461,13 @@ function validateBuildReviewDispatchBinding(
 function validateBuildReviewResultPayload(
   projection: TaskProjection,
   result: unknown,
+  requireStructured = true,
 ): WorkflowDiagnostic | null {
   if (projection.route !== "build" || projection.phase !== "review") {
     return null;
   }
-  return isUnknownRecord(result) && Array.isArray(result.reviewFindings)
+  return isUnknownRecord(result) &&
+    (!requireStructured || Array.isArray(result.reviewFindings))
     ? null
     : invalidRequest(
         "$.result.reviewFindings",

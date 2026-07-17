@@ -2241,6 +2241,102 @@ test("Build blocks when configured Review repair attempts are exhausted", async 
   ]);
 });
 
+test("Build rejects exhausted Repair with mismatched Review final evidence", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-REPAIR-INVALID-EVIDENCE",
+    0,
+  );
+  await recordSucceededImplementation(
+    fileSystem,
+    prepared.execution,
+    "REPAIR-INVALID-EVIDENCE-IMPLEMENTED",
+    "2026-07-17T10:09:30Z",
+  );
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "REPAIR-INVALID-EVIDENCE-ENTERED",
+      "2026-07-17T10:09:45Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  let state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    reviewed.state,
+    "standards-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-INVALID-EVIDENCE-STANDARDS",
+        severity: "blocking",
+        subject: "approved-spec",
+        reference: "docs/spec/workflow.md#5.5",
+        message: "The Build still violates the Approved Spec.",
+        remediation: "Repair the violation before retrying Review.",
+      },
+    ],
+    "REPAIR-INVALID-EVIDENCE-STANDARDS",
+    "2026-07-17T10:10:00Z",
+  );
+  state = await recordReviewResult(
+    fileSystem,
+    prepared,
+    state,
+    "spec-review",
+    "blocked",
+    [
+      {
+        id: "FINDING-21-INVALID-EVIDENCE-SPEC",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: TASK_FIXTURE.acceptanceCriterion,
+        message: "The Build misses required recovery behavior.",
+        remediation: "Repair the behavior before retrying Review.",
+      },
+    ],
+    "REPAIR-INVALID-EVIDENCE-SPEC",
+    "2026-07-17T10:10:15Z",
+    `sha256:${"e".repeat(64)}`,
+  );
+  const rejected = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      state,
+      "active",
+      "implement",
+      "REPAIR-INVALID-EVIDENCE-REJECTED",
+      "2026-07-17T10:10:30Z",
+    ),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  const after = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(after.ok, true);
+  if (after.ok) {
+    assert.equal(after.state.projection.lifecycle, "active");
+    assert.equal(after.state.projection.phase, "review");
+    assert.equal(after.state.events.length, state.events.length);
+  }
+});
+
 test("Bound Writer blocks invalid capability material with a deterministic Event id", async () => {
   const fileSystem = new MemoryTaskLifecycleFileSystem();
   const prepared = await dispatchApprovedBuildPhase(
@@ -2331,6 +2427,7 @@ async function recordReviewResult(
   findings: readonly ReviewFinding[],
   suffix: string,
   occurredAt: string,
+  observedFinalFingerprint?: ContractIdentity,
 ): Promise<WorkflowState> {
   const reviewAgent = REVIEW_AGENTS.find((agent) => agent.role === role);
   assert.ok(reviewAgent, `Missing Review Agent fixture for ${role}`);
@@ -2348,6 +2445,9 @@ async function recordReviewResult(
     },
     outcome,
     reviewFindings: findings,
+    ...(observedFinalFingerprint === undefined
+      ? {}
+      : { observedFinalFingerprint }),
     suffix,
     occurredAt,
   });

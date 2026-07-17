@@ -261,6 +261,7 @@ export async function recordTestPhaseResult(
     materials: Pick<BindPhaseExecutionRequest, "manifest" | "currentContext">;
     outcome: AgentResultOutcome;
     reviewFindings?: readonly ReviewFinding[];
+    observedFinalFingerprint?: ContractIdentity;
     suffix: string;
     occurredAt: string;
   }>,
@@ -316,7 +317,8 @@ export async function recordTestPhaseResult(
       ...(request.phase === "review"
         ? { reviewFindings: request.reviewFindings ?? [] }
         : {}),
-      observedFinalFingerprint: dispatched.binding.baseFingerprint,
+      observedFinalFingerprint:
+        request.observedFinalFingerprint ?? dispatched.binding.baseFingerprint,
     },
     event: taskLifecycleEventMetadata(
       request.fixture,
