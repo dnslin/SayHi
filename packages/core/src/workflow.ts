@@ -355,13 +355,15 @@ export interface RecordBuildPlanChangeRequest {
   readonly contextManifestIdentity: ContractIdentity;
   readonly event: WorkflowEventMetadata;
 }
-export interface ReviseInitiativeGraphRequest {
-  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+export interface InitiativeGraphRevision {
   readonly taskId: string;
   readonly expectedVersion: number;
   readonly expectedGraphVersion: number;
   readonly graph: DependencyGraph;
   readonly event: WorkflowEventMetadata;
+}
+export interface ReviseInitiativeGraphRequest extends InitiativeGraphRevision {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
 }
 
 export interface RecordPhaseExecutionDispatchRequest {

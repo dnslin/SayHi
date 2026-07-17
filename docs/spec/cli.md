@@ -152,7 +152,7 @@ sayhi graph remove-edge <initiative-id> <edge-id>
 sayhi graph revise <initiative-id> --from <request.json> --plan|--apply
 ```
 
-`revise` reads a candidate graph, expected Task and graph versions, and user approval Event from the request. `--plan` validates the revision without persistence; `--apply` records the revision Event and atomically replaces the graph Projection. A revision after Plan preserves existing Build Task nodes, requires a reason and renewed user approval, and rejects stale versions.
+`revise` reads a candidate graph, expected Task and graph versions, and user approval Event from the request. `--plan` validates the revision without persistence; `--apply` appends the accepted revision Event before atomically replacing the graph and Task Projections. If a transient Projection write is interrupted, Core immediately rebuilds it from accepted Event history; a later `recover` can rebuild a missing or lagging Projection. A revision after Plan preserves existing Build Task nodes, requires a reason and renewed user approval, and rejects stale versions.
 
 ### 4.6 Workspace and Journal
 

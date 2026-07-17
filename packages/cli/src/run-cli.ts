@@ -29,7 +29,7 @@ import {
   type BaselineRecord,
   type DurableQuickResult,
   type WorkflowState,
-  type DependencyGraph,
+  type InitiativeGraphRevision,
   type TaskBaselineFileSystem,
 } from "@dnslin/sayhi-core";
 
@@ -247,13 +247,7 @@ interface ParsedGraphArguments {
   readonly source?: string;
   readonly mode?: GraphMutationMode;
 }
-interface GraphRevisionRequest {
-  readonly taskId: string;
-  readonly expectedVersion: number;
-  readonly expectedGraphVersion: number;
-  readonly graph: DependencyGraph;
-  readonly event: WorkflowEventMetadata;
-}
+type GraphRevisionRequest = InitiativeGraphRevision;
 type GraphArgumentResult = ParsedGraphArguments | InvalidCliArguments;
 
 type QuickSubcommand = "archive" | "complete" | "show";
@@ -2352,7 +2346,7 @@ function parseGraphRevisionRequest(
         taskId: value.taskId,
         expectedVersion: value.expectedVersion,
         expectedGraphVersion: value.expectedGraphVersion,
-        graph: value.graph as unknown as DependencyGraph,
+        graph: value.graph as unknown as InitiativeGraphRevision["graph"],
         event: value.event,
       })
     : null;

@@ -74,6 +74,7 @@ import {
   type TaskCreatedEvent,
   type DependencyGraph,
   type DependencyGraphEdge,
+  type InitiativeGraphRevision,
   type InitiativeGraphRevisedEvent,
   type TaskProjection,
   type TaskScope,
@@ -128,12 +129,14 @@ export interface TaskWriter {
 export interface ScopedTaskWriter extends TaskWriter {
   assertWritablePath(path: string): void;
 }
-
-export interface TaskBaselineFileSystem extends TaskLifecycleFileSystem {
-  captureBaseline(request: TaskBaselineCaptureRequest): Promise<BaselineRecord>;
+export interface InitiativeGraphFileSystem extends TaskLifecycleFileSystem {
   withWriterMutationLock<Result>(
     operation: (writer: TaskWriter) => Promise<Result>,
   ): Promise<Result>;
+}
+
+export interface TaskBaselineFileSystem extends InitiativeGraphFileSystem {
+  captureBaseline(request: TaskBaselineCaptureRequest): Promise<BaselineRecord>;
 }
 export interface TaskCommitRepositoryState {
   readonly head: string | null;
@@ -227,13 +230,9 @@ export interface AdvanceDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly transition: TransitionWorkflowRequest;
 }
-export interface ReviseDurableInitiativeGraphRequest {
-  readonly fileSystem: TaskLifecycleFileSystem;
-  readonly taskId: string;
-  readonly expectedVersion: number;
-  readonly expectedGraphVersion: number;
-  readonly graph: DependencyGraph;
-  readonly event: WorkflowEventMetadata;
+export interface ReviseDurableInitiativeGraphRequest
+  extends InitiativeGraphRevision {
+  readonly fileSystem: InitiativeGraphFileSystem;
 }
 
 export interface EscalateDurableQuickToBuildRequest {
@@ -303,7 +302,7 @@ export interface ReadDurableTaskRequest {
   readonly taskId: string;
 }
 export interface InspectDurableInitiativeGraphRequest {
-  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly fileSystem: InitiativeGraphFileSystem;
   readonly initiativeTaskId: string;
 }
 export type InitiativeGraphNodeStatus =
@@ -918,9 +917,13 @@ export async function advanceDurableTask(
       ),
     ]);
   }
-  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-    advanceDurableTaskLocked(request, paths),
-  );
+  return transition?.initiativeGraph === undefined
+    ? runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        advanceDurableTaskLocked(request, paths),
+      )
+    : runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
+        advanceDurableTaskLocked(request, paths),
+      );
 }
 export async function reviseDurableInitiativeGraph(
   request: ReviseDurableInitiativeGraphRequest,
@@ -929,7 +932,7 @@ export async function reviseDurableInitiativeGraph(
   if (!paths.ok) {
     return paths;
   }
-  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+  return runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
     reviseDurableInitiativeGraphLocked(request, paths),
   );
 }
@@ -1041,9 +1044,13 @@ export async function recoverDurableTask(
   if (!paths.ok) {
     return paths;
   }
-  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-    recoverDurableTaskLocked(request, paths),
-  );
+  return isInitiativeGraphFileSystem(request.fileSystem)
+    ? runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
+        recoverDurableTaskLocked(request, paths),
+      )
+    : runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        recoverDurableTaskLocked(request, paths),
+      );
 }
 
 export async function adoptDurableTaskBaseline(
@@ -1271,6 +1278,15 @@ export async function inspectDurableInitiativeGraph(
   if (!paths.ok) {
     return paths;
   }
+  return runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
+    inspectDurableInitiativeGraphLocked(request, paths),
+  );
+}
+
+async function inspectDurableInitiativeGraphLocked(
+  request: InspectDurableInitiativeGraphRequest,
+  paths: TaskPaths,
+): Promise<InspectDurableInitiativeGraphResult> {
   const loaded = await loadTask(request.fileSystem, request.initiativeTaskId);
   if (!loaded.ok) {
     return loaded;
@@ -3563,6 +3579,7 @@ async function reviseDurableInitiativeGraphLocked(
     ]);
   }
   let activePath = paths.graphPath;
+  let appended = false;
   try {
     const preflight = await preflightInitiativeGraphRecord(
       request.fileSystem,
@@ -3578,6 +3595,7 @@ async function reviseDurableInitiativeGraphLocked(
       loaded.eventsPath,
       serializeEvent(revised.event),
     );
+    appended = true;
     activePath = paths.graphPath;
     await writeInitiativeGraphIfChanged(
       request.fileSystem,
@@ -3595,9 +3613,24 @@ async function reviseDurableInitiativeGraphLocked(
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       state: revised.state,
       event: revised.event,
-      appended: true,
+      appended,
     });
   } catch {
+    if (appended) {
+      const recovered = await recoverDurableTaskLocked(
+        { fileSystem: request.fileSystem, taskId: request.taskId },
+        paths,
+      );
+      if (recovered.ok) {
+        return Object.freeze({
+          ok: true,
+          contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+          state: revised.state,
+          event: revised.event,
+          appended,
+        });
+      }
+    }
     return ioFailure(activePath);
   }
 }
@@ -5160,6 +5193,37 @@ async function runWithTaskLock<Result>(
 ): Promise<Result | TaskLifecycleFailure> {
   try {
     return await fileSystem.withTaskMutationLock(lockPath, operation);
+  } catch {
+    return ioFailure(lockPath);
+  }
+}
+
+function isInitiativeGraphFileSystem(
+  fileSystem: TaskLifecycleFileSystem,
+): fileSystem is InitiativeGraphFileSystem {
+  return "withWriterMutationLock" in fileSystem &&
+    typeof fileSystem.withWriterMutationLock === "function";
+}
+
+async function runWithInitiativeGraphLease<Result>(
+  fileSystem: TaskLifecycleFileSystem,
+  lockPath: string,
+  operation: () => Promise<Result>,
+): Promise<Result | TaskLifecycleFailure> {
+  if (!isInitiativeGraphFileSystem(fileSystem)) {
+    return failure([
+      diagnostic(
+        "task_lifecycle.writer.unavailable",
+        lockPath,
+        "Initiative graph operations require the shared Writer Lease.",
+        "Use a Project Store filesystem that provides the Writer Lease.",
+      ),
+    ]);
+  }
+  try {
+    return await fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(fileSystem, lockPath, operation),
+    );
   } catch {
     return ioFailure(lockPath);
   }
