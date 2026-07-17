@@ -252,6 +252,12 @@ export interface BuildPlanChangedEvent extends WorkflowEventBase {
   readonly contextManifestPath: string;
   readonly contextManifestIdentity: ContractIdentity;
 }
+export interface InitiativeGraphRevisedEvent extends WorkflowEventBase {
+  readonly type: "initiative_graph_revised";
+  readonly from: WorkflowPosition;
+  readonly initiativeGraph: DependencyGraph;
+  readonly expectedGraphVersion: number;
+}
 export type ContextManifestChange = "added" | "refreshed" | "removed" | "frozen";
 
 export interface ContextManifestChangedEvent extends WorkflowEventBase {
@@ -285,6 +291,7 @@ export type WorkflowEvent =
   | BaselineAdoptedEvent
   | ContextManifestChangedEvent
   | BuildPlanChangedEvent
+  | InitiativeGraphRevisedEvent
   | PhaseExecutionDispatchedEvent
   | PhaseExecutionResultAcceptedEvent;
 
@@ -346,6 +353,14 @@ export interface RecordBuildPlanChangeRequest {
   readonly requirementsIdentity: ContractIdentity;
   readonly contextManifestPath: string;
   readonly contextManifestIdentity: ContractIdentity;
+  readonly event: WorkflowEventMetadata;
+}
+export interface ReviseInitiativeGraphRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly expectedGraphVersion: number;
+  readonly graph: DependencyGraph;
   readonly event: WorkflowEventMetadata;
 }
 
@@ -466,6 +481,19 @@ export type RecordBuildPlanChangeResult =
       contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
       state: WorkflowState;
       event: BuildPlanChangedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+export type ReviseInitiativeGraphResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: InitiativeGraphRevisedEvent;
     }>
   | Readonly<{
       ok: false;
@@ -1153,6 +1181,88 @@ export function recordBuildPlanChange(
   });
 }
 
+export function reviseInitiativeGraph(
+  state: WorkflowState,
+  request: ReviseInitiativeGraphRequest,
+): ReviseInitiativeGraphResult {
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return initiativeGraphRevisionFailure(state, eventDiagnostic);
+  }
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "initiative_graph_revised" &&
+      matchesInitiativeGraphRevisionIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return initiativeGraphRevisionFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Initiative graph revision intent.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+  const graph = validateInitiativeGraphRevisionRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (isWorkflowDiagnostic(graph)) {
+    return initiativeGraphRevisionFailure(state, graph);
+  }
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "initiative_graph_revised" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: graph,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    expectedGraphVersion: request.expectedGraphVersion,
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectInitiativeGraphRevisedEvent(state.projection, event);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: freezeState([...state.events, event], projection),
+    event,
+  });
+}
+
 
 export function recordPhaseExecutionDispatch(
   state: WorkflowState,
@@ -1553,6 +1663,30 @@ export function replayWorkflowEvents(
       }
       const event = copyBuildPlanChangedEvent(sourceEvent);
       projection = projectBuildPlanChangedEvent(projection, event);
+      acceptedEvents.push(event);
+      continue;
+    }
+    if (projection !== null && sourceEvent.type === "initiative_graph_revised") {
+      const graph = validateInitiativeGraphRevisionRequest(
+        freezeState(acceptedEvents, projection),
+        {
+          contractVersion: WORKFLOW_CONTRACT_VERSION,
+          taskId: sourceEvent.taskId,
+          expectedVersion: projection.version,
+          expectedGraphVersion: sourceEvent.expectedGraphVersion,
+          graph: sourceEvent.initiativeGraph,
+          event: sourceEvent,
+        },
+        true,
+      );
+      if (isWorkflowDiagnostic(graph)) {
+        return replayFailure({
+          ...graph,
+          path: `$[${index}]${graph.path.slice(1)}`,
+        });
+      }
+      const event = copyInitiativeGraphRevisedEvent(sourceEvent, graph);
+      projection = projectInitiativeGraphRevisedEvent(projection, event);
       acceptedEvents.push(event);
       continue;
     }
@@ -2320,6 +2454,132 @@ function validateBuildPlanChangeRequest(
   }
   return validateEventMetadata(request.event, "$.event");
 }
+function validateInitiativeGraphRevisionRequest(
+  state: WorkflowState,
+  request: ReviseInitiativeGraphRequest,
+  stateIsConsistent: boolean,
+): DependencyGraph | WorkflowDiagnostic {
+  if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (request.taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Initiative graph revision Task id does not match the current Projection.",
+      "Reload the intended Initiative and submit its stable Task id.",
+    );
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (request.expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${request.expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Initiative before revising its Dependency Graph.",
+    );
+  }
+  if (
+    state.projection.route !== "initiative" ||
+    state.projection.lifecycle !== "active" ||
+    state.projection.phase !== "integrate"
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.state",
+      "Initiative graph revisions require an active Initiative in Integrate.",
+      "Advance the Initiative through approved Plan before revising its graph.",
+    );
+  }
+  if (
+    !Number.isSafeInteger(request.expectedGraphVersion) ||
+    request.expectedGraphVersion < 1
+  ) {
+    return invalidRequest(
+      "$.expectedGraphVersion",
+      "Expected Dependency Graph version must be a positive safe integer.",
+    );
+  }
+  if (request.event.actor.kind !== "user") {
+    return diagnostic(
+      "workflow.gate.unmet",
+      "$.event.actor.kind",
+      "Initiative graph revision requires renewed user approval.",
+      "Submit the revision with an Event attributed to the approving user.",
+    );
+  }
+  const validation = validateDependencyGraphContract({
+    contractVersion: DEPENDENCY_GRAPH_CONTRACT_VERSION,
+    graph: request.graph,
+  });
+  if (!validation.ok) {
+    return dependencyGraphWorkflowDiagnostic(validation.diagnostics[0]!);
+  }
+  const current = currentInitiativeGraph(state.events);
+  if (current === undefined) {
+    return graphFailure(
+      "$.graph",
+      "Initiative graph revision requires an accepted current Dependency Graph.",
+    );
+  }
+  if (request.expectedGraphVersion !== current.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedGraphVersion",
+      `Expected Dependency Graph version ${request.expectedGraphVersion} does not match current version ${current.version}.`,
+      "Reload the accepted Dependency Graph and reconsider the revision.",
+    );
+  }
+  if (validation.graph.id !== current.id) {
+    return graphFailure(
+      "$.graph.id",
+      "Dependency Graph revision must preserve the durable graph id.",
+    );
+  }
+  if (validation.graph.initiativeTaskId !== state.projection.id) {
+    return graphFailure(
+      "$.graph.initiativeTaskId",
+      "Dependency Graph revision must belong to the current Initiative.",
+    );
+  }
+  if (validation.graph.version !== current.version + 1) {
+    return graphFailure(
+      "$.graph.version",
+      "Dependency Graph revision must increment the current graph version by one.",
+    );
+  }
+  if (validation.graph.updatedByEvent !== request.event.eventId) {
+    return graphFailure(
+      "$.graph.updatedByEvent",
+      "Dependency Graph revision must bind itself to its accepted revision Event.",
+    );
+  }
+  const revisedNodeIds = new Set(
+    validation.graph.nodes.map((node) => node.taskId),
+  );
+  const removedNode = current.nodes.find(
+    (node) => !revisedNodeIds.has(node.taskId),
+  );
+  if (removedNode !== undefined) {
+    return graphFailure(
+      "$.graph.nodes",
+      `Dependency Graph revision cannot remove durable Build Task node ${removedNode.taskId}.`,
+    );
+  }
+  return validation.graph;
+}
 
 
 function validatePhaseExecutionDispatchRequest(
@@ -2879,6 +3139,21 @@ function matchesBuildPlanChangeIntent(
     event.actor.sessionRef === request.event.actor.sessionRef
   );
 }
+function matchesInitiativeGraphRevisionIntent(
+  event: InitiativeGraphRevisedEvent,
+  request: ReviseInitiativeGraphRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    event.expectedGraphVersion === request.expectedGraphVersion &&
+    stableJson(event.initiativeGraph) === stableJson(request.graph) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
 
 function matchesPhaseExecutionDispatchIntent(
   event: PhaseExecutionDispatchedEvent,
@@ -2971,6 +3246,17 @@ function currentBuildPlanChange(
     const event = events[index]!;
     if (event.type === "build_plan_changed") {
       return event;
+    }
+  }
+  return undefined;
+}
+function currentInitiativeGraph(
+  events: readonly WorkflowEvent[],
+): DependencyGraph | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const graph = events[index]!.initiativeGraph;
+    if (graph !== null) {
+      return graph;
     }
   }
   return undefined;
@@ -3071,13 +3357,15 @@ function validateReplayEvent(
           ? !isBaselineAdoptedEventPayload(event)
           : event.type === "context_manifest_changed"
             ? !isContextManifestChangedEventPayload(event)
-            : event.type === "build_plan_changed"
-              ? !isBuildPlanChangedEventPayload(event)
-              : event.type === "phase_execution_dispatched"
-                ? !isPhaseExecutionDispatchedEventPayload(event)
-                : event.type === "phase_execution_result_accepted"
-                  ? !isPhaseExecutionResultAcceptedEventPayload(event)
-                  : true
+              : event.type === "build_plan_changed"
+                ? !isBuildPlanChangedEventPayload(event)
+                : event.type === "initiative_graph_revised"
+                  ? !isInitiativeGraphRevisedEventPayload(event)
+                  : event.type === "phase_execution_dispatched"
+                    ? !isPhaseExecutionDispatchedEventPayload(event)
+                    : event.type === "phase_execution_result_accepted"
+                      ? !isPhaseExecutionResultAcceptedEventPayload(event)
+                      : true
   ) {
     return diagnostic(
       "workflow.event.invalid",
@@ -3190,6 +3478,18 @@ function isBuildPlanChangedEventPayload(
     isContractIdentity(event.requirementsIdentity) &&
     event.contextManifestPath === "context/implement.jsonl" &&
     isContractIdentity(event.contextManifestIdentity)
+  );
+}
+function isInitiativeGraphRevisedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    Number.isSafeInteger(event.expectedGraphVersion) &&
+    (event.expectedGraphVersion as number) > 0 &&
+    event.initiativeGraph !== null &&
+    isUnknownRecord(event.initiativeGraph)
   );
 }
 
@@ -3780,6 +4080,17 @@ function projectBuildPlanChangedEvent(
     updatedAt: event.occurredAt,
   });
 }
+function projectInitiativeGraphRevisedEvent(
+  projection: TaskProjection,
+  event: InitiativeGraphRevisedEvent,
+): TaskProjection {
+  return Object.freeze({
+    ...projection,
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    updatedAt: event.occurredAt,
+  });
+}
 
 function projectPhaseExecutionEvent(
   projection: TaskProjection,
@@ -3899,6 +4210,20 @@ function copyBuildPlanChangedEvent(
     gates: Object.freeze([] as GateAcceptance[]),
     blockers: copyStrings(event.blockers),
     initiativeGraph: null,
+  });
+}
+function copyInitiativeGraphRevisedEvent(
+  event: InitiativeGraphRevisedEvent,
+  initiativeGraph: DependencyGraph,
+): InitiativeGraphRevisedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph,
   });
 }
 
@@ -4058,6 +4383,7 @@ function digestEvent(
     | Omit<BaselineAdoptedEvent, "chainDigest">
     | Omit<ContextManifestChangedEvent, "chainDigest">
     | Omit<BuildPlanChangedEvent, "chainDigest">
+    | Omit<InitiativeGraphRevisedEvent, "chainDigest">
     | Omit<PhaseExecutionDispatchedEvent, "chainDigest">
     | Omit<PhaseExecutionResultAcceptedEvent, "chainDigest">
     | WorkflowEvent,
@@ -4097,6 +4423,8 @@ function digestEvent(
     payload.requirementsIdentity = event.requirementsIdentity;
     payload.contextManifestPath = event.contextManifestPath;
     payload.contextManifestIdentity = event.contextManifestIdentity;
+  } else if (event.type === "initiative_graph_revised") {
+    payload.expectedGraphVersion = event.expectedGraphVersion;
   } else if (event.type === "phase_execution_dispatched") {
     payload.planIdentity = event.planIdentity;
     payload.binding = event.binding;
@@ -4189,6 +4517,17 @@ function buildPlanChangeFailure(
   state: WorkflowState,
   diagnosticValue: WorkflowDiagnostic,
 ): RecordBuildPlanChangeResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+function initiativeGraphRevisionFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): ReviseInitiativeGraphResult {
   return Object.freeze({
     ok: false,
     contractVersion: WORKFLOW_CONTRACT_VERSION,

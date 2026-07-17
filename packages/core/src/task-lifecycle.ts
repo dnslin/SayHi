@@ -62,6 +62,7 @@ import {
   escalateQuickToBuild,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  reviseInitiativeGraph,
   type BaselineAdoptedEvent,
   type StartWorkflowTaskRequest,
   type ContextManifestChangedEvent,
@@ -72,6 +73,7 @@ import {
   type TaskCreatedEvent,
   type DependencyGraph,
   type DependencyGraphEdge,
+  type InitiativeGraphRevisedEvent,
   type TaskProjection,
   type TaskScope,
   type TransitionWorkflowRequest,
@@ -222,6 +224,14 @@ export interface CreateDurableTaskRequest {
 export interface AdvanceDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly transition: TransitionWorkflowRequest;
+}
+export interface ReviseDurableInitiativeGraphRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly expectedGraphVersion: number;
+  readonly graph: DependencyGraph;
+  readonly event: WorkflowEventMetadata;
 }
 
 export interface EscalateDurableQuickToBuildRequest {
@@ -468,6 +478,15 @@ export type AdvanceDurableTaskResult =
       contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
       state: WorkflowState;
       event: WorkflowTransitionedEvent;
+      appended: boolean;
+    }>
+  | TaskLifecycleFailure;
+export type ReviseDurableInitiativeGraphResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: InitiativeGraphRevisedEvent;
       appended: boolean;
     }>
   | TaskLifecycleFailure;
@@ -899,6 +918,17 @@ export async function advanceDurableTask(
   }
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
     advanceDurableTaskLocked(request, paths),
+  );
+}
+export async function reviseDurableInitiativeGraph(
+  request: ReviseDurableInitiativeGraphRequest,
+): Promise<ReviseDurableInitiativeGraphResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    reviseDurableInitiativeGraphLocked(request, paths),
   );
 }
 
@@ -3477,6 +3507,84 @@ async function advanceDurableTaskLocked(
       state: transitioned.state,
       event: transitioned.event,
       appended,
+    });
+  } catch {
+    return ioFailure(activePath);
+  }
+}
+async function reviseDurableInitiativeGraphLocked(
+  request: ReviseDurableInitiativeGraphRequest,
+  paths: TaskPaths,
+): Promise<ReviseDurableInitiativeGraphResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const revised = reviseInitiativeGraph(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: request.expectedVersion,
+    expectedGraphVersion: request.expectedGraphVersion,
+    graph: request.graph,
+    event: request.event,
+  });
+  if (!revised.ok) {
+    return failure(revised.diagnostics);
+  }
+  if (revised.state.events.length === loaded.state.events.length) {
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: revised.state,
+      event: revised.event,
+      appended: false,
+    });
+  }
+  const currentGraph = latestInitiativeGraph(loaded.state);
+  if (currentGraph === null) {
+    return failure([
+      diagnostic(
+        "workflow.graph.invalid",
+        "$.graph",
+        "Initiative graph revision requires an accepted current Dependency Graph.",
+        "Recover the Initiative graph from its accepted Event history before retrying.",
+      ),
+    ]);
+  }
+  let activePath = paths.graphPath;
+  try {
+    const preflight = await preflightInitiativeGraphRecord(
+      request.fileSystem,
+      paths,
+      loaded.state,
+      currentGraph,
+    );
+    if (preflight !== null) {
+      return preflight;
+    }
+    activePath = loaded.eventsPath;
+    await request.fileSystem.appendFile(
+      loaded.eventsPath,
+      serializeEvent(revised.event),
+    );
+    activePath = paths.graphPath;
+    await writeInitiativeGraphIfChanged(
+      request.fileSystem,
+      paths.graphPath,
+      revised.event.initiativeGraph,
+    );
+    activePath = loaded.projectionPath;
+    await writeProjectionIfChanged(
+      request.fileSystem,
+      loaded.projectionPath,
+      revised.state.projection,
+    );
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: revised.state,
+      event: revised.event,
+      appended: true,
     });
   } catch {
     return ioFailure(activePath);

@@ -29,6 +29,7 @@ import {
   type BaselineRecord,
   type DurableQuickResult,
   type WorkflowState,
+  type DependencyGraph,
   type TaskBaselineFileSystem,
 } from "@dnslin/sayhi-core";
 
@@ -234,7 +235,8 @@ interface ParsedTaskArguments {
   readonly adoptedPaths?: readonly string[];
 }
 type TaskArgumentResult = ParsedTaskArguments | InvalidCliArguments;
-type GraphSubcommand = "show";
+type GraphSubcommand = "revise" | "show";
+type GraphMutationMode = "plan" | "apply";
 interface ParsedGraphArguments {
   readonly ok: true;
   readonly command: "graph";
@@ -242,6 +244,15 @@ interface ParsedGraphArguments {
   readonly cwd: string;
   readonly json: boolean;
   readonly initiativeTaskId: string;
+  readonly source?: string;
+  readonly mode?: GraphMutationMode;
+}
+interface GraphRevisionRequest {
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly expectedGraphVersion: number;
+  readonly graph: DependencyGraph;
+  readonly event: WorkflowEventMetadata;
 }
 type GraphArgumentResult = ParsedGraphArguments | InvalidCliArguments;
 
@@ -334,7 +345,7 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           "graph",
           2,
           graph.message,
-          "Run sayhi graph show <initiative-id>.",
+        "Run sayhi graph show <initiative-id> or graph revise <initiative-id> --from <request.json> --plan|--apply.",
           args.includes("--json"),
         );
   }
@@ -2133,25 +2144,96 @@ function createCliTaskEvent(reason: string): WorkflowEventMetadata {
 }
 
 async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> {
+  const operation = `graph.${parsed.subcommand}`;
   const repositoryRoot = await resolveCliRepositoryRoot(
     parsed.cwd,
-    `graph.${parsed.subcommand}`,
+    operation,
     parsed.json,
   );
   if (typeof repositoryRoot !== "string") {
     return repositoryRoot;
   }
-  const result = await coreContract.inspectDurableInitiativeGraph({
-    fileSystem: new NodeManagedProjectFileSystem(repositoryRoot),
-    initiativeTaskId: parsed.initiativeTaskId,
+  const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
+  if (parsed.subcommand === "show") {
+    const result = await coreContract.inspectDurableInitiativeGraph({
+      fileSystem,
+      initiativeTaskId: parsed.initiativeTaskId,
+    });
+    return result.ok
+      ? cliSuccess(
+          operation,
+          Object.freeze({ graph: result.graph, nodes: result.nodes }),
+          parsed.json,
+        )
+      : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
+  }
+  const request = await readTaskJsonRequest(
+    fileSystem,
+    parsed.source!,
+    operation,
+    parsed.json,
+  );
+  if (!request.ok) {
+    return request.result;
+  }
+  const taskIdFailure = taskRequestIdFailure(
+    request.value,
+    parsed.initiativeTaskId,
+    operation,
+    parsed.json,
+  );
+  if (taskIdFailure !== undefined) {
+    return taskIdFailure;
+  }
+  const revision = parseGraphRevisionRequest(request.value);
+  if (revision === null) {
+    return taskRequestFailure(
+      operation,
+      "Initiative graph revision requires Task and graph versions, graph material, and Event metadata.",
+      parsed.json,
+    );
+  }
+  if (parsed.mode === "plan") {
+    const task = await coreContract.readDurableTask({
+      fileSystem,
+      taskId: revision.taskId,
+    });
+    if (!task.ok) {
+      return cliDomainFailure(operation, task.diagnostics[0], parsed.json);
+    }
+    const planned = coreContract.reviseInitiativeGraph(task.state, {
+      contractVersion: 1,
+      ...revision,
+    });
+    return planned.ok
+      ? cliSuccess(
+          operation,
+          Object.freeze({
+            graph: planned.event.initiativeGraph,
+            event: planned.event,
+            projection: planned.state.projection,
+            planned: true,
+          }),
+          parsed.json,
+        )
+      : cliDomainFailure(operation, planned.diagnostics[0], parsed.json);
+  }
+  const revised = await coreContract.reviseDurableInitiativeGraph({
+    fileSystem,
+    ...revision,
   });
-  return result.ok
+  return revised.ok
     ? cliSuccess(
-        "graph.show",
-        Object.freeze({ graph: result.graph, nodes: result.nodes }),
+        operation,
+        Object.freeze({
+          graph: revised.event.initiativeGraph,
+          event: revised.event,
+          projection: revised.state.projection,
+          appended: revised.appended,
+        }),
         parsed.json,
       )
-    : cliDomainFailure("graph.show", result.diagnostics[0], parsed.json);
+    : cliDomainFailure(operation, revised.diagnostics[0], parsed.json);
 }
 
 type TaskJsonRequestResult =
@@ -2250,6 +2332,27 @@ function parsePlanDecisionRequest(
         expectedVersion: value.expectedVersion,
         planIdentity: value.planIdentity,
         contextManifestIdentity: value.contextManifestIdentity,
+        event: value.event,
+      })
+    : null;
+}
+function parseGraphRevisionRequest(
+  value: Record<string, unknown>,
+): GraphRevisionRequest | null {
+  return (
+    typeof value.taskId === "string" &&
+    typeof value.expectedVersion === "number" &&
+    Number.isSafeInteger(value.expectedVersion) &&
+    typeof value.expectedGraphVersion === "number" &&
+    Number.isSafeInteger(value.expectedGraphVersion) &&
+    isRecord(value.graph) &&
+    isWorkflowEventMetadata(value.event)
+  )
+    ? Object.freeze({
+        taskId: value.taskId,
+        expectedVersion: value.expectedVersion,
+        expectedGraphVersion: value.expectedGraphVersion,
+        graph: value.graph as unknown as DependencyGraph,
         event: value.event,
       })
     : null;
@@ -2550,6 +2653,8 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
   }
   let cwd = process.cwd();
   let json = false;
+  let source: string | undefined;
+  let mode: GraphMutationMode | undefined;
   let graphCount = 0;
   const values: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -2561,13 +2666,26 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
     if (isGlobalPresentationOption(argument)) {
       continue;
     }
-    if (argument === "--cwd") {
+    if (argument === "--cwd" || argument === "--from") {
       const value = args[index + 1];
       if (value === undefined || value.startsWith("--")) {
-        return { ok: false, message: "--cwd requires a path." };
+        return { ok: false, message: `${argument} requires a path.` };
       }
-      cwd = value;
+      if (argument === "--cwd") {
+        cwd = value;
+      } else if (source !== undefined) {
+        return { ok: false, message: "Specify --from exactly once." };
+      } else {
+        source = value;
+      }
       index += 1;
+      continue;
+    }
+    if (argument === "--plan" || argument === "--apply") {
+      if (mode !== undefined) {
+        return { ok: false, message: "Specify --plan or --apply exactly once." };
+      }
+      mode = argument === "--plan" ? "plan" : "apply";
       continue;
     }
     if (argument === "graph") {
@@ -2582,21 +2700,37 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
   if (graphCount !== 1) {
     return { ok: false, message: "Specify exactly one graph command." };
   }
-  const [subcommand, initiativeTaskId, extra] = values;
-  if (subcommand !== "show") {
-    return { ok: false, message: "Graph command is not supported." };
+  const [subcommand, initiativeTaskId, ...tail] = values;
+  if (subcommand === "show") {
+    return initiativeTaskId !== undefined &&
+      tail.length === 0 &&
+      source === undefined &&
+      mode === undefined
+      ? { ok: true, command: "graph", subcommand, cwd, json, initiativeTaskId }
+      : { ok: false, message: "graph show requires exactly one Initiative id." };
   }
-  if (initiativeTaskId === undefined || extra !== undefined) {
-    return { ok: false, message: "graph show requires exactly one Initiative id." };
+  if (subcommand === "revise") {
+    return initiativeTaskId !== undefined &&
+      tail.length === 0 &&
+      source !== undefined &&
+      mode !== undefined
+      ? {
+          ok: true,
+          command: "graph",
+          subcommand,
+          cwd,
+          json,
+          initiativeTaskId,
+          source,
+          mode,
+        }
+      : {
+          ok: false,
+          message:
+            "graph revise requires one Initiative id, --from <request.json>, and --plan or --apply.",
+        };
   }
-  return {
-    ok: true,
-    command: "graph",
-    subcommand,
-    cwd,
-    json,
-    initiativeTaskId,
-  };
+  return { ok: false, message: "Graph command is not supported." };
 }
 
 function parseArguments(args: readonly string[]): CliArgumentResult {
