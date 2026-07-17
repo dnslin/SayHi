@@ -58,6 +58,7 @@ import {
   recordContextManifestChange,
   recordBuildPlanChange,
   transitionWorkflow,
+  validateWorkflowEventMetadata,
   escalateQuickToBuild,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
@@ -131,6 +132,29 @@ export interface TaskBaselineFileSystem extends TaskLifecycleFileSystem {
     operation: (writer: TaskWriter) => Promise<Result>,
   ): Promise<Result>;
 }
+export interface TaskCommitRepositoryState {
+  readonly head: string | null;
+  readonly headParent: string | null;
+  readonly headMessage: string | null;
+  readonly headPaths: readonly string[];
+  readonly stagedPaths: readonly string[];
+}
+export interface TaskCommitRequest {
+  readonly expectedHead: string;
+  readonly paths: readonly string[];
+  readonly message: string;
+  readonly expectedBaseline: BaselineRecord;
+}
+export interface TaskCommitResult {
+  readonly commit: string;
+  readonly parent: string | null;
+  readonly paths: readonly string[];
+  readonly finalBaseline: BaselineRecord;
+}
+export interface TaskCommitPort {
+  inspectRepository(): Promise<TaskCommitRepositoryState>;
+  commit(request: TaskCommitRequest): Promise<TaskCommitResult>;
+}
 
 
 
@@ -149,6 +173,13 @@ export type TaskLifecycleDiagnosticCode =
   | "task_lifecycle.baseline.drift"
   | "task_lifecycle.writer.scope"
   | "task_lifecycle.writer.unavailable"
+  | "task_commit.state.invalid"
+  | "task_commit.policy.invalid"
+  | "task_commit.repository.drift"
+  | "task_commit.staged_scope"
+  | "task_commit.paths.empty"
+  | "task_commit.git.failed"
+  | "task_commit.evidence.invalid"
   | "context_manifest.missing"
   | "context_manifest.invalid"
   | "context_manifest.source.unreadable"
@@ -318,6 +349,17 @@ export interface WithBoundDurableTaskWriterRequest<Value> {
   readonly taskId: string;
   readonly materials: PhaseExecutionMaterials;
   readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
+}
+export interface PlanDurableTaskCommitRequest {
+  readonly fileSystem: TaskBaselineFileSystem;
+  readonly git: TaskCommitPort;
+  readonly taskId: string;
+}
+export interface FinishDurableTaskCommitRequest {
+  readonly fileSystem: TaskArchiveFileSystem & TaskBaselineFileSystem;
+  readonly git: TaskCommitPort;
+  readonly taskId: string;
+  readonly event: WorkflowEventMetadata;
 }
 
 export interface AddDurableContextManifestEntryRequest {
@@ -642,6 +684,66 @@ export type ArchiveDurableTaskResult =
       moved: boolean;
     }>
   | TaskLifecycleFailure;
+export interface DurableTaskCommitEvidence {
+  readonly schemaVersion: 1;
+  readonly taskId: string;
+  readonly commit: string;
+  readonly parent: string;
+  readonly paths: readonly string[];
+  readonly message: string;
+  readonly completionEvent: WorkflowEventMetadata;
+}
+export interface DurableTaskFinishRecord {
+  readonly schemaVersion: 1;
+  readonly taskId: string;
+  readonly state: "prepared" | "committed";
+  readonly baseline: BaselineRecord;
+  readonly message: string;
+  readonly paths: readonly string[];
+  readonly commit: string | null;
+  readonly completionEvent: WorkflowEventMetadata;
+  readonly knowledge: Readonly<{
+    disposition: "deferred";
+    candidates: readonly [];
+    reason: string;
+  }>;
+  readonly journal: Readonly<{
+    taskId: string;
+    commit: string | null;
+    summary: string;
+    createdAt: string;
+  }>;
+  readonly tracker: Readonly<{
+    disposition: "not-requested";
+    reason: string;
+  }>;
+}
+export interface DurableTaskCommitPlan {
+  readonly taskId: string;
+  readonly ready: boolean;
+  readonly baseline: BaselineRecord;
+  readonly message: string;
+  readonly paths: readonly string[];
+  readonly stagedPaths: readonly string[];
+  readonly excludedPaths: readonly string[];
+  readonly diagnostics: readonly TaskLifecycleDiagnostic[];
+}
+export type PlanDurableTaskCommitResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      plan: DurableTaskCommitPlan;
+    }>
+  | TaskLifecycleFailure;
+export type FinishDurableTaskCommitResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      commit: DurableTaskCommitEvidence;
+      state: WorkflowState;
+      archived: true;
+    }>
+  | TaskLifecycleFailure;
 export type RecordDurableQuickResultResult =
   | Readonly<{
       ok: true;
@@ -693,6 +795,7 @@ interface TaskPaths {
   readonly lockPath: string;
   readonly quickResultPath: string;
   readonly plansDirectory: string;
+  readonly finishPath: string;
 }
 
 type LoadTaskResult =
@@ -840,6 +943,51 @@ export async function archiveDurableTask(
   return runWithTaskLock(request.fileSystem, paths.lockPath, () =>
     archiveDurableTaskLocked(request, paths),
   );
+}
+export async function planDurableTaskCommit(
+  request: PlanDurableTaskCommitRequest,
+): Promise<PlanDurableTaskCommitResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await request.fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        planDurableTaskCommitLocked(request, paths),
+      ),
+    );
+  } catch {
+    return taskCommitFailure(
+      "task_commit.git.failed",
+      paths.taskDirectory,
+      "Git repository state could not be inspected for the constrained Task commit plan.",
+      "Repair Git access and retry the constrained Task commit plan.",
+    );
+  }
+}
+
+export async function finishDurableTaskCommit(
+  request: FinishDurableTaskCommitRequest,
+): Promise<FinishDurableTaskCommitResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await request.fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+        finishDurableTaskCommitLocked(request, paths),
+      ),
+    );
+  } catch {
+    return taskCommitFailure(
+      "task_commit.git.failed",
+      paths.taskDirectory,
+      "Git could not complete the constrained Task commit.",
+      "Inspect the repository state and retry only after the commit outcome is known.",
+    );
+  }
 }
 
 export async function createDurableTaskHandoff(
@@ -3635,6 +3783,829 @@ async function archiveDurableTaskLocked(
     return ioFailure(failurePath);
   }
 }
+async function planDurableTaskCommitLocked(
+  request: PlanDurableTaskCommitRequest,
+  paths: TaskPaths,
+): Promise<PlanDurableTaskCommitResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const baselinePath = taskBaselinePath(paths, loaded.state.projection.baselineRef);
+  const baseline = await loadTaskBaseline(request.fileSystem, baselinePath);
+  if (!baseline.ok) {
+    return baseline;
+  }
+  const adoption = latestBaselineAdoption(loaded.state);
+  if (
+    adoption === null ||
+    adoption.baselineIdentity !== hashCanonicalJson(baselineMaterial(baseline.baseline)) ||
+    stableJson(adoption.adopted) !== stableJson(baseline.baseline.dirtyPaths)
+  ) {
+    return baselineInvalid(
+      baselinePath,
+      "Baseline file does not match its accepted adoption Event.",
+      "Restore the Event-bound Baseline before planning a Task commit.",
+    );
+  }
+  const current = await captureCurrentTaskBaseline(
+    request.fileSystem,
+    request.taskId,
+    paths,
+    loaded.state.projection.scope,
+    baseline.baseline.adoptedPaths,
+  );
+  if (!current.ok) {
+    return current;
+  }
+  let repository: TaskCommitRepositoryState;
+  try {
+    repository = await request.git.inspectRepository();
+  } catch {
+    return taskCommitFailure(
+      "task_commit.git.failed",
+      "$",
+      "Git repository state could not be inspected.",
+      "Repair Git access and retry the constrained Task commit plan.",
+    );
+  }
+  const changedPaths = changedBaselinePaths(baseline.baseline, current.baseline);
+  const scopedPaths = Object.freeze(
+    changedPaths.filter((path) =>
+      isWritableTaskPath(path, loaded.state.projection.scope.files),
+    ),
+  );
+  const excludedPaths = Object.freeze(
+    changedPaths.filter(
+      (path) => !isWritableTaskPath(path, loaded.state.projection.scope.files),
+    ),
+  );
+  const stagedPaths = Object.freeze([...repository.stagedPaths].sort());
+  const scopedStagedPaths = stagedPaths.filter((path) =>
+    isWritableTaskPath(path, loaded.state.projection.scope.files),
+  );
+  const diagnostics: TaskLifecycleDiagnostic[] = [];
+  if (
+    loaded.state.projection.route !== "build" ||
+    loaded.state.projection.lifecycle !== "active" ||
+    loaded.state.projection.phase !== "finish"
+  ) {
+    diagnostics.push(
+      taskCommitDiagnostic(
+        "task_commit.state.invalid",
+        "$.task",
+        "A constrained Task commit requires an active Build in Finish after Review.",
+        "Complete the required Build Phases and successful Review before committing.",
+      ),
+    );
+  }
+  if (loaded.state.projection.policies.commit !== "auto-after-review") {
+    diagnostics.push(
+      taskCommitDiagnostic(
+        "task_commit.policy.invalid",
+        "$.task.policies.commit",
+        "Task commit policy does not authorize automatic Finish commit.",
+        "Use an auto-after-review policy or obtain the required human confirmation.",
+      ),
+    );
+  }
+  if (baseline.baseline.head === null || repository.head !== baseline.baseline.head) {
+    diagnostics.push(
+      taskCommitDiagnostic(
+        "task_commit.repository.drift",
+        "$.repository.head",
+        "Repository HEAD changed after the accepted Task Baseline.",
+        "Resolve the external commit or adopt a new Baseline before committing.",
+      ),
+    );
+  }
+  if (scopedStagedPaths.length > 0) {
+    diagnostics.push(
+      taskCommitDiagnostic(
+        "task_commit.staged_scope",
+        "$.repository.stagedPaths",
+        "Task-owned paths already have staged content that cannot be attributed safely.",
+        "Preserve the staged work and resolve or explicitly adopt it before retrying.",
+      ),
+    );
+  }
+  if (scopedPaths.length === 0) {
+    diagnostics.push(
+      taskCommitDiagnostic(
+        "task_commit.paths.empty",
+        "$.paths",
+        "No changed path is attributable to the approved Task scope.",
+        "Finish without a Task commit or record an approved scoped implementation change.",
+      ),
+    );
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    plan: Object.freeze({
+      taskId: request.taskId,
+      ready: diagnostics.length === 0,
+      baseline: current.baseline,
+      message: taskCommitMessage(loaded.state.projection),
+      paths: scopedPaths,
+      stagedPaths,
+      excludedPaths,
+      diagnostics: Object.freeze(diagnostics),
+    }),
+  });
+}
+
+async function finishDurableTaskCommitLocked(
+  request: FinishDurableTaskCommitRequest,
+  paths: TaskPaths,
+): Promise<FinishDurableTaskCommitResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const loadedFinish = await loadDurableTaskFinishRecord(
+    request.fileSystem,
+    paths.finishPath,
+    loaded.state,
+  );
+  if (!loadedFinish.ok) {
+    return loadedFinish;
+  }
+  let finish = loadedFinish.record;
+  const finishRecordWasLoaded = finish !== null;
+  if (finish === null) {
+    if (
+      loaded.state.projection.lifecycle !== "active" ||
+      loaded.state.projection.phase !== "finish"
+    ) {
+      return taskCommitFailure(
+        "task_commit.state.invalid",
+        "$.projection",
+        "A constrained Task commit requires an active Build in Finish.",
+        "Complete Review and advance the active Build to Finish before committing.",
+      );
+    }
+    const preflight = preflightDurableTaskFinishTransition(
+      loaded.state,
+      request.taskId,
+      request.event,
+    );
+    if (preflight !== null) {
+      return preflight;
+    }
+    const planned = await planDurableTaskCommitLocked(request, paths);
+    if (!planned.ok) {
+      return planned;
+    }
+    if (!planned.plan.ready) {
+      return failure(planned.plan.diagnostics);
+    }
+    if (planned.plan.baseline.head === null) {
+      return taskCommitFailure(
+        "task_commit.repository.drift",
+        "$.repository.head",
+        "Task Baseline has no commit identity.",
+        "Commit an initial repository state and adopt a new Baseline before retrying.",
+      );
+    }
+    finish = createDurableTaskFinishRecord(request, planned.plan);
+    const persisted = await writeDurableTaskFinishRecord(request.fileSystem, paths, finish);
+    if (persisted !== null) {
+      return persisted;
+    }
+  }
+  if (
+    finishRecordWasLoaded &&
+    loaded.state.projection.lifecycle === "active" &&
+    loaded.state.projection.phase === "finish"
+  ) {
+    const preflight = preflightDurableTaskFinishTransition(
+      loaded.state,
+      finish.taskId,
+      finish.completionEvent,
+    );
+    if (preflight !== null) {
+      return preflight;
+    }
+  }
+  const resolved = await resolveDurableTaskFinishCommit(
+    request,
+    paths,
+    loaded.state,
+    finish,
+    finishRecordWasLoaded,
+  );
+  if (!resolved.ok) {
+    return resolved;
+  }
+  finish = resolved.finish;
+  const evidence: DurableTaskCommitEvidence = Object.freeze({
+    schemaVersion: 1,
+    taskId: finish.taskId,
+    commit: finish.commit!,
+    parent: resolved.parent,
+    paths: finish.paths,
+    message: finish.message,
+    completionEvent: finish.completionEvent,
+  });
+  const written = await writeDurableTaskCommitEvidence(request.fileSystem, paths, evidence);
+  if (written !== null) {
+    return written;
+  }
+  const completed =
+    loaded.state.projection.lifecycle === "active"
+      ? await advanceDurableTaskLocked(
+          {
+            fileSystem: request.fileSystem,
+            transition: taskCommitCompletionTransition(
+              evidence.taskId,
+              evidence.completionEvent,
+              loaded.state,
+            ),
+          },
+          paths,
+        )
+      : loaded.state.projection.lifecycle === "completed" &&
+          loaded.state.projection.phase === "finish"
+        ? Object.freeze({
+            ok: true as const,
+            contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+            state: loaded.state,
+          })
+        : taskCommitFailure(
+            "task_commit.state.invalid",
+            "$.projection",
+            "A recoverable constrained Task commit must be active or completed in Finish.",
+            "Restore the durable Task to its accepted Finish state before retrying.",
+          );
+  if (!completed.ok) {
+    return completed;
+  }
+  const archived = await archiveDurableTaskLocked(
+    {
+      fileSystem: request.fileSystem,
+      transition: taskCommitArchiveTransition(evidence, completed.state),
+    },
+    paths,
+  );
+  if (!archived.ok) {
+    return archived;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    commit: evidence,
+    state: archived.state,
+    archived: true,
+  });
+}
+
+function taskCommitCompletionTransition(
+  taskId: string,
+  completionEvent: WorkflowEventMetadata,
+  state: WorkflowState,
+): TransitionWorkflowRequest {
+  return {
+    contractVersion: 1,
+    taskId,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "completed", phase: "finish", step: "completed" },
+    gates: [
+      {
+        gate: "finish",
+        evidence: [{ kind: "validation", reference: "evidence/commit.json" }],
+      },
+    ],
+    event: completionEvent,
+  };
+}
+
+function preflightDurableTaskFinishTransition(
+  state: WorkflowState,
+  taskId: string,
+  event: WorkflowEventMetadata,
+): TaskLifecycleFailure | null {
+  const transitioned = transitionWorkflow(
+    state,
+    taskCommitCompletionTransition(taskId, event, state),
+  );
+  return transitioned.ok ? null : failure(transitioned.diagnostics);
+}
+
+function taskCommitArchiveTransition(
+  evidence: DurableTaskCommitEvidence,
+  state: WorkflowState,
+): TransitionWorkflowRequest {
+  return {
+    contractVersion: 1,
+    taskId: evidence.taskId,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "archived", phase: "finish", step: "archived" },
+    gates: [
+      {
+        gate: "archive",
+        evidence: [{ kind: "validation", reference: "evidence/commit.json" }],
+      },
+    ],
+    event: Object.freeze({
+      eventId: `${evidence.completionEvent.eventId}-archive`,
+      actor: evidence.completionEvent.actor,
+      reason: "Archive completed Task after constrained commit.",
+      idempotencyKey: `${evidence.completionEvent.idempotencyKey}-archive`,
+      occurredAt: evidence.completionEvent.occurredAt,
+    }),
+  };
+}
+
+async function writeDurableTaskCommitEvidence(
+  fileSystem: TaskLifecycleFileSystem,
+  paths: TaskPaths,
+  evidence: DurableTaskCommitEvidence,
+): Promise<TaskLifecycleFailure | null> {
+  const directory = `${paths.taskDirectory}/evidence`;
+  const evidencePath = `${directory}/commit.json`;
+  try {
+    const existingDirectory = await fileSystem.inspect(directory);
+    if (existingDirectory.kind === "missing") {
+      await fileSystem.createDirectory(directory);
+    } else if (existingDirectory.kind !== "directory") {
+      return taskCommitFailure(
+        "task_commit.evidence.invalid",
+        directory,
+        "Task commit Evidence directory is unsafe.",
+        "Restore the Task Evidence directory before retrying.",
+      );
+    }
+    const existing = await fileSystem.inspect(evidencePath);
+    if (existing.kind === "file") {
+      if ((await fileSystem.readFile(evidencePath)) === `${JSON.stringify(evidence, null, 2)}\n`) {
+        return null;
+      }
+      return taskCommitFailure(
+        "task_commit.evidence.invalid",
+        evidencePath,
+        "Task commit Evidence conflicts with the recoverable Finish record.",
+        "Inspect the existing commit outcome before retrying.",
+      );
+    }
+    if (existing.kind !== "missing") {
+      return taskCommitFailure(
+        "task_commit.evidence.invalid",
+        evidencePath,
+        "Task commit Evidence path is unsafe.",
+        "Restore the Task Evidence path before retrying.",
+      );
+    }
+    await fileSystem.writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`);
+    return null;
+  } catch {
+    return taskCommitFailure(
+      "task_commit.evidence.invalid",
+      evidencePath,
+      "Task commit Evidence could not be persisted.",
+      "Inspect the Git commit outcome and restore durable Task storage before retrying.",
+    );
+  }
+}
+
+function createDurableTaskFinishRecord(
+  request: FinishDurableTaskCommitRequest,
+  plan: DurableTaskCommitPlan,
+): DurableTaskFinishRecord {
+  return Object.freeze({
+    schemaVersion: 1,
+    taskId: request.taskId,
+    state: "prepared",
+    baseline: plan.baseline,
+    message: plan.message,
+    paths: Object.freeze([...plan.paths]),
+    commit: null,
+    completionEvent: request.event,
+    knowledge: Object.freeze({
+      disposition: "deferred",
+      candidates: Object.freeze([]) as readonly [],
+      reason: "No Knowledge Agent result was accepted for this Finish operation.",
+    }),
+    journal: Object.freeze({
+      taskId: request.taskId,
+      commit: null,
+      summary: "Constrained Task commit prepared.",
+      createdAt: request.event.occurredAt,
+    }),
+    tracker: Object.freeze({
+      disposition: "not-requested",
+      reason: "External tracker synchronization was not explicitly requested.",
+    }),
+  });
+}
+
+async function resolveDurableTaskFinishCommit(
+  request: FinishDurableTaskCommitRequest,
+  paths: TaskPaths,
+  state: WorkflowState,
+  finish: DurableTaskFinishRecord,
+  finishRecordWasLoaded: boolean,
+): Promise<Readonly<{ ok: true; finish: DurableTaskFinishRecord; parent: string }> | TaskLifecycleFailure> {
+  let observed: TaskCommitRepositoryState;
+  try {
+    observed = await request.git.inspectRepository();
+  } catch {
+    return taskCommitFailure(
+      "task_commit.git.failed",
+      "$.repository",
+      "Git could not inspect the recoverable Task commit.",
+      "Restore repository access and retry without changing Git history.",
+    );
+  }
+  if (
+    finishRecordWasLoaded &&
+    finish.state === "prepared" &&
+    observed.head === finish.baseline.head
+  ) {
+    const verified = await verifyPreparedDurableTaskFinishRecord(request, paths, finish);
+    if (verified !== null) {
+      return verified;
+    }
+  }
+  if (finish.state === "prepared" && observed.head === finish.baseline.head) {
+    let committed: TaskCommitResult;
+    try {
+      committed = await request.git.commit({
+        expectedHead: finish.baseline.head!,
+        paths: finish.paths,
+        message: finish.message,
+        expectedBaseline: finish.baseline,
+      });
+    } catch {
+      return taskCommitFailure(
+        "task_commit.git.failed",
+        "$.repository",
+        "Git could not create the constrained Task commit.",
+        "Inspect the repository state and retry only after the commit outcome is known.",
+      );
+    }
+    if (!isExactDurableTaskFinishCommit(finish, committed)) {
+      return taskCommitFailure(
+        "task_commit.git.failed",
+        "$.repository.commit",
+        "Git did not report the exact constrained Task commit requested by Core.",
+        "Inspect the repository manually; do not retry until the commit outcome is known.",
+      );
+    }
+    const persisted = await writeDurableTaskFinishRecord(
+      request.fileSystem,
+      paths,
+      committedDurableTaskFinishRecord(finish, committed.commit),
+    );
+    if (persisted !== null) {
+      return persisted;
+    }
+    return Object.freeze({
+      ok: true,
+      finish: committedDurableTaskFinishRecord(finish, committed.commit),
+      parent: committed.parent!,
+    });
+  }
+  const recovered = await recoverDurableTaskFinishCommit(request, paths, state, finish, observed);
+  if (!recovered.ok) {
+    return recovered;
+  }
+  const committed =
+    finish.state === "committed"
+      ? finish
+      : committedDurableTaskFinishRecord(finish, recovered.commit);
+  if (committed !== finish) {
+    const persisted = await writeDurableTaskFinishRecord(request.fileSystem, paths, committed);
+    if (persisted !== null) {
+      return persisted;
+    }
+  }
+  return Object.freeze({ ok: true, finish: committed, parent: recovered.parent });
+}
+
+async function verifyPreparedDurableTaskFinishRecord(
+  request: FinishDurableTaskCommitRequest,
+  paths: TaskPaths,
+  finish: DurableTaskFinishRecord,
+): Promise<TaskLifecycleFailure | null> {
+  const planned = await planDurableTaskCommitLocked(request, paths);
+  if (!planned.ok) {
+    return planned;
+  }
+  if (
+    !planned.plan.ready ||
+    stableJson(planned.plan.baseline) !== stableJson(finish.baseline) ||
+    planned.plan.message !== finish.message ||
+    stableJson(planned.plan.paths) !== stableJson(finish.paths)
+  ) {
+    return taskCommitFailure(
+      "task_commit.evidence.invalid",
+      paths.finishPath,
+      "The prepared Finish record does not match the current approved Task commit plan.",
+      "Restore finish.json recorded by Core before retrying the constrained commit.",
+    );
+  }
+  return null;
+}
+
+function isExactDurableTaskFinishCommit(
+  finish: DurableTaskFinishRecord,
+  committed: TaskCommitResult,
+): boolean {
+  return (
+    isGitCommit(committed.commit) &&
+    committed.parent === finish.baseline.head &&
+    stableJson([...committed.paths].sort()) === stableJson(finish.paths) &&
+    hasExpectedPostCommitBaseline(
+      finish.baseline,
+      committed.finalBaseline,
+      committed.commit,
+      finish.paths,
+    )
+  );
+}
+
+async function recoverDurableTaskFinishCommit(
+  request: FinishDurableTaskCommitRequest,
+  paths: TaskPaths,
+  state: WorkflowState,
+  finish: DurableTaskFinishRecord,
+  observed: TaskCommitRepositoryState,
+): Promise<Readonly<{ ok: true; commit: string; parent: string }> | TaskLifecycleFailure> {
+  const canonical = await loadTaskBaseline(
+    request.fileSystem,
+    taskBaselinePath(paths, state.projection.baselineRef),
+  );
+  if (!canonical.ok) {
+    return canonical;
+  }
+  if (canonical.baseline.head === null) {
+    return taskCommitFailure(
+      "task_commit.repository.drift",
+      "$.repository.head",
+      "Task Baseline has no commit identity.",
+      "Commit an initial repository state and adopt a new Baseline before retrying.",
+    );
+  }
+  const commit = finish.commit ?? observed.head;
+  if (
+    commit === null ||
+    !isGitCommit(commit) ||
+    observed.head !== commit ||
+    observed.headParent !== canonical.baseline.head ||
+    observed.headMessage !== taskCommitMessage(state.projection) ||
+    stableJson(observed.headPaths) !== stableJson(finish.paths)
+  ) {
+    return taskCommitFailure(
+      "task_commit.repository.drift",
+      "$.repository",
+      "Repository HEAD does not match the constrained Task commit bound to its Baseline.",
+      "Inspect the Git outcome manually; do not retry until the intended commit is restored.",
+    );
+  }
+  const finalBaseline = await captureCurrentTaskBaseline(
+    request.fileSystem,
+    request.taskId,
+    paths,
+    canonical.baseline.declaredScope,
+    canonical.baseline.adoptedPaths,
+  );
+  if (!finalBaseline.ok) {
+    return finalBaseline;
+  }
+  if (
+    !hasExpectedPostCommitBaseline(
+      canonical.baseline,
+      finalBaseline.baseline,
+      commit,
+      finish.paths,
+    )
+  ) {
+    return taskCommitFailure(
+      "task_commit.repository.drift",
+      "$.repository",
+      "Repository material changed after the constrained Task commit.",
+      "Restore the recorded Task commit state before retrying.",
+    );
+  }
+  return Object.freeze({ ok: true, commit, parent: canonical.baseline.head });
+}
+
+function committedDurableTaskFinishRecord(
+  finish: DurableTaskFinishRecord,
+  commit: string,
+): DurableTaskFinishRecord {
+  return Object.freeze({
+    ...finish,
+    state: "committed",
+    commit,
+    journal: Object.freeze({
+      ...finish.journal,
+      commit,
+      summary: "Constrained Task commit completed.",
+    }),
+  });
+}
+
+async function loadDurableTaskFinishRecord(
+  fileSystem: TaskLifecycleFileSystem,
+  path: string,
+  state: WorkflowState,
+): Promise<Readonly<{ ok: true; record: DurableTaskFinishRecord | null }> | TaskLifecycleFailure> {
+  try {
+    const entry = await fileSystem.inspect(path);
+    if (entry.kind === "missing") {
+      return Object.freeze({ ok: true, record: null });
+    }
+    if (entry.kind !== "file") {
+      return invalidDurableTaskFinishRecord(path);
+    }
+    const value: unknown = JSON.parse(await fileSystem.readFile(path));
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return invalidDurableTaskFinishRecord(path);
+    }
+    const record = value as Record<string, unknown>;
+    const baseline = validateBaselineRecord(record.baseline, `${path}.baseline`);
+    if (!baseline.ok) {
+      return baseline;
+    }
+    const paths = record.paths;
+    const knowledge = record.knowledge;
+    const journal = record.journal;
+    const tracker = record.tracker;
+    const event = record.completionEvent;
+    const eventDiagnostic = validateWorkflowEventMetadata(event, `${path}.completionEvent`);
+    const commit = record.commit;
+    if (
+      record.schemaVersion !== 1 ||
+      record.taskId !== state.projection.id ||
+      (record.state !== "prepared" && record.state !== "committed") ||
+      typeof record.message !== "string" ||
+      record.message.length === 0 ||
+      record.message !== taskCommitMessage(state.projection) ||
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      !paths.every((path) => typeof path === "string") ||
+      !sameStrings(paths, [...new Set(paths as readonly string[])].sort()) ||
+      !(paths as readonly string[]).every((path) =>
+        isWritableTaskPath(path, state.projection.scope.files),
+      ) ||
+      stableJson(baseline.baseline.declaredScope) !== stableJson(state.projection.scope) ||
+      !hasExactAdoption(baseline.baseline) ||
+      baseline.baseline.head === null ||
+      eventDiagnostic !== null ||
+      !isFinishKnowledge(knowledge) ||
+      !isFinishJournal(journal, state.projection.id) ||
+      !isFinishTracker(tracker) ||
+      (commit !== null && (typeof commit !== "string" || !isGitCommit(commit))) ||
+      (record.state === "prepared" && commit !== null) ||
+      (record.state === "committed" && commit === null) ||
+      (typeof journal === "object" && journal !== null && "commit" in journal &&
+        (journal as { commit?: unknown }).commit !== commit)
+    ) {
+      return invalidDurableTaskFinishRecord(path);
+    }
+    return Object.freeze({
+      ok: true,
+      record: Object.freeze({
+        schemaVersion: 1,
+        taskId: state.projection.id,
+        state: record.state,
+        baseline: baseline.baseline,
+        message: record.message,
+        paths: Object.freeze([...paths]),
+        commit,
+        completionEvent: event as WorkflowEventMetadata,
+        knowledge,
+        journal,
+        tracker,
+      }),
+    });
+  } catch {
+    return taskCommitFailure(
+      "task_commit.evidence.invalid",
+      path,
+      "The recoverable Finish record could not be read.",
+      "Restore finish.json recorded by Core before retrying.",
+    );
+  }
+}
+
+
+function isFinishKnowledge(
+  value: unknown,
+): value is DurableTaskFinishRecord["knowledge"] {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).disposition === "deferred" &&
+    Array.isArray((value as Record<string, unknown>).candidates) &&
+    ((value as Record<string, unknown>).candidates as readonly unknown[]).length === 0 &&
+    typeof (value as Record<string, unknown>).reason === "string"
+  );
+}
+
+function isFinishJournal(
+  value: unknown,
+  taskId: string,
+): value is DurableTaskFinishRecord["journal"] {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).taskId === taskId &&
+    ((value as Record<string, unknown>).commit === null ||
+      (typeof (value as Record<string, unknown>).commit === "string" &&
+        isGitCommit((value as Record<string, unknown>).commit as string))) &&
+    typeof (value as Record<string, unknown>).summary === "string" &&
+    typeof (value as Record<string, unknown>).createdAt === "string"
+  );
+}
+
+function isFinishTracker(
+  value: unknown,
+): value is DurableTaskFinishRecord["tracker"] {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).disposition === "not-requested" &&
+    typeof (value as Record<string, unknown>).reason === "string"
+  );
+}
+
+async function writeDurableTaskFinishRecord(
+  fileSystem: TaskLifecycleFileSystem,
+  paths: TaskPaths,
+  record: DurableTaskFinishRecord,
+): Promise<TaskLifecycleFailure | null> {
+  try {
+    await fileSystem.writeFile(paths.finishPath, `${JSON.stringify(record, null, 2)}\n`);
+    return null;
+  } catch {
+    return taskCommitFailure(
+      "task_commit.evidence.invalid",
+      paths.finishPath,
+      "The recoverable Finish record could not be persisted.",
+      "Restore durable Task storage before retrying the constrained commit.",
+    );
+  }
+}
+
+function invalidDurableTaskFinishRecord(path: string): TaskLifecycleFailure {
+  return taskCommitFailure(
+    "task_commit.evidence.invalid",
+    path,
+    "The recoverable Finish record is structurally invalid.",
+    "Restore finish.json recorded by Core before retrying.",
+  );
+}
+
+function taskCommitMessage(projection: TaskProjection): string {
+  return `SayHi Task ${projection.id}: ${projection.title}`;
+}
+
+function isGitCommit(value: string): boolean {
+  return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value);
+}
+function hasExpectedPostCommitBaseline(
+  before: BaselineRecord,
+  after: BaselineRecord,
+  commit: string,
+  committedPaths: readonly string[],
+): boolean {
+  const committed = new Set(committedPaths);
+  return (
+    after.head === commit &&
+    after.repositoryRootIdentity === before.repositoryRootIdentity &&
+    after.submodulesDigest === before.submodulesDigest &&
+    stableJson(after.declaredScope) === stableJson(before.declaredScope) &&
+    stableJson(after.adoptedPaths) === stableJson(before.adoptedPaths) &&
+    !after.dirtyPaths.some((change) => committed.has(change.path)) &&
+    stableJson(after.dirtyPaths) ===
+      stableJson(before.dirtyPaths.filter((change) => !committed.has(change.path)))
+  );
+}
+
+
+function taskCommitDiagnostic(
+  code: Extract<TaskLifecycleDiagnosticCode, `task_commit.${string}`>,
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleDiagnostic {
+  return diagnostic(code, path, message, remediation);
+}
+
+function taskCommitFailure(
+  code: Extract<TaskLifecycleDiagnosticCode, `task_commit.${string}`>,
+  path: string,
+  message: string,
+  remediation: string,
+): TaskLifecycleFailure {
+  return failure([taskCommitDiagnostic(code, path, message, remediation)]);
+}
 
 function validateRepeatedArchiveTransition(
   state: WorkflowState,
@@ -4891,6 +5862,7 @@ function taskPaths(taskId: unknown):
     lockPath: `.sayhi/.runtime/task-${taskId}.lock`,
     handoffPath: `${taskDirectory}/handoff.json`,
     quickResultPath: `${taskDirectory}/${QUICK_RESULT_FILE_NAME}`,
+    finishPath: `${taskDirectory}/finish.json`,
     plansDirectory: `${taskDirectory}/plans`,
   });
 }

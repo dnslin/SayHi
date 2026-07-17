@@ -3089,6 +3089,13 @@ function validateReplayEvent(
   return validateEventMetadata(event, path);
 }
 
+export function validateWorkflowEventMetadata(
+  event: unknown,
+  path: string,
+): WorkflowDiagnostic | null {
+  return validateEventMetadata(event, path);
+}
+
 function validateEventMetadata(
   event: unknown,
   path: string,

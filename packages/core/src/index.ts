@@ -56,6 +56,8 @@ import {
   dispatchDurablePhaseExecution,
   resumeDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
+  finishDurableTaskCommit,
+  planDurableTaskCommit,
 } from "./task-lifecycle.js";
 
 export {
@@ -342,6 +344,8 @@ export {
   dispatchDurablePhaseExecution,
   resumeDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
+  finishDurableTaskCommit,
+  planDurableTaskCommit,
 } from "./task-lifecycle.js";
 export type {
   ArchiveDurableTaskRequest,
@@ -410,6 +414,16 @@ export type {
   ResumeDurablePhaseExecutionResult,
   RecordDurablePhaseExecutionResultRequest,
   RecordDurablePhaseExecutionResultResult,
+  DurableTaskCommitEvidence,
+  DurableTaskCommitPlan,
+  FinishDurableTaskCommitRequest,
+  FinishDurableTaskCommitResult,
+  PlanDurableTaskCommitRequest,
+  PlanDurableTaskCommitResult,
+  TaskCommitPort,
+  TaskCommitRepositoryState,
+  TaskCommitRequest,
+  TaskCommitResult,
 } from "./task-lifecycle.js";
 
 export interface BootstrapContract {
@@ -467,6 +481,8 @@ export interface CoreContract {
   readonly dispatchDurablePhaseExecution: typeof dispatchDurablePhaseExecution;
   readonly resumeDurablePhaseExecution: typeof resumeDurablePhaseExecution;
   readonly recordDurablePhaseExecutionResult: typeof recordDurablePhaseExecutionResult;
+  readonly finishDurableTaskCommit: typeof finishDurableTaskCommit;
+  readonly planDurableTaskCommit: typeof planDurableTaskCommit;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -524,4 +540,6 @@ export const coreContract: CoreContract = Object.freeze({
   dispatchDurablePhaseExecution,
   resumeDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
+  finishDurableTaskCommit,
+  planDurableTaskCommit,
 });

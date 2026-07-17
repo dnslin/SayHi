@@ -1680,6 +1680,407 @@ test("packaged CLI stops a changed Quick write outside its approved scope", asyn
   assertQuickProjection(recoveredEnvelope.result?.projection, "completed");
   assert.equal(await readFile(join(repository, "README.md"), "utf8"), "recovered by Quick\n");
 });
+test("packaged CLI commits only accepted Build scope and archives the Task", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await prepareScopedFinishTask(repository);
+
+  await writeFile(join(repository, "user-staged.txt"), "keep staged\n", "utf8");
+  await runGit(repository, "add", "user-staged.txt");
+  await writeFile(join(repository, "user-untracked.txt"), "keep untracked\n", "utf8");
+  const headBefore = await readGitHead(repository);
+
+  const planned = await executeCliResult(
+    "task",
+    "commit-plan",
+    FOUNDATION_TASK.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(planned.exitCode, 0);
+  const plan = (JSON.parse(planned.stdout) as CliJsonEnvelope).result as {
+    ready: boolean;
+    paths: readonly string[];
+    stagedPaths: readonly string[];
+    excludedPaths: readonly string[];
+  };
+  assert.equal(plan.ready, true);
+  assert.deepEqual(plan.paths, ["packages/core/foundation.ts"]);
+  assert.deepEqual(plan.stagedPaths, ["user-staged.txt"]);
+  assert.deepEqual(plan.excludedPaths, ["user-staged.txt", "user-untracked.txt"]);
+
+  const committed = await executeCliResult(
+    "task",
+    "commit",
+    FOUNDATION_TASK.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(committed.exitCode, 0);
+  const result = (JSON.parse(committed.stdout) as CliJsonEnvelope).result as {
+    commit: string;
+    projection: { lifecycle: string; phase: string };
+    archived: boolean;
+  };
+  assert.equal(result.projection.lifecycle, "archived");
+  assert.equal(result.projection.phase, "finish");
+  assert.equal(result.archived, true);
+  assert.equal(await readGitHead(repository), result.commit);
+  const commitParents = await executeFile("git", ["show", "-s", "--format=%P", result.commit], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.equal(commitParents.stdout.trim(), headBefore);
+  const committedPaths = await executeFile("git", ["show", "--format=", "--name-only", result.commit], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.deepEqual(
+    committedPaths.stdout.split(/\r?\n/u).filter(Boolean),
+    ["packages/core/foundation.ts"],
+  );
+  assert.equal(await readFile(join(repository, "user-staged.txt"), "utf8"), "keep staged\n");
+  assert.equal(await readFile(join(repository, "user-untracked.txt"), "utf8"), "keep untracked\n");
+  const status = await executeFile("git", ["status", "--porcelain"], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.match(status.stdout, /A  user-staged\.txt/u);
+  assert.match(status.stdout, /\?\? user-untracked\.txt/u);
+  const evidence = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "tasks", "archive", FOUNDATION_TASK.taskId, "evidence", "commit.json"),
+      "utf8",
+    ),
+  ) as { commit: string; paths: readonly string[] };
+  assert.equal(evidence.commit, result.commit);
+  assert.deepEqual(evidence.paths, ["packages/core/foundation.ts"]);
+  const finish = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "tasks", "archive", FOUNDATION_TASK.taskId, "finish.json"),
+      "utf8",
+    ),
+  ) as {
+    taskId: string;
+    commit: string;
+    knowledge: { disposition: string; candidates: readonly unknown[] };
+    journal: { taskId: string; commit: string };
+    tracker: { disposition: string };
+  };
+  assert.equal(finish.taskId, FOUNDATION_TASK.taskId);
+  assert.equal(finish.commit, result.commit);
+  assert.equal(finish.knowledge.disposition, "deferred");
+  assert.deepEqual(finish.knowledge.candidates, []);
+  assert.equal(finish.journal.taskId, FOUNDATION_TASK.taskId);
+  assert.equal(finish.journal.commit, result.commit);
+  assert.equal(finish.tracker.disposition, "not-requested");
+});
+
+test("Core recovers a committed Task after commit Evidence persistence fails", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-recovery-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await prepareScopedFinishTask(repository);
+  const fileSystem = new FailingCommitEvidenceFileSystem(repository);
+  const evidencePath = `.sayhi/tasks/${FOUNDATION_TASK.taskId}/evidence/commit.json`;
+  fileSystem.failNextWrite(evidencePath);
+  const headBefore = await readGitHead(repository);
+  const first = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event: taskLifecycleEventMetadata(
+      FOUNDATION_TASK,
+      "FINISH-RECOVERY",
+      "2026-07-17T12:03:00Z",
+    ),
+  });
+  assert.equal(first.ok, false);
+  assert.notEqual(await readGitHead(repository), headBefore);
+  const finishPath = join(repository, ".sayhi", "tasks", FOUNDATION_TASK.taskId, "finish.json");
+  const finish = JSON.parse(await readFile(finishPath, "utf8")) as {
+    baseline: { head: string | null };
+  };
+  finish.baseline.head = "a".repeat(40);
+  await writeFile(finishPath, `${JSON.stringify(finish, null, 2)}\n`, "utf8");
+
+  const recovered = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event: taskLifecycleEventMetadata(
+      FOUNDATION_TASK,
+      "FINISH-RECOVERY",
+      "2026-07-17T12:03:00Z",
+    ),
+  });
+  if (!recovered.ok) {
+    assert.fail(
+      `${recovered.diagnostics[0]?.code ?? "unknown"}: ${recovered.diagnostics[0]?.message ?? "Task commit recovery failed"}`,
+    );
+  }
+  assert.equal(recovered.state.projection.lifecycle, "archived");
+  const evidence = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "tasks", "archive", FOUNDATION_TASK.taskId, "evidence", "commit.json"),
+      "utf8",
+    ),
+  ) as { commit: string; parent: string };
+  assert.equal(evidence.commit, await readGitHead(repository));
+  assert.equal(evidence.parent, headBefore);
+});
+
+test("Core rejects a tampered prepared Finish record before Git commit", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-tampered-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await prepareScopedFinishTask(repository);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const event = taskLifecycleEventMetadata(
+    FOUNDATION_TASK,
+    "FINISH-TAMPERED",
+    "2026-07-17T12:03:00Z",
+  );
+  const prepared = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: {
+      inspectRepository: () => fileSystem.inspectRepository(),
+      async commit() {
+        throw new Error("Injected Git failure after Finish record persistence");
+      },
+    },
+    taskId: FOUNDATION_TASK.taskId,
+    event,
+  });
+  assert.equal(prepared.ok, false);
+  const finishPath = join(repository, ".sayhi", "tasks", FOUNDATION_TASK.taskId, "finish.json");
+  const finish = JSON.parse(await readFile(finishPath, "utf8")) as {
+    paths: string[];
+    baseline: { trackedWorktreeDigest: string };
+  };
+  const originalPaths = [...finish.paths];
+  finish.paths = ["unrelated-user-work.txt"];
+  await writeFile(finishPath, `${JSON.stringify(finish, null, 2)}\n`, "utf8");
+
+  const rejectedPaths = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event,
+  });
+  assert.equal(rejectedPaths.ok, false);
+  if (rejectedPaths.ok) {
+    return;
+  }
+  assert.equal(rejectedPaths.diagnostics[0]?.code, "task_commit.evidence.invalid");
+  assert.equal(await readGitHead(repository), (await fileSystem.inspectRepository()).head);
+
+  finish.paths = originalPaths;
+  finish.baseline.trackedWorktreeDigest = `sha256:${"a".repeat(64)}`;
+  await writeFile(finishPath, `${JSON.stringify(finish, null, 2)}\n`, "utf8");
+  const rejectedBaseline = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event,
+  });
+  assert.equal(rejectedBaseline.ok, false);
+  if (rejectedBaseline.ok) {
+    return;
+  }
+  assert.equal(rejectedBaseline.diagnostics[0]?.code, "task_commit.evidence.invalid");
+  assert.equal(await readGitHead(repository), (await fileSystem.inspectRepository()).head);
+});
+
+test("Core rejects an invalid Finish event before creating a Git commit", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-invalid-event-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await prepareScopedFinishTask(repository);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const headBefore = await readGitHead(repository);
+  const rejected = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event: {
+      ...taskLifecycleEventMetadata(
+        FOUNDATION_TASK,
+        "FINISH-INVALID-EVENT",
+        "2026-07-17T12:03:00Z",
+      ),
+      actor: { kind: "orchestrator", id: "", sessionRef: "sayhi-test-session" },
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.equal(await readGitHead(repository), headBefore);
+  assert.equal(
+    (await fileSystem.inspect(`.sayhi/tasks/${FOUNDATION_TASK.taskId}/finish.json`)).kind,
+    "missing",
+  );
+});
+
+test("Core rejects a malformed persisted Finish event after completion", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-completed-event-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await prepareScopedFinishTask(repository);
+  const fileSystem = new FailingArchiveEventFileSystem(repository);
+  fileSystem.failNextArchiveEvent();
+  const event = taskLifecycleEventMetadata(
+    FOUNDATION_TASK,
+    "FINISH-COMPLETED-EVENT",
+    "2026-07-17T12:03:00Z",
+  );
+  const first = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event,
+  });
+  assert.equal(first.ok, false);
+  assert.equal(
+    (await showTaskState(repository)).projection.lifecycle,
+    "completed",
+    first.ok
+      ? "Finish unexpectedly archived despite injected archive Event failure"
+      : `${first.diagnostics[0]?.code ?? "unknown"}: ${first.diagnostics[0]?.message ?? "Finish failed"}`,
+  );
+  const finishPath = join(repository, ".sayhi", "tasks", FOUNDATION_TASK.taskId, "finish.json");
+  const finish = JSON.parse(await readFile(finishPath, "utf8")) as {
+    completionEvent: { actor: { id: string } };
+  };
+  finish.completionEvent.actor.id = "";
+  await writeFile(finishPath, `${JSON.stringify(finish, null, 2)}\n`, "utf8");
+
+  const rejected = await coreContract.finishDurableTaskCommit({
+    fileSystem,
+    git: fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    event,
+  });
+  assert.equal(rejected.ok, false);
+  if (rejected.ok) {
+    return;
+  }
+  assert.equal(rejected.diagnostics[0]?.code, "task_commit.evidence.invalid");
+  assert.equal((await showTaskState(repository)).projection.lifecycle, "completed");
+});
+
+class FailingCommitEvidenceFileSystem extends NodeManagedProjectFileSystem {
+  #failedPath: string | null = null;
+
+  failNextWrite(path: string): void {
+    this.#failedPath = path;
+  }
+
+  override async writeFile(path: string, content: string): Promise<void> {
+    if (path === this.#failedPath) {
+      this.#failedPath = null;
+      throw new Error(`Injected write failure: ${path}`);
+    }
+    await super.writeFile(path, content);
+  }
+}
+
+class FailingArchiveEventFileSystem extends NodeManagedProjectFileSystem {
+  #failArchiveEvent = false;
+
+  failNextArchiveEvent(): void {
+    this.#failArchiveEvent = true;
+  }
+
+  override async appendFile(path: string, content: string): Promise<void> {
+    if (this.#failArchiveEvent && content.includes('"lifecycle":"archived"')) {
+      this.#failArchiveEvent = false;
+      throw new Error("Injected archive Event failure");
+    }
+    await super.appendFile(path, content);
+  }
+}
+
+async function prepareScopedFinishTask(repository: string): Promise<WorkflowState> {
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await mkdir(join(repository, "packages", "core"), { recursive: true });
+  await writeFile(
+    join(repository, "packages", "core", "foundation.ts"),
+    "export const foundation = 'clean';\n",
+    "utf8",
+  );
+  const initialized = await executeCliResult("init", "--cwd", repository, "--json");
+  const start = taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-17T12:00:00Z");
+  await writeTaskRequest(repository, "task-create.json", {
+    ...start,
+    task: {
+      ...start.task,
+      policies: { ...start.task.policies, commit: "auto-after-review" },
+    },
+  });
+  assert.equal(initialized.exitCode, 0);
+  await runGit(repository, "add", ".");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+  await writeFile(
+    join(repository, "packages", "core", "foundation.ts"),
+    "export const foundation = 'adopted';\n",
+    "utf8",
+  );
+  const created = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-create.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(created.exitCode, 0);
+  const adopted = await executeCliResult(
+    "task",
+    "adopt",
+    FOUNDATION_TASK.taskId,
+    "packages/core/foundation.ts",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(adopted.exitCode, 0);
+  let state = await showTaskState(repository);
+  state = await advanceFoundationTask(
+    repository,
+    state,
+    [
+      ["active", "explore"],
+      ["active", "plan"],
+      ["active", "implement"],
+    ],
+    "2026-07-17T12:01:00Z",
+  );
+  const changed = await withDurableTaskWriter({
+    fileSystem: new NodeManagedProjectFileSystem(repository),
+    taskId: FOUNDATION_TASK.taskId,
+    expectedVersion: state.projection.version,
+    operation: (writer) =>
+      writer.writeFile(
+        "packages/core/foundation.ts",
+        "export const foundation = 'committed';\n",
+      ),
+  });
+  if (!changed.ok) {
+    assert.fail(changed.diagnostics[0]?.message ?? "Scoped Writer unexpectedly failed");
+  }
+  state = await advanceFoundationTask(
+    repository,
+    state,
+    [
+      ["active", "review"],
+      ["active", "finish"],
+    ],
+    "2026-07-17T12:02:00Z",
+  );
+  assert.equal(state.projection.phase, "finish");
+  return state;
+}
+
 async function showTaskState(repository: string): Promise<WorkflowState> {
   const shown = await executeCliResult(
     "task",
@@ -1806,7 +2207,7 @@ async function advanceFoundationTask(
 
     await writeTaskRequest(
       repository,
-      "task-transition.json",
+      ".sayhi/.runtime/task-transition.json",
       taskLifecycleTransition(
         FOUNDATION_TASK,
         state,
@@ -1821,7 +2222,7 @@ async function advanceFoundationTask(
       "advance",
       FOUNDATION_TASK.taskId,
       "--from",
-      "task-transition.json",
+      ".sayhi/.runtime/task-transition.json",
       "--cwd",
       repository,
       "--json",
