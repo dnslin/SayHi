@@ -4,11 +4,6 @@ import {
   type ContractIdentity,
 } from "./identity.js";
 import {
-  RECORD_CONTRACT_VERSION,
-  validateContractRecord,
-  type AgentResultRecord,
-} from "./record-contracts.js";
-import {
   contentMatchesIdentity,
   validateContextManifestEntries,
 } from "./context-manifest.js";
@@ -139,96 +134,6 @@ export interface PhaseExecutionBinding {
   readonly contextManifestIdentity: ContractIdentity;
   readonly agentContractIdentity: ContractIdentity;
   readonly skillIdentities: readonly BoundSkillIdentity[];
-}
-
-export function parsePhaseExecutionBinding(
-  value: unknown,
-): PhaseExecutionBinding | null {
-  try {
-    if (!isUnknownRecord(value) || !Array.isArray(value.skillIdentities)) {
-      return null;
-    }
-    const dispatch = {
-      schemaVersion: value.schemaVersion,
-      dispatchId: value.dispatchId,
-      taskId: value.taskId,
-      expectedTaskVersion: value.expectedTaskVersion,
-      phase: value.phase,
-      agentRole: value.agentRole,
-      baseFingerprint: value.baseFingerprint,
-      requestedAt: value.requestedAt,
-      contextManifestIdentity: value.contextManifestIdentity,
-      agentContractIdentity: value.agentContractIdentity,
-    } as PhaseExecutionDispatch;
-    if (validateDispatch(dispatch) !== null) {
-      return null;
-    }
-    const names = new Set<string>();
-    const skillIdentities: BoundSkillIdentity[] = [];
-    for (const skill of value.skillIdentities) {
-      if (
-        !isUnknownRecord(skill) ||
-        !isNonEmptyString(skill.name) ||
-        names.has(skill.name) ||
-        !validateDomainValue({
-          contractVersion: DOMAIN_VALIDATION_CONTRACT_VERSION,
-          kind: "contentHash",
-          value: skill.identity,
-        }).ok
-      ) {
-        return null;
-      }
-      names.add(skill.name);
-      skillIdentities.push(
-        Object.freeze({
-          name: skill.name,
-          identity: Object.freeze({ ...(skill.identity as ContentHash) }),
-        }),
-      );
-    }
-    return Object.freeze({
-      schemaVersion: dispatch.schemaVersion,
-      dispatchId: dispatch.dispatchId,
-      taskId: dispatch.taskId,
-      expectedTaskVersion: dispatch.expectedTaskVersion,
-      phase: dispatch.phase,
-      agentRole: dispatch.agentRole,
-      baseFingerprint: dispatch.baseFingerprint,
-      requestedAt: dispatch.requestedAt,
-      contextManifestIdentity: dispatch.contextManifestIdentity,
-      agentContractIdentity: dispatch.agentContractIdentity,
-      skillIdentities: Object.freeze(skillIdentities),
-    });
-  } catch {
-    return null;
-  }
-}
-
-export function parsePhaseExecutionResult(
-  value: unknown,
-): AgentResultRecord | null {
-  const validation = validateContractRecord({
-    contractVersion: RECORD_CONTRACT_VERSION,
-    kind: "agentResult",
-    record: value,
-  });
-  return validation.ok ? (validation.record as AgentResultRecord) : null;
-}
-
-export function phaseExecutionResultMatchesBinding(
-  result: AgentResultRecord,
-  binding: PhaseExecutionBinding,
-): boolean {
-  return (
-    result.dispatchId === binding.dispatchId &&
-    result.taskId === binding.taskId &&
-    result.expectedTaskVersion === binding.expectedTaskVersion &&
-    result.phase === binding.phase &&
-    result.agentRole === binding.agentRole &&
-    result.contextManifestIdentity === binding.contextManifestIdentity &&
-    result.agentContractIdentity === binding.agentContractIdentity &&
-    result.baseFingerprint === binding.baseFingerprint
-  );
 }
 
 export type RepositoryOperation = "read" | "write" | "validate";
@@ -822,19 +727,6 @@ function bindSkillIdentities(
           digest: skill.identity.digest,
         }),
       }),
-    );
-  }
-  if (
-    materialNames.size !== request.agentContract.skills.length ||
-    request.skills.some(
-      (material) => !request.agentContract.skills.includes(material.name),
-    )
-  ) {
-    return failure(
-      "execution.skill_invalid",
-      "$.skills",
-      "Skill materials must exactly match the Phase Agent's declared Skills.",
-      "Provide one locked material record for each declared Skill and no undeclared Skills.",
     );
   }
   return Object.freeze({

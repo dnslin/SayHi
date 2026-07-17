@@ -22,12 +22,11 @@ Combining all dimensions into one status string is forbidden. A lifecycle value 
 3. Every completed Gate requires typed Evidence.
 4. A required Context Entry must exist and match its content identity.
 5. An Agent result must match its dispatch task, Phase, Agent role, and repository fingerprint.
-6. Before resuming an active Build Phase, Core must revalidate its exact approved Plan, Context Manifest, Phase Agent Capability Contract, and locked Skill identities.
-7. No read Agent may overlap an exclusive writer or validation operation in the shared checkout.
-8. A Task may move backward only through an explicitly allowed repair or replanning transition.
-9. Cancellation and blocking preserve artifacts and working changes.
-10. Finish is required before archive.
-11. Prompts may explain workflow rules but cannot redefine them.
+6. No read Agent may overlap an exclusive writer or validation operation in the shared checkout.
+7. A Task may move backward only through an explicitly allowed repair or replanning transition.
+8. Cancellation and blocking preserve artifacts and working changes.
+9. Finish is required before archive.
+10. Prompts may explain workflow rules but cannot redefine them.
 
 ## 3. Route classification
 
@@ -321,7 +320,6 @@ The Core distinguishes:
 - `recovery_required` — Projection/Event or update state cannot be reconciled automatically;
 - `blocked` — a business, review, dependency, authorization, or bounded-repair blocker prevents progress;
 - `agent_invalid` — dispatched Agent identity, capability, or output contract is unexpected;
-- `skill_invalid` — a locked Skill identity or declared Skill bundle differs from the accepted dispatch.
 - `sync_conflict` — local and external tracker projections changed incompatibly.
 
 These are reason codes associated with lifecycle or operations, not additional Phase values.
