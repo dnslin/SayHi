@@ -731,3 +731,42 @@ test("Core preserves accepted UTC leap seconds in ordered record timestamps", ()
   });
   assert.equal(evidenceResult.ok, true);
 });
+
+test("Core requires structured actionable Review findings", () => {
+  const actionableReview = {
+    ...AGENT_RESULT_RECORD,
+    phase: "review",
+    agentRole: "spec-review",
+    outcome: "blocked",
+    findings: [
+      {
+        id: "FINDING-7",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: "Recovery reproduces the Task Projection",
+        message: "The result omits the required recovery behavior.",
+        remediation: "Persist and replay the recovery result before retrying Review.",
+      },
+    ],
+  } as const;
+  const accepted = coreContract.validateContractRecord({
+    contractVersion: 1,
+    kind: "agentResult",
+    record: actionableReview,
+  });
+  assert.equal(accepted.ok, true);
+
+  const unstructured = coreContract.validateContractRecord({
+    contractVersion: 1,
+    kind: "agentResult",
+    record: { ...actionableReview, findings: ["Recovery behavior is missing."] },
+  });
+  assert.equal(unstructured.ok, false);
+  if (!unstructured.ok) {
+    assert.equal(
+      unstructured.diagnostics[0]?.code,
+      "record_contract.agent_result.invalid",
+    );
+    assert.equal(unstructured.diagnostics[0]?.path, "$.record.findings[0]");
+  }
+});

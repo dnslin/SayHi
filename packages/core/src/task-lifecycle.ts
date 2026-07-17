@@ -313,6 +313,13 @@ export interface WithDurableTaskWriterRequest<Value> {
   readonly expectedVersion: number;
   readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
 }
+export interface WithBoundDurableTaskWriterRequest<Value> {
+  readonly fileSystem: ContextManifestFileSystem & TaskBaselineFileSystem;
+  readonly taskId: string;
+  readonly materials: PhaseExecutionMaterials;
+  readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
+}
+
 export interface AddDurableContextManifestEntryRequest {
   readonly fileSystem: ContextManifestFileSystem;
   readonly taskId: string;
@@ -887,6 +894,63 @@ export async function withDurableTaskWriter<Value>(
   } catch {
     return writerUnavailable();
   }
+}
+
+export async function withBoundDurableTaskWriter<Value>(
+  request: WithBoundDurableTaskWriterRequest<Value>,
+): Promise<WithDurableTaskWriterResult<Value>> {
+  const now = new Date();
+  const timestamp = now.toISOString();
+  const resumed = await resumeDurablePhaseExecution({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+    materials: request.materials,
+    blockEvent: {
+      eventId: `EVENT-${request.taskId}-BOUND-WRITER-${now.getTime()}`,
+      actor: {
+        kind: "system",
+        id: "sayhi-core",
+        sessionRef: "bound-writer",
+      },
+      reason: "Bound Implementation Writer revalidation failed.",
+      idempotencyKey: `BOUND-WRITER-${request.taskId}-${now.getTime()}`,
+      occurredAt: timestamp,
+    },
+  });
+  if (!resumed.ok) {
+    return resumed;
+  }
+  if (resumed.status === "blocked") {
+    return failure(resumed.diagnostics);
+  }
+  if (resumed.status !== "ready") {
+    return phaseExecutionResultInvalid(
+      "Bound Implementation dispatch is not ready for a Writer operation.",
+    );
+  }
+  if (
+    resumed.binding.phase !== "implement" ||
+    resumed.binding.agentRole !== "implementation"
+  ) {
+    return phaseExecutionResultInvalid(
+      "Bound Writer requires the active Implementation Agent dispatch.",
+    );
+  }
+  const authorized = authorizePhaseExecution({
+    contractVersion: 1,
+    binding: resumed.binding,
+    ...request.materials,
+    capability: { kind: "repository", access: "write" },
+  });
+  if (!authorized.ok) {
+    return phaseExecutionFailure(authorized.diagnostics);
+  }
+  return withDurableTaskWriter({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+    expectedVersion: resumed.state.projection.version,
+    operation: request.operation,
+  });
 }
 export async function recordDurableQuickResult(
   request: RecordDurableQuickResultRequest,
@@ -3165,8 +3229,29 @@ async function advanceDurableTaskLocked(
   if (!loaded.ok) {
     return loaded;
   }
+  if (request.transition.expectedVersion !== loaded.state.projection.version) {
+    const retried = transitionWorkflow(loaded.state, request.transition);
+    if (!retried.ok) {
+      return failure(retried.diagnostics);
+    }
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: retried.state,
+      event: retried.event,
+      appended: false,
+    });
+  }
   if (isBuildPlanTransition(loaded.state, request.transition)) {
     return buildPlanApprovalRequired();
+  }
+  const resealed = await resealBuildImplementationAfterContextDrift(
+    request.fileSystem,
+    paths,
+    loaded.state,
+  );
+  if (resealed !== null) {
+    return resealed;
   }
   const transitioned = transitionWorkflow(loaded.state, request.transition);
   if (!transitioned.ok) {
@@ -3180,14 +3265,6 @@ async function advanceDurableTaskLocked(
       event: transitioned.event,
       appended: false,
     });
-  }
-  const resealed = await resealBuildImplementationAfterContextDrift(
-    request.fileSystem,
-    paths,
-    loaded.state,
-  );
-  if (resealed !== null) {
-    return resealed;
   }
   const graph = transitioned.event.initiativeGraph;
   let activePath = loaded.eventsPath;

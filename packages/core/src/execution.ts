@@ -692,6 +692,17 @@ function validateAgentBinding(
       "Use read-only, exclusive-write, or read-only-plus-exclusive-validation.",
     );
   }
+  if (
+    (contract.role === "standards-review" || contract.role === "spec-review") &&
+    contract.repositoryAccess !== "read-only"
+  ) {
+    return failure(
+      "execution.agent_invalid",
+      "$.agentContract.repositoryAccess",
+      "Review Agent Capability Contracts must have read-only repository access.",
+      "Use read-only access for Standards Review and Spec Review Agents.",
+    );
+  }
   if (!isRepositoryRelativePath(contract.outputSchema)) {
     return failure(
       "execution.agent_invalid",

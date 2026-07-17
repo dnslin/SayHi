@@ -734,6 +734,25 @@ export function transitionWorkflow(
   if (buildPlanDiagnostic !== null) {
     return transitionFailure(state, buildPlanDiagnostic);
   }
+  const implementationResultDiagnostic =
+    validateBuildImplementationResultTransition(
+      state.projection,
+      state.events,
+      request.to,
+    );
+  if (implementationResultDiagnostic !== null) {
+    return transitionFailure(state, implementationResultDiagnostic);
+  }
+  const reviewResultDiagnostic = validateBuildReviewResultTransition(
+    state.projection,
+    state.events,
+    request.to,
+  );
+  if (reviewResultDiagnostic !== null) {
+    return transitionFailure(state, reviewResultDiagnostic);
+  }
+
+
 
   const invariantDiagnostic = validateTransitionInvariants(
     state.projection,
@@ -1619,6 +1638,15 @@ export function replayWorkflowEvents(
     if (buildPlanDiagnostic !== null) {
       return replayFailure({ ...buildPlanDiagnostic, path: `$[${index}]` });
     }
+    const reviewResultDiagnostic = validateBuildReviewResultTransition(
+      projection,
+      acceptedEvents,
+      sourceEvent.to,
+    );
+    if (reviewResultDiagnostic !== null) {
+      return replayFailure({ ...reviewResultDiagnostic, path: `$[${index}]` });
+    }
+
 
     const invariantDiagnostic = validateTransitionInvariants(
       projection,
@@ -3179,6 +3207,130 @@ function validateBuildPlanImplementationTransition(
   }
   return null;
 }
+function validateBuildImplementationResultTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+): WorkflowDiagnostic | null {
+  if (
+    projection.route !== "build" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "implement" ||
+    to.lifecycle !== "active" ||
+    to.phase !== "review"
+  ) {
+    return null;
+  }
+  const succeeded = events.some(
+    (event) =>
+      event.type === "phase_execution_result_accepted" &&
+      event.from.phase === "implement" &&
+      isUnknownRecord(event.result) &&
+      event.result.phase === "implement" &&
+      event.result.agentRole === "implementation" &&
+      event.result.outcome === "succeeded",
+  );
+  return succeeded
+    ? null
+    : diagnostic(
+        "workflow.transition.illegal",
+        "$.to",
+        "Build Review requires an accepted successful Implementation result.",
+        "Record the bound Implementation Agent result before entering Review.",
+      );
+}
+function validateBuildReviewResultTransition(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  to: WorkflowPosition,
+): WorkflowDiagnostic | null {
+  if (
+    projection.route !== "build" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "review" ||
+    to.lifecycle !== "active" ||
+    (to.phase !== "finish" && to.phase !== "implement")
+  ) {
+    return null;
+  }
+  const results = currentBuildReviewResults(events);
+  const requiredRoles = ["standards-review", "spec-review"] as const;
+  const missingRoles = requiredRoles.filter((role) => !results.has(role));
+  if (missingRoles.length > 0) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      `Build Review requires accepted ${missingRoles.join(" and ")} results.`,
+      "Record both independent read-only Review Agent results before leaving Review.",
+    );
+  }
+  const reviewResults = requiredRoles.map((role) => results.get(role)!);
+  const hasBlockingFinding = reviewResults.some(hasBlockingReviewFinding);
+  if (to.phase === "finish") {
+    return hasBlockingFinding ||
+      reviewResults.some((result) => result.outcome !== "succeeded")
+      ? diagnostic(
+          "workflow.transition.illegal",
+          "$.to",
+          "Build Review has unresolved blocking findings.",
+          "Resolve findings through Repair or record an authorized waiver before entering Finish.",
+        )
+      : null;
+  }
+  return hasBlockingFinding
+    ? null
+    : diagnostic(
+        "workflow.transition.illegal",
+        "$.to",
+        "Build Repair requires a blocking Review finding.",
+        "Return to Implement only to address recorded blocking Review findings.",
+      );
+}
+
+function currentBuildReviewResults(
+  events: readonly WorkflowEvent[],
+): ReadonlyMap<"standards-review" | "spec-review", Record<string, unknown>> {
+  const results = new Map<
+    "standards-review" | "spec-review",
+    Record<string, unknown>
+  >();
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.lifecycle === "active" &&
+      event.to.phase === "review"
+    ) {
+      break;
+    }
+    if (
+      event.type !== "phase_execution_result_accepted" ||
+      event.from.phase !== "review" ||
+      !isUnknownRecord(event.result) ||
+      event.result.phase !== "review" ||
+      (event.result.agentRole !== "standards-review" &&
+        event.result.agentRole !== "spec-review")
+    ) {
+      continue;
+    }
+    if (!results.has(event.result.agentRole)) {
+      results.set(event.result.agentRole, event.result);
+    }
+  }
+  return results;
+}
+
+function hasBlockingReviewFinding(result: Record<string, unknown>): boolean {
+  return (
+    Array.isArray(result.findings) &&
+    result.findings.some(
+      (finding) =>
+        isUnknownRecord(finding) && finding.severity === "blocking",
+    )
+  );
+}
+
+
 
 function buildPlanApprovalEvidence(
   gates: readonly GateAcceptance[],

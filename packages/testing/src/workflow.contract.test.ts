@@ -975,6 +975,21 @@ test("Build repair transitions stop at the configured attempt limit", () => {
       `repair-${state.projection.version}`,
     );
   }
+  state = recordWorkflowReviewResults(
+    state,
+    "blocked",
+    [
+      {
+        id: "FINDING-repair-exhausted",
+        severity: "blocking",
+        subject: "acceptance-criterion",
+        reference: "The workflow completes",
+        message: "The repaired behavior remains incomplete.",
+        remediation: "Block the Task with the preserved Review evidence.",
+      },
+    ],
+    "repair-exhausted",
+  );
 
   const rejected = coreContract.transitionWorkflow(state, {
     contractVersion: 1,
@@ -1380,6 +1395,55 @@ function advanceTask(
   if (buildPlanAuthority !== undefined) {
     state = buildPlanAuthority.state;
   }
+  if (
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "implement" &&
+    lifecycle === "active" &&
+    phase === "review"
+  ) {
+    state = recordWorkflowAgentResult(
+      state,
+      "implement",
+      "implementation",
+      "succeeded",
+      [],
+      `${suffix}-implementation`,
+    );
+  }
+  if (
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "review" &&
+    lifecycle === "active" &&
+    phase === "finish"
+  ) {
+    state = recordWorkflowReviewResults(state, "succeeded", [], suffix);
+  }
+  if (
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "review" &&
+    lifecycle === "active" &&
+    phase === "implement"
+  ) {
+    state = recordWorkflowReviewResults(
+      state,
+      "blocked",
+      [
+        {
+          id: `FINDING-${suffix}`,
+          severity: "blocking",
+          subject: "acceptance-criterion",
+          reference: "The workflow completes",
+          message: "The reviewed behavior is incomplete.",
+          remediation: "Repair the behavior and rerun both review axes.",
+        },
+      ],
+      suffix,
+    );
+  }
+
   const allowed = routeTransitions[state.projection.route].find(
     (candidate) =>
       candidate.from.lifecycle === state.projection.lifecycle &&
@@ -1447,6 +1511,62 @@ function advanceTask(
     assert.fail(result.diagnostics[0]?.message ?? "Workflow transition failed");
   }
   return result.state;
+}
+
+function recordWorkflowReviewResults(
+  state: WorkflowState,
+  outcome: "succeeded" | "blocked",
+  findings: readonly Record<string, unknown>[],
+  suffix: string,
+): WorkflowState {
+  let result = state;
+  for (const role of ["standards-review", "spec-review"] as const) {
+    result = recordWorkflowAgentResult(
+      result,
+      "review",
+      role,
+      outcome,
+      findings.map((finding) => ({ ...finding, id: `${finding.id}-${role}` })),
+      `${suffix}-${role}`,
+    );
+  }
+  return result;
+}
+
+function recordWorkflowAgentResult(
+  state: WorkflowState,
+  phase: "implement" | "review",
+  agentRole: "implementation" | "standards-review" | "spec-review",
+  outcome: "succeeded" | "blocked",
+  findings: readonly Record<string, unknown>[],
+  suffix: string,
+): WorkflowState {
+  const recorded = coreContract.recordPhaseExecutionResult(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    result: {
+      schemaVersion: 1,
+      dispatchId: `DISPATCH-${suffix}`,
+      taskId: state.projection.id,
+      expectedTaskVersion: state.projection.version,
+      phase,
+      agentRole,
+      contextManifestIdentity: `sha256:${"a".repeat(64)}`,
+      agentContractIdentity: `sha256:${"b".repeat(64)}`,
+      baseFingerprint: `sha256:${"c".repeat(64)}`,
+      outcome,
+      artifacts: [],
+      evidence: [],
+      findings,
+      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+    event: eventMetadata(`RESULT-${suffix}`),
+  });
+  if (!recorded.ok) {
+    assert.fail(recorded.diagnostics[0]?.message ?? "Agent result failed");
+  }
+  return recorded.state;
 }
 
 function establishBuildPlanAuthority(state: WorkflowState, suffix: string) {

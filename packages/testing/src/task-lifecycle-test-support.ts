@@ -6,6 +6,8 @@ import {
   freezeDurableContextManifest,
   readGateEvidenceKinds,
   recordDurableBuildPlan,
+  dispatchDurablePhaseExecution,
+  recordDurablePhaseExecutionResult,
   type ContextManifestFileSystem,
   type StartWorkflowTaskRequest,
   type TransitionWorkflowRequest,
@@ -24,6 +26,82 @@ export interface TaskLifecycleFixture {
   readonly eventNamespace: string;
   readonly sessionRef: string;
 }
+
+const IMPLEMENTATION_AGENT_CONTRACT = {
+  schemaVersion: 1,
+  role: "implementation",
+  runtimeName: "sayhi-v1-implementation",
+  contractVersion: 1,
+  tools: ["read", "edit", "bash"],
+  network: "none",
+  skills: ["implement", "tdd"],
+  spawns: [],
+  repositoryAccess: "exclusive-write",
+  outputSchema: "schemas/agent/implementation-output.json",
+  promptBaseIdentity: `sha256:${"a".repeat(64)}`,
+  overridePolicy: "prompt-body-only",
+} as const;
+const IMPLEMENTATION_AGENT_CONTRACT_ID =
+  "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08";
+const IMPLEMENTATION_SKILLS = [
+  {
+    name: "implement",
+    identity: {
+      algorithm: "sha256-lf-v1",
+      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
+    },
+    content: "implement skill\n",
+  },
+  {
+    name: "tdd",
+    identity: {
+      algorithm: "sha256-lf-v1",
+      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
+    },
+    content: "tdd skill\n",
+  },
+] as const;
+const REVIEW_AGENTS = [
+  {
+    role: "standards-review",
+    contractIdentity:
+      "sha256:21a8ae092397c5873d98bcb0f0cf6fd080f62a83096bc7aa35b4185829c0784b",
+    contract: {
+      schemaVersion: 1,
+      role: "standards-review",
+      runtimeName: "sayhi-v1-standards-review",
+      contractVersion: 1,
+      tools: [],
+      network: "none",
+      skills: [],
+      spawns: [],
+      repositoryAccess: "read-only",
+      outputSchema: "schemas/agent/standards-review-output.json",
+      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+      overridePolicy: "prompt-body-only",
+    },
+  },
+  {
+    role: "spec-review",
+    contractIdentity:
+      "sha256:6a82f7bca42776d7b92abcf2facf4a88a6b1b2bb212bafc3dafd2632ce62b97f",
+    contract: {
+      schemaVersion: 1,
+      role: "spec-review",
+      runtimeName: "sayhi-v1-spec-review",
+      contractVersion: 1,
+      tools: [],
+      network: "none",
+      skills: [],
+      spawns: [],
+      repositoryAccess: "read-only",
+      outputSchema: "schemas/agent/spec-review-output.json",
+      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+      overridePolicy: "prompt-body-only",
+    },
+  },
+] as const;
+
 
 export function taskLifecycleStartRequest(
   fixture: TaskLifecycleFixture,
@@ -232,8 +310,144 @@ export async function createCompletedDurableTask(
     );
   }
   state = approved.state;
+  const dispatched = await dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: planned.plan.identity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: `DISPATCH-${fixture.eventNamespace}-IMPLEMENT`,
+        taskId: fixture.taskId,
+        expectedTaskVersion: state.projection.version,
+        phase: "implement",
+        agentRole: "implementation",
+        baseFingerprint: `sha256:${"d".repeat(64)}`,
+        requestedAt: transitionedAt,
+        contextManifestIdentity: planned.plan.contextManifestIdentity,
+        agentContractIdentity: IMPLEMENTATION_AGENT_CONTRACT_ID,
+      },
+      manifest: [],
+      currentContext: [],
+      agentContract: IMPLEMENTATION_AGENT_CONTRACT,
+      skills: IMPLEMENTATION_SKILLS,
+    },
+    event: taskLifecycleEventMetadata(
+      fixture,
+      "IMPLEMENT-DISPATCHED",
+      transitionedAt,
+    ),
+  });
+  if (!dispatched.ok) {
+    throw new Error(dispatched.diagnostics[0]?.message ?? "Implement dispatch failed");
+  }
+  const implemented = await recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: fixture.taskId,
+    result: {
+      schemaVersion: 1,
+      dispatchId: dispatched.binding.dispatchId,
+      taskId: fixture.taskId,
+      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
+      phase: "implement",
+      agentRole: "implementation",
+      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
+      agentContractIdentity: dispatched.binding.agentContractIdentity,
+      baseFingerprint: dispatched.binding.baseFingerprint,
+      outcome: "succeeded",
+      artifacts: ["artifacts/implementation.md"],
+      evidence: ["evidence/implementation.json"],
+      findings: [],
+      observedFinalFingerprint: dispatched.binding.baseFingerprint,
+    },
+    event: taskLifecycleEventMetadata(
+      fixture,
+      "IMPLEMENT-RESULT",
+      transitionedAt,
+    ),
+  });
+  if (!implemented.ok) {
+    throw new Error(implemented.diagnostics[0]?.message ?? "Implement result failed");
+  }
+  state = implemented.state;
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      fixture,
+      state,
+      "active",
+      "review",
+      "REVIEW",
+      transitionedAt,
+    ),
+  });
+  if (!reviewed.ok) {
+    throw new Error(reviewed.diagnostics[0]?.message ?? "Review entry failed");
+  }
+  state = reviewed.state;
+  for (const reviewAgent of REVIEW_AGENTS) {
+    const dispatched = await dispatchDurablePhaseExecution({
+      fileSystem,
+      planIdentity: planned.plan.identity,
+      execution: {
+        contractVersion: 1,
+        dispatch: {
+          schemaVersion: 1,
+          dispatchId: `DISPATCH-${fixture.eventNamespace}-${reviewAgent.role}`,
+          taskId: fixture.taskId,
+          expectedTaskVersion: state.projection.version,
+          phase: "review",
+          agentRole: reviewAgent.role,
+          baseFingerprint: `sha256:${"d".repeat(64)}`,
+          requestedAt: transitionedAt,
+          contextManifestIdentity: planned.plan.contextManifestIdentity,
+          agentContractIdentity: reviewAgent.contractIdentity,
+        },
+        manifest: [],
+        currentContext: [],
+        agentContract: reviewAgent.contract,
+        skills: [],
+      },
+      event: taskLifecycleEventMetadata(
+        fixture,
+        `${reviewAgent.role}-DISPATCHED`,
+        transitionedAt,
+      ),
+    });
+    if (!dispatched.ok) {
+      throw new Error(dispatched.diagnostics[0]?.message ?? "Review dispatch failed");
+    }
+    const result = await recordDurablePhaseExecutionResult({
+      fileSystem,
+      taskId: fixture.taskId,
+      result: {
+        schemaVersion: 1,
+        dispatchId: dispatched.binding.dispatchId,
+        taskId: fixture.taskId,
+        expectedTaskVersion: dispatched.binding.expectedTaskVersion,
+        phase: "review",
+        agentRole: reviewAgent.role,
+        contextManifestIdentity: dispatched.binding.contextManifestIdentity,
+        agentContractIdentity: dispatched.binding.agentContractIdentity,
+        baseFingerprint: dispatched.binding.baseFingerprint,
+        outcome: "succeeded",
+        artifacts: [`artifacts/${reviewAgent.role}.md`],
+        evidence: [`evidence/${reviewAgent.role}.json`],
+        findings: [],
+        observedFinalFingerprint: dispatched.binding.baseFingerprint,
+      },
+      event: taskLifecycleEventMetadata(
+        fixture,
+        `${reviewAgent.role}-RESULT`,
+        transitionedAt,
+      ),
+    });
+    if (!result.ok) {
+      throw new Error(result.diagnostics[0]?.message ?? "Review result failed");
+    }
+    state = result.state;
+  }
   for (const [lifecycle, phase] of [
-    ["active", "review"],
     ["active", "finish"],
     ["completed", "finish"],
   ] as const) {

@@ -327,6 +327,10 @@ A dispatch request binds execution to state:
 
 Every Agent result MUST echo these binding values and include a schema-valid `outcome`, artifacts, Evidence, findings, and observed final fingerprint. A result cannot declare a Task transition accepted.
 
+Review results use structured findings. Each finding has a stable `id`, `severity` (`blocking` or `advisory`), `subject` (`acceptance-criterion` or `approved-spec`), `reference`, `message`, and actionable `remediation`. Only Standards Review and Spec Review results may contain findings. A failed or blocked Review result MUST contain at least one blocking finding; a successful Review result MUST NOT contain one.
+
+Standards Review and Spec Review Capability Contracts MUST have `read-only` repository access. A Build may enter Review only after a successful Implementation result. It may enter Finish only after both independent Review results succeed without blocking findings. A blocking finding permits the explicit Review repair transition; the configured repair-attempt limit still blocks further automatic repair while preserving the accepted result Events.
+
 For an active Build Phase, Core accepts a `phase_execution_dispatched` Workflow Event that binds the exact approved Plan identity to the complete dispatch binding, including Context Manifest, Phase Agent Capability Contract, and ordered locked Skill identities. Core accepts at most one result for that dispatch as a `phase_execution_result_accepted` Event.
 
 On resume, Core MUST load the bound Plan evidence and revalidate the live Context Manifest, Capability Contract, and Skill materials against the durable binding before work continues or an accepted result returns. A changed or missing Plan, Context, Agent capability, or Skill MUST append a same-Phase Block Event using caller-supplied Event metadata and return a review-required disposition with its actionable diagnostic. When every identity is unchanged and a result is already accepted, resume returns that result and MUST NOT dispatch the Phase Agent again.

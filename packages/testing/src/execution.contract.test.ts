@@ -1185,3 +1185,40 @@ test("Core fails closed when binding input cannot be read safely", () => {
     },
   );
 });
+
+test("Core rejects Review Agent contracts with write authority", () => {
+  const reviewContract = {
+    schemaVersion: 1,
+    role: "standards-review",
+    runtimeName: "sayhi-v1-standards-review",
+    contractVersion: 1,
+    tools: [],
+    network: "none",
+    skills: [],
+    spawns: [],
+    repositoryAccess: "exclusive-write",
+    outputSchema: "schemas/agent/standards-review-output.json",
+    promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+    overridePolicy: "prompt-body-only",
+  } as const;
+  const result = coreContract.bindPhaseExecution({
+    contractVersion: 1,
+    dispatch: {
+      ...dispatch,
+      dispatchId: "DISPATCH-REVIEW-WRITE",
+      phase: "review",
+      agentRole: "standards-review",
+      agentContractIdentity:
+        "sha256:4f0759751cd37e0248b05644e26d6c737b601cdfc35bb29311ee71da3c30dded",
+    },
+    manifest,
+    currentContext,
+    agentContract: reviewContract,
+    skills: [],
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0]?.code, "execution.agent_invalid");
+    assert.equal(result.diagnostics[0]?.path, "$.agentContract.repositoryAccess");
+  }
+});

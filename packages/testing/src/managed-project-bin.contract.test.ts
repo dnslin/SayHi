@@ -14,12 +14,16 @@ import { NodeManagedProjectFileSystem } from "@dnslin/sayhi-cli";
 import {
   coreContract,
   withDurableTaskWriter,
+  type PhaseAgentContract,
+  type SkillMaterial,
+  type ContractIdentity,
   type WorkflowLifecycle,
   type WorkflowPhase,
   type WorkflowState,
 } from "@dnslin/sayhi-core";
 
 import {
+  taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
   taskLifecycleTransition,
   type TaskLifecycleFixture,
@@ -48,6 +52,84 @@ const FOUNDATION_TASK = Object.freeze({
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
+
+const FOUNDATION_IMPLEMENTATION_AGENT = {
+  role: "implementation",
+  identity:
+    "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
+  contract: {
+    schemaVersion: 1,
+    role: "implementation",
+    runtimeName: "sayhi-v1-implementation",
+    contractVersion: 1,
+    tools: ["read", "edit", "bash"],
+    network: "none",
+    skills: ["implement", "tdd"],
+    spawns: [],
+    repositoryAccess: "exclusive-write",
+    outputSchema: "schemas/agent/implementation-output.json",
+    promptBaseIdentity: `sha256:${"a".repeat(64)}`,
+    overridePolicy: "prompt-body-only",
+  } as const satisfies PhaseAgentContract,
+  skills: [
+    {
+      name: "implement",
+      identity: {
+        algorithm: "sha256-lf-v1",
+        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
+      },
+      content: "implement skill\n",
+    },
+    {
+      name: "tdd",
+      identity: {
+        algorithm: "sha256-lf-v1",
+        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
+      },
+      content: "tdd skill\n",
+    },
+  ] as const satisfies readonly SkillMaterial[],
+} as const;
+const FOUNDATION_REVIEW_AGENTS = [
+  {
+    role: "standards-review",
+    identity:
+      "sha256:21a8ae092397c5873d98bcb0f0cf6fd080f62a83096bc7aa35b4185829c0784b",
+    contract: {
+      schemaVersion: 1,
+      role: "standards-review",
+      runtimeName: "sayhi-v1-standards-review",
+      contractVersion: 1,
+      tools: [],
+      network: "none",
+      skills: [],
+      spawns: [],
+      repositoryAccess: "read-only",
+      outputSchema: "schemas/agent/standards-review-output.json",
+      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+      overridePolicy: "prompt-body-only",
+    } as const satisfies PhaseAgentContract,
+  },
+  {
+    role: "spec-review",
+    identity:
+      "sha256:6a82f7bca42776d7b92abcf2facf4a88a6b1b2bb212bafc3dafd2632ce62b97f",
+    contract: {
+      schemaVersion: 1,
+      role: "spec-review",
+      runtimeName: "sayhi-v1-spec-review",
+      contractVersion: 1,
+      tools: [],
+      network: "none",
+      skills: [],
+      spawns: [],
+      repositoryAccess: "read-only",
+      outputSchema: "schemas/agent/spec-review-output.json",
+      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+      overridePolicy: "prompt-body-only",
+    } as const satisfies PhaseAgentContract,
+  },
+] as const;
 
 
 
@@ -1764,6 +1846,39 @@ async function advanceFoundationTask(
       state = await approveFoundationPlan(repository, state, occurredAt);
       continue;
     }
+    if (
+      state.projection.route === "build" &&
+      state.projection.lifecycle === "active" &&
+      state.projection.phase === "implement" &&
+      lifecycle === "active" &&
+      phase === "review"
+    ) {
+      state = await recordFoundationPhaseResult(
+        repository,
+        state,
+        "implement",
+        FOUNDATION_IMPLEMENTATION_AGENT,
+        occurredAt,
+      );
+    }
+    if (
+      state.projection.route === "build" &&
+      state.projection.lifecycle === "active" &&
+      state.projection.phase === "review" &&
+      lifecycle === "active" &&
+      phase === "finish"
+    ) {
+      for (const reviewAgent of FOUNDATION_REVIEW_AGENTS) {
+        state = await recordFoundationPhaseResult(
+          repository,
+          state,
+          "review",
+          { ...reviewAgent, skills: [] },
+          occurredAt,
+        );
+      }
+    }
+
     await writeTaskRequest(
       repository,
       "task-transition.json",
@@ -1874,6 +1989,130 @@ async function approveFoundationPlan(
   const approvedProjection = requireRecord(approvedResult.projection, "Plan approval Projection");
   assert.equal(requireString(approvedProjection, "phase"), "implement");
   return showTaskState(repository);
+}
+
+async function recordFoundationPhaseResult(
+  repository: string,
+  state: WorkflowState,
+  phase: "implement" | "review",
+  agent: Readonly<{
+    role: "implementation" | "standards-review" | "spec-review";
+    identity: ContractIdentity;
+    contract: PhaseAgentContract;
+    skills: readonly SkillMaterial[];
+  }>,
+  occurredAt: string,
+): Promise<WorkflowState> {
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const material = foundationBuildPlanMaterial(state);
+  const manifest = await coreContract.inspectDurableContextManifest({
+    fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    phase: "implement",
+  });
+  if (!manifest.ok || manifest.state !== "valid") {
+    assert.fail("Foundation Implement Context Manifest was not valid");
+  }
+  const currentContext = await Promise.all(
+    manifest.entries.map(async (entry) => ({
+      source: entry.source,
+      content: await fileSystem.readRepositoryFile(entry.source.value),
+    })),
+  );
+  const suffix = `${state.projection.version}-${agent.role}`;
+  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: material.planIdentity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: `DISPATCH-${FOUNDATION_TASK.eventNamespace}-${suffix}`,
+        taskId: FOUNDATION_TASK.taskId,
+        expectedTaskVersion: state.projection.version,
+        phase,
+        agentRole: agent.role,
+        baseFingerprint: `sha256:${"d".repeat(64)}`,
+        requestedAt: occurredAt,
+        contextManifestIdentity: material.contextManifestIdentity,
+        agentContractIdentity: agent.identity,
+      },
+      manifest: manifest.entries,
+      currentContext,
+      agentContract: agent.contract,
+      skills: agent.skills,
+    },
+    event: taskLifecycleEventMetadata(
+      FOUNDATION_TASK,
+      `PHASE-${suffix}-DISPATCHED`,
+      occurredAt,
+    ),
+  });
+  if (!dispatched.ok) {
+    assert.fail(dispatched.diagnostics[0]?.message ?? "Foundation Phase dispatch failed");
+  }
+  const result = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: FOUNDATION_TASK.taskId,
+    result: {
+      schemaVersion: 1,
+      dispatchId: dispatched.binding.dispatchId,
+      taskId: FOUNDATION_TASK.taskId,
+      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
+      phase,
+      agentRole: agent.role,
+      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
+      agentContractIdentity: dispatched.binding.agentContractIdentity,
+      baseFingerprint: dispatched.binding.baseFingerprint,
+      outcome: "succeeded",
+      artifacts: [`artifacts/${agent.role}.md`],
+      evidence: [`evidence/${agent.role}.json`],
+      findings: [],
+      observedFinalFingerprint: dispatched.binding.baseFingerprint,
+    },
+    event: taskLifecycleEventMetadata(
+      FOUNDATION_TASK,
+      `PHASE-${suffix}-RESULT`,
+      occurredAt,
+    ),
+  });
+  if (!result.ok) {
+    assert.fail(result.diagnostics[0]?.message ?? "Foundation Phase result failed");
+  }
+  return result.state;
+}
+
+function foundationBuildPlanMaterial(
+  state: WorkflowState,
+): Readonly<{
+  planIdentity: ContractIdentity;
+  contextManifestIdentity: ContractIdentity;
+}> {
+  const approval = [...state.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "workflow_transitioned" &&
+        event.from.phase === "plan" &&
+        event.to.phase === "implement",
+    );
+  assert.ok(approval, "Foundation Build Plan approval Event is missing");
+  const planReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) => evidence.reference.startsWith("plans/"));
+  const contextReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) =>
+      evidence.reference.startsWith("context/implement.jsonl#"),
+    );
+  assert.ok(planReference, "Foundation Build Plan reference is missing");
+  assert.ok(contextReference, "Foundation Context reference is missing");
+  return {
+    planIdentity: `sha256:${planReference.reference.slice("plans/".length, -".json".length)}` as ContractIdentity,
+    contextManifestIdentity: contextReference.reference.slice(
+      "context/implement.jsonl#".length,
+    ) as ContractIdentity,
+  };
 }
 
 async function executeCli(...args: readonly string[]) {
