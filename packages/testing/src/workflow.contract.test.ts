@@ -1097,6 +1097,136 @@ test("Core rejects malformed, unbound, and duplicate Phase results", () => {
   }
 });
 
+test("Core rejects results from superseded Phase dispatches", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `superseded-result-${phase}`);
+  }
+  const approval = state.events.find(
+    (event) =>
+      event.type === "workflow_transitioned" &&
+      event.from.phase === "plan" &&
+      event.to.phase === "implement",
+  );
+  assert.ok(approval, "Build Plan approval Event is missing");
+  const planReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) => evidence.reference.startsWith("plans/"));
+  assert.ok(planReference, "Build Plan reference is missing");
+  const planIdentity = `sha256:${planReference.reference.slice("plans/".length, -".json".length)}` as ContractIdentity;
+  const firstBinding = {
+    schemaVersion: 1 as const,
+    dispatchId: "DISPATCH-SUPERSEDED-FIRST",
+    taskId: state.projection.id,
+    expectedTaskVersion: state.projection.version,
+    phase: "review" as const,
+    agentRole: "standards-review" as const,
+    baseFingerprint: `sha256:${"d".repeat(64)}`,
+    requestedAt: "2026-07-17T10:12:00Z",
+    contextManifestIdentity: `sha256:${"a".repeat(64)}`,
+    agentContractIdentity: `sha256:${"b".repeat(64)}`,
+    skillIdentities: [],
+  };
+  const first = coreContract.recordPhaseExecutionDispatch(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    planIdentity,
+    binding: firstBinding,
+    event: eventMetadata("superseded-first-dispatch"),
+  });
+  assert.equal(first.ok, true);
+  if (!first.ok) {
+    return;
+  }
+  const second = coreContract.recordPhaseExecutionDispatch(first.state, {
+    contractVersion: 1,
+    taskId: first.state.projection.id,
+    expectedVersion: first.state.projection.version,
+    planIdentity,
+    binding: {
+      ...firstBinding,
+      dispatchId: "DISPATCH-SUPERSEDED-SECOND",
+      expectedTaskVersion: first.state.projection.version,
+      requestedAt: "2026-07-17T10:12:15Z",
+    },
+    event: eventMetadata("superseded-second-dispatch"),
+  });
+  assert.equal(second.ok, true);
+  if (!second.ok) {
+    return;
+  }
+  const staleResult = {
+    schemaVersion: 1,
+    dispatchId: firstBinding.dispatchId,
+    taskId: firstBinding.taskId,
+    expectedTaskVersion: firstBinding.expectedTaskVersion,
+    phase: firstBinding.phase,
+    agentRole: firstBinding.agentRole,
+    contextManifestIdentity: firstBinding.contextManifestIdentity,
+    agentContractIdentity: firstBinding.agentContractIdentity,
+    baseFingerprint: firstBinding.baseFingerprint,
+    outcome: "succeeded",
+    artifacts: [],
+    evidence: [],
+    findings: [],
+    reviewFindings: [],
+    observedFinalFingerprint: firstBinding.baseFingerprint,
+  };
+  const stale = coreContract.recordPhaseExecutionResult(second.state, {
+    contractVersion: 1,
+    taskId: second.state.projection.id,
+    expectedVersion: second.state.projection.version,
+    result: staleResult,
+    event: eventMetadata("superseded-first-result"),
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  const replayPayload: Record<string, unknown> = {
+    schemaVersion: 1,
+    eventId: "EVENT-REPLAY-SUPERSEDED-RESULT",
+    taskId: second.state.projection.id,
+    route: "build",
+    sequence: second.state.projection.version + 1,
+    previousChainDigest: second.state.events.at(-1)!.chainDigest,
+    type: "phase_execution_result_accepted",
+    from: {
+      lifecycle: second.state.projection.lifecycle,
+      phase: second.state.projection.phase,
+      step: second.state.projection.step,
+    },
+    to: {
+      lifecycle: second.state.projection.lifecycle,
+      phase: second.state.projection.phase,
+      step: second.state.projection.step,
+    },
+    actor: { kind: "agent", id: "reviewer", sessionRef: "replay" },
+    outcome: "accepted",
+    gates: [],
+    blockers: second.state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Record a superseded result.",
+    idempotencyKey: "REPLAY-SUPERSEDED-RESULT",
+    occurredAt: "2026-07-17T10:12:30Z",
+    result: staleResult,
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...second.state.events,
+    { ...replayPayload, chainDigest: digestReplayEvent(replayPayload) },
+  ]);
+  assert.equal(replayed.ok, false);
+  if (!replayed.ok) {
+    assert.equal(replayed.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+});
+
 test("replay requires a current Implementation result before Build Review", () => {
   let state = startTask("build");
   for (const [lifecycle, phase] of [

@@ -2509,17 +2509,40 @@ function validatePhaseExecutionResultBinding(
       "Record the result only while its dispatched Phase remains active.",
     );
   }
-  const binding = [...events]
-    .reverse()
-    .filter((event) => event.type === "phase_execution_dispatched")
-    .map((event) => parsePhaseExecutionBinding(event.binding))
-    .find((candidate) => candidate?.dispatchId === result.dispatchId);
+  const bindings = [] as ReturnType<typeof parsePhaseExecutionBinding>[];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.phase === projection.phase
+    ) {
+      break;
+    }
+    if (event.type !== "phase_execution_dispatched") {
+      continue;
+    }
+    const binding = parsePhaseExecutionBinding(event.binding);
+    if (binding !== null && binding.phase === projection.phase) {
+      bindings.push(binding);
+    }
+  }
+  const binding = bindings.find(
+    (candidate) => candidate?.dispatchId === result.dispatchId,
+  );
   if (binding === undefined || binding === null) {
     return diagnostic(
       "workflow.transition.illegal",
       "$.result.dispatchId",
       "Phase execution result requires an accepted dispatch binding.",
       "Dispatch the Phase Agent before recording its result.",
+    );
+  }
+  if (bindings[0]?.dispatchId !== result.dispatchId) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "Phase execution result must use the latest active Phase dispatch.",
+      "Record a result only for the most recently accepted dispatch.",
     );
   }
   if (!phaseExecutionResultMatchesBinding(result, binding)) {
