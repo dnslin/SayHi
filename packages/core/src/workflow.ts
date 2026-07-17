@@ -2309,6 +2309,28 @@ function validatePhaseExecutionDispatchRequest(
       "Record and approve the current Build Plan before dispatching the Phase Agent.",
     );
   }
+  if (
+    state.projection.route === "build" &&
+    state.projection.phase === "review"
+  ) {
+    const implementation = currentBuildImplementationResult(state.events);
+    if (implementation === undefined) {
+      return diagnostic(
+        "workflow.transition.illegal",
+        "$.binding.baseFingerprint",
+        "Build Review dispatch requires the current successful Implementation result.",
+        "Record the current Implementation result before dispatching either Review Agent.",
+      );
+    }
+    if (request.binding.baseFingerprint !== implementation.observedFinalFingerprint) {
+      return diagnostic(
+        "workflow.transition.illegal",
+        "$.binding.baseFingerprint",
+        "Build Review dispatch must use the Implementation final fingerprint.",
+        "Dispatch both Review Agents from the exact frozen Implementation result.",
+      );
+    }
+  }
   return null;
 }
 
@@ -2339,6 +2361,16 @@ function validatePhaseExecutionResultRequest(
     return invalidRequest(
       "$.result",
       "Phase execution result requires a readable immutable payload.",
+    );
+  }
+  if (
+    state.projection.route === "build" &&
+    state.projection.phase === "review" &&
+    !Array.isArray(request.result.reviewFindings)
+  ) {
+    return invalidRequest(
+      "$.result.reviewFindings",
+      "New Build Review results require structured reviewFindings.",
     );
   }
   return null;
@@ -3221,23 +3253,14 @@ function validateBuildImplementationResultTransition(
   ) {
     return null;
   }
-  const succeeded = events.some(
-    (event) =>
-      event.type === "phase_execution_result_accepted" &&
-      event.from.phase === "implement" &&
-      isUnknownRecord(event.result) &&
-      event.result.phase === "implement" &&
-      event.result.agentRole === "implementation" &&
-      event.result.outcome === "succeeded",
-  );
-  return succeeded
-    ? null
-    : diagnostic(
+  return currentBuildImplementationResult(events) === undefined
+    ? diagnostic(
         "workflow.transition.illegal",
         "$.to",
-        "Build Review requires an accepted successful Implementation result.",
-        "Record the bound Implementation Agent result before entering Review.",
-      );
+        "Build Review requires an accepted successful Implementation result for the current cycle.",
+        "Record a new bound Implementation Agent result before entering Review.",
+      )
+    : null;
 }
 function validateBuildReviewResultTransition(
   projection: TaskProjection,
@@ -3253,6 +3276,15 @@ function validateBuildReviewResultTransition(
   ) {
     return null;
   }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      "Build Review requires the current successful Implementation result.",
+      "Return to Implement and record a new bound Implementation result.",
+    );
+  }
   const results = currentBuildReviewResults(events);
   const requiredRoles = ["standards-review", "spec-review"] as const;
   const missingRoles = requiredRoles.filter((role) => !results.has(role));
@@ -3265,6 +3297,19 @@ function validateBuildReviewResultTransition(
     );
   }
   const reviewResults = requiredRoles.map((role) => results.get(role)!);
+  if (
+    reviewResults.some(
+      (result) =>
+        result.baseFingerprint !== implementation.observedFinalFingerprint,
+    )
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.to",
+      "Build Review results must assess the same frozen Implementation fingerprint.",
+      "Rerun both independent Review Agents from the exact Implementation final fingerprint.",
+    );
+  }
   const hasBlockingFinding = reviewResults.some(hasBlockingReviewFinding);
   if (to.phase === "finish") {
     return hasBlockingFinding ||
@@ -3285,6 +3330,33 @@ function validateBuildReviewResultTransition(
         "Build Repair requires a blocking Review finding.",
         "Return to Implement only to address recorded blocking Review findings.",
       );
+}
+
+function currentBuildImplementationResult(
+  events: readonly WorkflowEvent[],
+): Readonly<Record<string, unknown>> | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.to.lifecycle === "active" &&
+      event.to.phase === "implement"
+    ) {
+      break;
+    }
+    if (
+      event.type === "phase_execution_result_accepted" &&
+      event.from.phase === "implement" &&
+      isUnknownRecord(event.result) &&
+      event.result.phase === "implement" &&
+      event.result.agentRole === "implementation" &&
+      event.result.outcome === "succeeded" &&
+      isContractIdentity(event.result.observedFinalFingerprint)
+    ) {
+      return event.result;
+    }
+  }
+  return undefined;
 }
 
 function currentBuildReviewResults(
@@ -3309,7 +3381,8 @@ function currentBuildReviewResults(
       !isUnknownRecord(event.result) ||
       event.result.phase !== "review" ||
       (event.result.agentRole !== "standards-review" &&
-        event.result.agentRole !== "spec-review")
+        event.result.agentRole !== "spec-review") ||
+      !Array.isArray(event.result.reviewFindings)
     ) {
       continue;
     }
@@ -3322,8 +3395,8 @@ function currentBuildReviewResults(
 
 function hasBlockingReviewFinding(result: Record<string, unknown>): boolean {
   return (
-    Array.isArray(result.findings) &&
-    result.findings.some(
+    Array.isArray(result.reviewFindings) &&
+    result.reviewFindings.some(
       (finding) =>
         isUnknownRecord(finding) && finding.severity === "blocking",
     )

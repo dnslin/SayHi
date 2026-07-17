@@ -183,7 +183,8 @@ export type AgentResultRecord = Readonly<Record<string, unknown>> & {
   readonly outcome: AgentResultOutcome;
   readonly artifacts: readonly string[];
   readonly evidence: readonly string[];
-  readonly findings: readonly ReviewFinding[];
+  readonly findings: readonly string[];
+  readonly reviewFindings?: readonly ReviewFinding[];
   readonly observedFinalFingerprint: ContractIdentity;
 };
 
@@ -993,23 +994,32 @@ function validateAgentResult(
 function validateAgentResultFindings(
   record: UnknownRecord,
 ): ContractRecordValidationFailure | null {
-  if (!Array.isArray(record.findings)) {
+  if (!isUniqueStringArray(record.findings, false)) {
     return invalidMilestoneRecord(
       "record_contract.agent_result.invalid",
       "Agent result",
       "$.record.findings",
-      "findings must be an array.",
+      "findings must contain unique non-empty diagnostic strings.",
+    );
+  }
+  if (record.reviewFindings === undefined) {
+    return null;
+  }
+  if (!Array.isArray(record.reviewFindings)) {
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.reviewFindings",
+      "reviewFindings must be an array.",
     );
   }
   if (record.phase !== "review") {
-    return record.findings.length === 0
-      ? null
-      : invalidMilestoneRecord(
-          "record_contract.agent_result.invalid",
-          "Agent result",
-          "$.record.findings",
-          "Only Review Agent results may include findings.",
-        );
+    return invalidMilestoneRecord(
+      "record_contract.agent_result.invalid",
+      "Agent result",
+      "$.record.reviewFindings",
+      "Only Review Agent results may include structured reviewFindings.",
+    );
   }
   if (
     record.agentRole !== "standards-review" &&
@@ -1019,13 +1029,13 @@ function validateAgentResultFindings(
       "record_contract.agent_result.invalid",
       "Agent result",
       "$.record.agentRole",
-      "Review findings require a Standards Review or Spec Review Agent result.",
+      "Structured reviewFindings require a Standards Review or Spec Review Agent result.",
     );
   }
   const ids = new Set<string>();
   let blockingFindings = 0;
-  for (let index = 0; index < record.findings.length; index += 1) {
-    const finding = record.findings[index];
+  for (let index = 0; index < record.reviewFindings.length; index += 1) {
+    const finding = record.reviewFindings[index];
     if (
       !isRecord(finding) ||
       !isIdentifier(finding.id) ||
@@ -1040,7 +1050,7 @@ function validateAgentResultFindings(
       return invalidMilestoneRecord(
         "record_contract.agent_result.invalid",
         "Agent result",
-        `$.record.findings[${index}]`,
+        `$.record.reviewFindings[${index}]`,
         "Each Review finding needs unique id, severity, subject, reference, message, and remediation.",
       );
     }
@@ -1061,7 +1071,7 @@ function validateAgentResultFindings(
     return invalidMilestoneRecord(
       "record_contract.agent_result.invalid",
       "Agent result",
-      "$.record.findings",
+      "$.record.reviewFindings",
       "A failed or blocked Review result requires a blocking finding.",
     );
   }

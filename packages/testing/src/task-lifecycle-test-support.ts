@@ -61,7 +61,7 @@ const IMPLEMENTATION_SKILLS = [
     content: "tdd skill\n",
   },
 ] as const;
-const REVIEW_AGENTS = [
+export const REVIEW_AGENTS = [
   {
     role: "standards-review",
     contractIdentity:
@@ -106,6 +106,7 @@ const REVIEW_AGENTS = [
 export function taskLifecycleStartRequest(
   fixture: TaskLifecycleFixture,
   occurredAt: string,
+  maxRepairAttempts = 2,
 ): StartWorkflowTaskRequest {
   return {
     contractVersion: 1,
@@ -131,7 +132,7 @@ export function taskLifecycleStartRequest(
       policies: {
         commit: "never",
         push: "never",
-        maxRepairAttempts: 2,
+        maxRepairAttempts,
       },
     },
     routeGate: {
@@ -434,6 +435,7 @@ export async function createCompletedDurableTask(
         artifacts: [`artifacts/${reviewAgent.role}.md`],
         evidence: [`evidence/${reviewAgent.role}.json`],
         findings: [],
+        reviewFindings: [],
         observedFinalFingerprint: dispatched.binding.baseFingerprint,
       },
       event: taskLifecycleEventMetadata(

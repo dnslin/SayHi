@@ -1022,6 +1022,52 @@ test("Build repair transitions stop at the configured attempt limit", () => {
   assert.equal(state.projection.lifecycle, "blocked");
 });
 
+test("Build Review exit requires one frozen Implementation fingerprint", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `fingerprint-${phase}`);
+  }
+  state = recordWorkflowAgentResult(
+    state,
+    "review",
+    "standards-review",
+    "succeeded",
+    [],
+    "fingerprint-standards",
+  );
+  state = recordWorkflowAgentResult(
+    state,
+    "review",
+    "spec-review",
+    "succeeded",
+    [],
+    "fingerprint-spec",
+    `sha256:${"e".repeat(64)}`,
+  );
+  const rejected = coreContract.transitionWorkflow(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    to: { lifecycle: "active", phase: "finish", step: "ready" },
+    gates: [
+      {
+        gate: "review",
+        evidence: [{ kind: "review", reference: "evidence/review.json" }],
+      },
+    ],
+    event: eventMetadata("fingerprint-finish"),
+  });
+  assert.equal(rejected.ok, false);
+  if (!rejected.ok) {
+    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+
 test("replay rejects transition Events with missing initiativeGraph data", () => {
   const state = advanceTask(
     startTask("build"),
@@ -1540,6 +1586,7 @@ function recordWorkflowAgentResult(
   outcome: "succeeded" | "blocked",
   findings: readonly Record<string, unknown>[],
   suffix: string,
+  baseFingerprint?: ContractIdentity,
 ): WorkflowState {
   const recorded = coreContract.recordPhaseExecutionResult(state, {
     contractVersion: 1,
@@ -1554,12 +1601,17 @@ function recordWorkflowAgentResult(
       agentRole,
       contextManifestIdentity: `sha256:${"a".repeat(64)}`,
       agentContractIdentity: `sha256:${"b".repeat(64)}`,
-      baseFingerprint: `sha256:${"c".repeat(64)}`,
+      baseFingerprint:
+        baseFingerprint ??
+        (phase === "review"
+          ? `sha256:${"d".repeat(64)}`
+          : `sha256:${"c".repeat(64)}`),
       outcome,
       artifacts: [],
       evidence: [],
-      findings,
-      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
+      findings: [],
+      ...(phase === "review" ? { reviewFindings: findings } : {}),
+      observedFinalFingerprint: `sha256:${"d".repeat(64)}`, 
     },
     event: eventMetadata(`RESULT-${suffix}`),
   });

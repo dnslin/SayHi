@@ -732,13 +732,14 @@ test("Core preserves accepted UTC leap seconds in ordered record timestamps", ()
   assert.equal(evidenceResult.ok, true);
 });
 
-test("Core requires structured actionable Review findings", () => {
+test("Core preserves v1 diagnostic findings with structured Review findings", () => {
   const actionableReview = {
     ...AGENT_RESULT_RECORD,
     phase: "review",
     agentRole: "spec-review",
     outcome: "blocked",
-    findings: [
+    findings: ["Recovery behavior is missing."],
+    reviewFindings: [
       {
         id: "FINDING-7",
         severity: "blocking",
@@ -759,7 +760,10 @@ test("Core requires structured actionable Review findings", () => {
   const unstructured = coreContract.validateContractRecord({
     contractVersion: 1,
     kind: "agentResult",
-    record: { ...actionableReview, findings: ["Recovery behavior is missing."] },
+    record: {
+      ...actionableReview,
+      reviewFindings: ["Recovery behavior is missing."],
+    },
   });
   assert.equal(unstructured.ok, false);
   if (!unstructured.ok) {
@@ -767,6 +771,6 @@ test("Core requires structured actionable Review findings", () => {
       unstructured.diagnostics[0]?.code,
       "record_contract.agent_result.invalid",
     );
-    assert.equal(unstructured.diagnostics[0]?.path, "$.record.findings[0]");
+    assert.equal(unstructured.diagnostics[0]?.path, "$.record.reviewFindings[0]");
   }
 });

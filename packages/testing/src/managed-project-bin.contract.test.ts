@@ -23,6 +23,7 @@ import {
 } from "@dnslin/sayhi-core";
 
 import {
+  REVIEW_AGENTS,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
   taskLifecycleTransition,
@@ -55,7 +56,7 @@ const CURRENT_RUNTIME_IGNORE_CONTENT =
 
 const FOUNDATION_IMPLEMENTATION_AGENT = {
   role: "implementation",
-  identity:
+  contractIdentity:
     "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
   contract: {
     schemaVersion: 1,
@@ -90,46 +91,6 @@ const FOUNDATION_IMPLEMENTATION_AGENT = {
     },
   ] as const satisfies readonly SkillMaterial[],
 } as const;
-const FOUNDATION_REVIEW_AGENTS = [
-  {
-    role: "standards-review",
-    identity:
-      "sha256:21a8ae092397c5873d98bcb0f0cf6fd080f62a83096bc7aa35b4185829c0784b",
-    contract: {
-      schemaVersion: 1,
-      role: "standards-review",
-      runtimeName: "sayhi-v1-standards-review",
-      contractVersion: 1,
-      tools: [],
-      network: "none",
-      skills: [],
-      spawns: [],
-      repositoryAccess: "read-only",
-      outputSchema: "schemas/agent/standards-review-output.json",
-      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
-      overridePolicy: "prompt-body-only",
-    } as const satisfies PhaseAgentContract,
-  },
-  {
-    role: "spec-review",
-    identity:
-      "sha256:6a82f7bca42776d7b92abcf2facf4a88a6b1b2bb212bafc3dafd2632ce62b97f",
-    contract: {
-      schemaVersion: 1,
-      role: "spec-review",
-      runtimeName: "sayhi-v1-spec-review",
-      contractVersion: 1,
-      tools: [],
-      network: "none",
-      skills: [],
-      spawns: [],
-      repositoryAccess: "read-only",
-      outputSchema: "schemas/agent/spec-review-output.json",
-      promptBaseIdentity: `sha256:${"b".repeat(64)}`,
-      overridePolicy: "prompt-body-only",
-    } as const satisfies PhaseAgentContract,
-  },
-] as const;
 
 
 
@@ -1868,12 +1829,12 @@ async function advanceFoundationTask(
       lifecycle === "active" &&
       phase === "finish"
     ) {
-      for (const reviewAgent of FOUNDATION_REVIEW_AGENTS) {
+      for (const reviewAgent of REVIEW_AGENTS) {
         state = await recordFoundationPhaseResult(
           repository,
           state,
           "review",
-          { ...reviewAgent, skills: [] },
+          reviewAgent,
           occurredAt,
         );
       }
@@ -1997,9 +1958,9 @@ async function recordFoundationPhaseResult(
   phase: "implement" | "review",
   agent: Readonly<{
     role: "implementation" | "standards-review" | "spec-review";
-    identity: ContractIdentity;
+    contractIdentity: ContractIdentity;
     contract: PhaseAgentContract;
-    skills: readonly SkillMaterial[];
+    skills?: readonly SkillMaterial[];
   }>,
   occurredAt: string,
 ): Promise<WorkflowState> {
@@ -2035,12 +1996,12 @@ async function recordFoundationPhaseResult(
         baseFingerprint: `sha256:${"d".repeat(64)}`,
         requestedAt: occurredAt,
         contextManifestIdentity: material.contextManifestIdentity,
-        agentContractIdentity: agent.identity,
+        agentContractIdentity: agent.contractIdentity,
       },
       manifest: manifest.entries,
       currentContext,
       agentContract: agent.contract,
-      skills: agent.skills,
+      skills: agent.skills ?? [],
     },
     event: taskLifecycleEventMetadata(
       FOUNDATION_TASK,
@@ -2068,6 +2029,7 @@ async function recordFoundationPhaseResult(
       artifacts: [`artifacts/${agent.role}.md`],
       evidence: [`evidence/${agent.role}.json`],
       findings: [],
+      ...(phase === "review" ? { reviewFindings: [] } : {}),
       observedFinalFingerprint: dispatched.binding.baseFingerprint,
     },
     event: taskLifecycleEventMetadata(

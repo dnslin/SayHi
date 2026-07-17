@@ -3253,9 +3253,20 @@ async function advanceDurableTaskLocked(
   if (resealed !== null) {
     return resealed;
   }
-  const transitioned = transitionWorkflow(loaded.state, request.transition);
+  let transitioned = transitionWorkflow(loaded.state, request.transition);
   if (!transitioned.ok) {
-    return failure(transitioned.diagnostics);
+    const blocked = blockExhaustedDurableRepair(
+      loaded.state,
+      request.transition,
+      transitioned.diagnostics,
+    );
+    if (blocked === null) {
+      return failure(transitioned.diagnostics);
+    }
+    transitioned = blocked;
+    if (!transitioned.ok) {
+      return failure(transitioned.diagnostics);
+    }
   }
   if (transitioned.state.events.length === loaded.state.events.length) {
     return Object.freeze({
@@ -3313,6 +3324,50 @@ async function advanceDurableTaskLocked(
   } catch {
     return ioFailure(activePath);
   }
+}
+
+function blockExhaustedDurableRepair(
+  state: WorkflowState,
+  transition: TransitionWorkflowRequest,
+  diagnostics: readonly WorkflowDiagnostic[],
+): ReturnType<typeof transitionWorkflow> | null {
+  if (
+    !diagnostics.some(
+      (diagnostic) => diagnostic.code === "workflow.repair.exhausted",
+    ) ||
+    state.projection.route !== "build" ||
+    state.projection.lifecycle !== "active" ||
+    state.projection.phase !== "review"
+  ) {
+    return null;
+  }
+  const reviewResult = [...state.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === "phase_execution_result_accepted" &&
+        event.from.phase === "review",
+    );
+  if (reviewResult === undefined) {
+    return null;
+  }
+  return transitionWorkflow(state, {
+    ...transition,
+    to: {
+      lifecycle: "blocked",
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    gates: [
+      {
+        gate: "block",
+        evidence: [
+          { kind: "workflow", reference: `events/${reviewResult.eventId}` },
+        ],
+      },
+    ],
+    blockers: ["Configured Review repair attempts are exhausted."],
+  });
 }
 
 async function escalateDurableQuickToBuildLocked(
