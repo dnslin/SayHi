@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  coreContract,
+  type PhaseExecutionMaterials,
   advanceDurableTask,
   addDurableContextManifestEntry,
   archiveDurableTask,
@@ -1346,3 +1348,588 @@ test("a superseded Build Plan cannot be rejected", async () => {
     assert.deepEqual(recovered.state, revised.state);
   }
 });
+
+const PHASE_CONTEXT_SOURCE = "docs/phase-context.md";
+const PHASE_CONTEXT_CONTENT = "Stable implementation context.\n";
+const PHASE_AGENT_CONTRACT = {
+  schemaVersion: 1,
+  role: "implementation",
+  runtimeName: "sayhi-v1-implementation",
+  contractVersion: 1,
+  tools: ["read", "edit", "bash"],
+  network: "none",
+  skills: ["implement", "tdd"],
+  spawns: [],
+  repositoryAccess: "exclusive-write",
+  outputSchema: "schemas/agent/implementation-output.json",
+  promptBaseIdentity: `sha256:${"a".repeat(64)}`,
+  overridePolicy: "prompt-body-only",
+} as const;
+const PHASE_AGENT_CONTRACT_ID =
+  "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08";
+const PHASE_SKILLS = [
+  {
+    name: "implement",
+    identity: {
+      algorithm: "sha256-lf-v1",
+      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
+    },
+    content: "implement skill\n",
+  },
+  {
+    name: "tdd",
+    identity: {
+      algorithm: "sha256-lf-v1",
+      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
+    },
+    content: "tdd skill\n",
+  },
+] as const;
+
+test("Build resume returns an accepted Agent result without dispatching it again", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-RESULT");
+
+  const resumed = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: prepared.materials,
+  });
+  assert.equal(resumed.ok, true);
+  if (!resumed.ok) {
+    return;
+  }
+  assert.equal(resumed.status, "ready");
+  assert.equal(resumed.plan.identity, prepared.planIdentity);
+  assert.equal(resumed.binding.dispatchId, prepared.execution.dispatch.dispatchId);
+
+  const result = {
+    schemaVersion: 1,
+    dispatchId: prepared.execution.dispatch.dispatchId,
+    taskId: TASK_ID,
+    expectedTaskVersion: prepared.execution.dispatch.expectedTaskVersion,
+    phase: "implement",
+    agentRole: "implementation",
+    contextManifestIdentity: prepared.execution.dispatch.contextManifestIdentity,
+    agentContractIdentity: prepared.execution.dispatch.agentContractIdentity,
+    baseFingerprint: prepared.execution.dispatch.baseFingerprint,
+    outcome: "succeeded",
+    artifacts: ["artifacts/implementation.md"],
+    evidence: ["evidence/implementation.json"],
+    findings: [],
+    observedFinalFingerprint: prepared.execution.dispatch.baseFingerprint,
+  } as const;
+  const accepted = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: TASK_ID,
+    result,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-RESULT-ACCEPTED",
+      "2026-07-17T10:02:00Z",
+    ),
+  });
+  assert.equal(accepted.ok, true);
+  if (!accepted.ok) {
+    return;
+  }
+
+  const completed = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: {
+      ...prepared.materials,
+      currentContext: [
+        {
+          ...prepared.materials.currentContext[0]!,
+          content: "Drifted completed context.\n",
+        },
+      ],
+    }
+  });
+  assert.equal(completed.ok, true);
+  if (!completed.ok) {
+    return;
+  }
+  assert.equal(completed.status, "completed");
+  assert.deepEqual(completed.result, result);
+  assert.equal(completed.state.events.length, accepted.state.events.length);
+});
+
+test("Build resume rejects modified approved Plan evidence", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-PLAN");
+  const planPath = `${TASK_DIRECTORY}/plans/${prepared.planIdentity.slice("sha256:".length)}.json`;
+  fileSystem.files.set(planPath, "{}\n");
+
+  const resumed = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: prepared.materials,
+  });
+  assert.equal(resumed.ok, false);
+  if (!resumed.ok) {
+    assert.equal(resumed.diagnostics[0]?.code, "build_plan.invalid");
+  }
+});
+
+test("Build dispatch rejects a mismatched Plan Manifest outside Implement", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-REVIEW");
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "PHASE-REVIEW",
+      "2026-07-17T10:02:00Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+
+  const reviewAgentContract = {
+    schemaVersion: 1,
+    role: "standards-review",
+    runtimeName: "sayhi-v1-standards-review",
+    contractVersion: 1,
+    tools: [],
+    network: "none",
+    skills: [],
+    spawns: [],
+    repositoryAccess: "read-only",
+    outputSchema: "schemas/agent/standards-review-output.json",
+    promptBaseIdentity: `sha256:${"b".repeat(64)}`,
+    overridePolicy: "prompt-body-only",
+  } as const;
+  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: prepared.planIdentity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: "DISPATCH-20-REVIEW-MISMATCH",
+        taskId: TASK_ID,
+        expectedTaskVersion: reviewed.state.projection.version,
+        phase: "review",
+        agentRole: "standards-review",
+        baseFingerprint: `sha256:${"e".repeat(64)}`,
+        requestedAt: "2026-07-17T10:02:15Z",
+        contextManifestIdentity:
+          "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        agentContractIdentity:
+          "sha256:21a8ae092397c5873d98bcb0f0cf6fd080f62a83096bc7aa35b4185829c0784b",
+      },
+      manifest: [],
+      currentContext: [],
+      agentContract: reviewAgentContract,
+      skills: [],
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-REVIEW-DISPATCHED",
+      "2026-07-17T10:02:30Z",
+    ),
+  });
+  assert.deepEqual(dispatched, {
+    ok: false,
+    contractVersion: 1,
+    diagnostics: [
+      {
+        code: "build_plan.invalid",
+        path: "$.execution.dispatch.contextManifestIdentity",
+        message: "Phase Context Manifest does not match the approved Build Plan.",
+        remediation:
+          "Restore the frozen Plan Manifest or record and approve a new Build Plan before dispatch.",
+      },
+    ],
+  });
+});
+
+test("Build dispatch rejects an Agent for a different active Phase", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-CROSS-PHASE");
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      recovered.state,
+      "active",
+      "review",
+      "PHASE-CROSS-PHASE-REVIEW",
+      "2026-07-17T10:02:00Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+
+  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: prepared.planIdentity,
+    execution: {
+      ...prepared.execution,
+      dispatch: {
+        ...prepared.execution.dispatch,
+        dispatchId: "DISPATCH-20-IMPLEMENT-DURING-REVIEW",
+        expectedTaskVersion: reviewed.state.projection.version,
+        requestedAt: "2026-07-17T10:02:15Z",
+      },
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-CROSS-PHASE-DISPATCHED",
+      "2026-07-17T10:02:30Z",
+    ),
+  });
+  assert.deepEqual(dispatched, {
+    ok: false,
+    contractVersion: 1,
+    diagnostics: [
+      {
+        code: "phase_execution.phase.invalid",
+        path: "$.execution.dispatch.phase",
+        message: "Phase execution dispatch does not match the active Workflow Phase.",
+        remediation: "Dispatch the review Phase Agent for the current Build position.",
+      },
+    ],
+  });
+});
+
+test("Build requires a fresh dispatch after returning to an earlier Phase", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-REPAIR");
+  const result = {
+    schemaVersion: 1,
+    dispatchId: prepared.execution.dispatch.dispatchId,
+    taskId: TASK_ID,
+    expectedTaskVersion: prepared.execution.dispatch.expectedTaskVersion,
+    phase: "implement",
+    agentRole: "implementation",
+    contextManifestIdentity: prepared.execution.dispatch.contextManifestIdentity,
+    agentContractIdentity: prepared.execution.dispatch.agentContractIdentity,
+    baseFingerprint: prepared.execution.dispatch.baseFingerprint,
+    outcome: "succeeded",
+    artifacts: ["artifacts/implementation.md"],
+    evidence: ["evidence/implementation.json"],
+    findings: [],
+    observedFinalFingerprint: prepared.execution.dispatch.baseFingerprint,
+  } as const;
+  const accepted = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: TASK_ID,
+    result,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-REPAIR-RESULT",
+      "2026-07-17T10:02:00Z",
+    ),
+  });
+  assert.equal(accepted.ok, true);
+  if (!accepted.ok) {
+    return;
+  }
+  const reviewed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      accepted.state,
+      "active",
+      "review",
+      "PHASE-REPAIR-REVIEW",
+      "2026-07-17T10:02:15Z",
+    ),
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const repaired = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      reviewed.state,
+      "active",
+      "implement",
+      "PHASE-REPAIR-IMPLEMENT",
+      "2026-07-17T10:02:30Z",
+    ),
+  });
+  assert.equal(repaired.ok, true);
+  if (!repaired.ok) {
+    return;
+  }
+
+  const resumed = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: prepared.materials,
+  });
+  assert.equal(resumed.ok, false);
+  if (!resumed.ok) {
+    assert.equal(resumed.diagnostics[0]?.code, "phase_execution.missing");
+  }
+
+  const stale = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: TASK_ID,
+    result,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-REPAIR-STALE-RESULT",
+      "2026-07-17T10:02:45Z",
+    ),
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.diagnostics[0]?.code, "phase_execution.result.invalid");
+  }
+
+  const fresh = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: prepared.planIdentity,
+    execution: {
+      ...prepared.execution,
+      dispatch: {
+        ...prepared.execution.dispatch,
+        expectedTaskVersion: repaired.state.projection.version,
+        requestedAt: "2026-07-17T10:03:00Z",
+      },
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-REPAIR-FRESH-DISPATCH",
+      "2026-07-17T10:03:15Z",
+    ),
+  });
+  assert.equal(fresh.ok, true);
+  if (!fresh.ok) {
+    return;
+  }
+  const restarted = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: prepared.materials,
+  });
+  assert.equal(restarted.ok, true);
+  if (restarted.ok) {
+    assert.equal(restarted.status, "ready");
+    assert.equal(restarted.binding.dispatchId, prepared.execution.dispatch.dispatchId);
+  }
+});
+
+test("Build resume blocks Context, Capability, and Skill identity drift", async () => {
+  const cases = [
+    {
+      name: "Context Manifest content drift",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        currentContext: [{ ...materials.currentContext[0]!, content: "Drifted context.\n" }],
+      }),
+      code: "execution.context_stale",
+    },
+    {
+      name: "Capability expansion",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        agentContract: {
+          ...materials.agentContract,
+          tools: [...materials.agentContract.tools, "write"],
+        },
+      }),
+      code: "execution.agent_invalid",
+    },
+    {
+      name: "Skill replacement",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        skills: materials.skills.map((skill, index) =>
+          index === 0 ? { ...skill, content: "replaced implement skill\n" } : skill,
+        ),
+      }),
+      code: "execution.skill_invalid",
+    },
+  ] as const;
+
+  for (const driftCase of cases) {
+    const fileSystem = new MemoryTaskLifecycleFileSystem();
+    const prepared = await dispatchApprovedBuildPhase(
+      fileSystem,
+      `DISPATCH-20-${driftCase.name.replaceAll(" ", "-")}`,
+    );
+    const resumed = await coreContract.resumeDurablePhaseExecution({
+      fileSystem,
+      taskId: TASK_ID,
+      materials: driftCase.mutate(prepared.materials),
+    });
+    assert.equal(resumed.ok, false, driftCase.name);
+    if (!resumed.ok) {
+      assert.equal(resumed.diagnostics[0]?.code, driftCase.code);
+    }
+  }
+});
+
+async function dispatchApprovedBuildPhase(
+  fileSystem: MemoryTaskLifecycleFileSystem,
+  dispatchId: string,
+) {
+  const created = await createDurableTask({ fileSystem, start: startRequest() });
+  if (!created.ok) {
+    assert.fail(created.diagnostics[0]?.message ?? "Task creation failed");
+  }
+  const explored = await advanceDurableTask({
+    fileSystem,
+    transition: exploreTransition(created.state.projection.version),
+  });
+  if (!explored.ok) {
+    assert.fail(explored.diagnostics[0]?.message ?? "Explore transition failed");
+  }
+  const planned = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      TASK_FIXTURE,
+      explored.state,
+      "active",
+      "plan",
+      "PHASE-PLAN",
+      "2026-07-17T10:00:00Z",
+    ),
+  });
+  if (!planned.ok) {
+    assert.fail(planned.diagnostics[0]?.message ?? "Plan transition failed");
+  }
+  fileSystem.files.set(PHASE_CONTEXT_SOURCE, PHASE_CONTEXT_CONTENT);
+  const added = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: planned.state.projection.version,
+    phase: "implement",
+    source: PHASE_CONTEXT_SOURCE,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-CONTEXT-ADDED",
+      "2026-07-17T10:00:15Z",
+    ),
+  });
+  if (!added.ok) {
+    assert.fail(added.diagnostics[0]?.message ?? "Context entry failed");
+  }
+  const frozen = await freezeDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: added.state.projection.version,
+    phase: "implement",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-CONTEXT-FROZEN",
+      "2026-07-17T10:00:30Z",
+    ),
+  });
+  if (!frozen.ok) {
+    assert.fail(frozen.diagnostics[0]?.message ?? "Context freeze failed");
+  }
+  const recorded = await recordDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: frozen.state.projection.version,
+    content: "# Phase execution plan\n\nPersist the execution identity.\n",
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-PLAN-RECORDED",
+      "2026-07-17T10:00:45Z",
+    ),
+  });
+  if (!recorded.ok) {
+    assert.fail(recorded.diagnostics[0]?.message ?? "Build Plan record failed");
+  }
+  const approved = await decideDurableBuildPlan({
+    fileSystem,
+    taskId: TASK_ID,
+    expectedVersion: recorded.state.projection.version,
+    decision: "approved",
+    planIdentity: recorded.plan.identity,
+    contextManifestIdentity: recorded.plan.contextManifestIdentity,
+    event: {
+      ...taskLifecycleEventMetadata(
+        TASK_FIXTURE,
+        "PHASE-PLAN-APPROVED",
+        "2026-07-17T10:01:00Z",
+      ),
+      actor: { kind: "user", id: "reviewer-20", sessionRef: "approval-20" },
+    },
+  });
+  if (!approved.ok || approved.decision !== "approved") {
+    assert.fail("Build Plan approval failed");
+  }
+  const manifest = await coreContract.inspectDurableContextManifest({
+    fileSystem,
+    taskId: TASK_ID,
+    phase: "implement",
+  });
+  if (!manifest.ok || manifest.state !== "valid") {
+    assert.fail("Implement Context Manifest was not valid");
+  }
+  const execution = {
+    contractVersion: 1,
+    dispatch: {
+      schemaVersion: 1,
+      dispatchId,
+      taskId: TASK_ID,
+      expectedTaskVersion: approved.state.projection.version,
+      phase: "implement",
+      agentRole: "implementation",
+      baseFingerprint: `sha256:${"d".repeat(64)}`,
+      requestedAt: "2026-07-17T10:01:15Z",
+      contextManifestIdentity: recorded.plan.contextManifestIdentity,
+      agentContractIdentity: PHASE_AGENT_CONTRACT_ID,
+    },
+    manifest: manifest.entries,
+    currentContext: [
+      {
+        source: { type: "project-path", value: PHASE_CONTEXT_SOURCE },
+        content: PHASE_CONTEXT_CONTENT,
+      },
+    ],
+    agentContract: PHASE_AGENT_CONTRACT,
+    skills: PHASE_SKILLS,
+  } as const;
+  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: recorded.plan.identity,
+    execution,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-DISPATCHED",
+      "2026-07-17T10:01:30Z",
+    ),
+  });
+  if (!dispatched.ok) {
+    assert.fail(dispatched.diagnostics[0]?.message ?? "Phase dispatch failed");
+  }
+  return {
+    planIdentity: recorded.plan.identity,
+    execution,
+    materials: {
+      manifest: execution.manifest,
+      currentContext: execution.currentContext,
+      agentContract: execution.agentContract,
+      skills: execution.skills,
+    },
+  };
+}

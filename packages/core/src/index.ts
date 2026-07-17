@@ -50,6 +50,9 @@ import {
   decideDurableBuildPlan,
   recordDurableBuildPlan,
   inspectDurableInitiativeGraph,
+  dispatchDurablePhaseExecution,
+  resumeDurablePhaseExecution,
+  recordDurablePhaseExecutionResult,
 } from "./task-lifecycle.js";
 
 export {
@@ -328,6 +331,9 @@ export {
   withDurableTaskWriter,
   decideDurableBuildPlan,
   recordDurableBuildPlan,
+  dispatchDurablePhaseExecution,
+  resumeDurablePhaseExecution,
+  recordDurablePhaseExecutionResult,
 } from "./task-lifecycle.js";
 export type {
   ArchiveDurableTaskRequest,
@@ -389,6 +395,12 @@ export type {
   DecideDurableBuildPlanResult,
   RecordDurableBuildPlanRequest,
   RecordDurableBuildPlanResult,
+  DispatchDurablePhaseExecutionRequest,
+  DispatchDurablePhaseExecutionResult,
+  ResumeDurablePhaseExecutionRequest,
+  ResumeDurablePhaseExecutionResult,
+  RecordDurablePhaseExecutionResultRequest,
+  RecordDurablePhaseExecutionResultResult,
 } from "./task-lifecycle.js";
 
 export interface BootstrapContract {
@@ -440,6 +452,9 @@ export interface CoreContract {
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
   readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
   readonly recordDurableBuildPlan: typeof recordDurableBuildPlan;
+  readonly dispatchDurablePhaseExecution: typeof dispatchDurablePhaseExecution;
+  readonly resumeDurablePhaseExecution: typeof resumeDurablePhaseExecution;
+  readonly recordDurablePhaseExecutionResult: typeof recordDurablePhaseExecutionResult;
 }
 
 const bootstrapContract: BootstrapContract = Object.freeze({
@@ -491,4 +506,7 @@ export const coreContract: CoreContract = Object.freeze({
   inspectDurableInitiativeGraph,
   decideDurableBuildPlan,
   recordDurableBuildPlan,
+  dispatchDurablePhaseExecution,
+  resumeDurablePhaseExecution,
+  recordDurablePhaseExecutionResult,
 });
