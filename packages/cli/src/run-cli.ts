@@ -235,7 +235,7 @@ interface ParsedTaskArguments {
   readonly adoptedPaths?: readonly string[];
 }
 type TaskArgumentResult = ParsedTaskArguments | InvalidCliArguments;
-type GraphSubcommand = "revise" | "show";
+type GraphSubcommand = "revise" | "show" | "ready";
 type GraphMutationMode = "plan" | "apply";
 interface ParsedGraphArguments {
   readonly ok: true;
@@ -339,7 +339,7 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           "graph",
           2,
           graph.message,
-        "Run sayhi graph show <initiative-id> or graph revise <initiative-id> --from <request.json> --plan|--apply.",
+        "Run sayhi graph show <initiative-id>, graph ready <initiative-id>, or graph revise <initiative-id> --from <request.json> --plan|--apply.",
           args.includes("--json"),
         );
   }
@@ -2161,6 +2161,23 @@ async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> 
         )
       : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
   }
+  if (parsed.subcommand === "ready") {
+    const result = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem,
+      initiativeTaskId: parsed.initiativeTaskId,
+    });
+    return result.ok
+      ? cliSuccess(
+          operation,
+          Object.freeze({
+            graph: result.graph,
+            nodes: result.nodes,
+            frontier: result.frontier,
+          }),
+          parsed.json,
+        )
+      : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
+  }
   const request = await readTaskJsonRequest(
     fileSystem,
     parsed.source!,
@@ -2695,13 +2712,13 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
     return { ok: false, message: "Specify exactly one graph command." };
   }
   const [subcommand, initiativeTaskId, ...tail] = values;
-  if (subcommand === "show") {
+  if (subcommand === "show" || subcommand === "ready") {
     return initiativeTaskId !== undefined &&
       tail.length === 0 &&
       source === undefined &&
       mode === undefined
       ? { ok: true, command: "graph", subcommand, cwd, json, initiativeTaskId }
-      : { ok: false, message: "graph show requires exactly one Initiative id." };
+      : { ok: false, message: `graph ${subcommand} requires exactly one Initiative id.` };
   }
   if (subcommand === "revise") {
     return initiativeTaskId !== undefined &&
