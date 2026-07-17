@@ -1068,6 +1068,165 @@ test("Build Review exit requires one frozen Implementation fingerprint", () => {
   }
 });
 
+test("replay requires a current Implementation result before Build Review", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `replay-implementation-${phase}`);
+  }
+  const payload: Record<string, unknown> = {
+    schemaVersion: 1,
+    eventId: "EVENT-REPLAY-IMPLEMENTATION-REQUIRED",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    type: "workflow_transitioned",
+    from: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    to: { lifecycle: "active", phase: "review", step: "ready" },
+    actor: { kind: "agent", id: "implementer", sessionRef: "replay" },
+    outcome: "accepted",
+    gates: [
+      {
+        gate: "implement",
+        evidence: [{ kind: "validation", reference: "evidence/implementation.json" }],
+      },
+    ],
+    blockers: [],
+    initiativeGraph: null,
+    reason: "Enter Review without a result.",
+    idempotencyKey: "REPLAY-IMPLEMENTATION-REQUIRED",
+    occurredAt: "2026-07-17T10:10:00Z",
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...state.events,
+    { ...payload, chainDigest: digestReplayEvent(payload) },
+  ]);
+  assert.equal(replayed.ok, false);
+  if (!replayed.ok) {
+    assert.equal(replayed.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+
+test("replay requires Review dispatches to use the Implementation fingerprint", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `replay-fingerprint-${phase}`);
+  }
+  const approval = state.events.find(
+    (event) =>
+      event.type === "workflow_transitioned" &&
+      event.from.phase === "plan" &&
+      event.to.phase === "implement",
+  );
+  assert.ok(approval, "Build Plan approval Event is missing");
+  const planReference = approval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) => evidence.reference.startsWith("plans/"));
+  assert.ok(planReference, "Build Plan reference is missing");
+  const payload: Record<string, unknown> = {
+    schemaVersion: 1,
+    eventId: "EVENT-REPLAY-FINGERPRINT-DISPATCH",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    type: "phase_execution_dispatched",
+    from: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    to: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    actor: { kind: "agent", id: "reviewer", sessionRef: "replay" },
+    outcome: "accepted",
+    gates: [],
+    blockers: state.projection.blockers,
+    initiativeGraph: null,
+    reason: "Dispatch Review from the wrong fingerprint.",
+    idempotencyKey: "REPLAY-FINGERPRINT-DISPATCH",
+    occurredAt: "2026-07-17T10:10:15Z",
+    planIdentity: `sha256:${planReference.reference.slice("plans/".length, -".json".length)}`,
+    binding: {
+      schemaVersion: 1,
+      dispatchId: "DISPATCH-REPLAY-FINGERPRINT",
+      taskId: state.projection.id,
+      expectedTaskVersion: state.projection.version,
+      phase: "review",
+      agentRole: "standards-review",
+      baseFingerprint: `sha256:${"e".repeat(64)}`,
+      requestedAt: "2026-07-17T10:10:15Z",
+      contextManifestIdentity: `sha256:${"c".repeat(64)}`,
+      agentContractIdentity: `sha256:${"b".repeat(64)}`,
+      skillIdentities: [],
+    },
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...state.events,
+    { ...payload, chainDigest: digestReplayEvent(payload) },
+  ]);
+  assert.equal(replayed.ok, false);
+  if (!replayed.ok) {
+    assert.equal(replayed.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+});
+
+test("replay validates structured Review findings", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `replay-findings-${phase}`);
+  }
+  const recorded = recordWorkflowAgentResult(
+    state,
+    "review",
+    "standards-review",
+    "succeeded",
+    [],
+    "replay-findings-result",
+  );
+  const resultEvent = recorded.events.at(-1)!;
+  assert.equal(resultEvent.type, "phase_execution_result_accepted");
+  if (resultEvent.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const payload: Record<string, unknown> = {
+    ...resultEvent,
+    result: {
+      ...(resultEvent.result as Record<string, unknown>),
+      reviewFindings: ["not structured"],
+    },
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...state.events,
+    { ...payload, chainDigest: digestReplayEvent(payload) },
+  ]);
+  assert.equal(replayed.ok, false);
+  if (!replayed.ok) {
+    assert.equal(replayed.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+});
+
 test("replay rejects transition Events with missing initiativeGraph data", () => {
   const state = advanceTask(
     startTask("build"),
@@ -1384,6 +1543,11 @@ function digestReplayEvent(event: Record<string, unknown>): string {
     payload.manifestPath = event.manifestPath;
     payload.manifestIdentity = event.manifestIdentity;
     payload.change = event.change;
+  } else if (event.type === "phase_execution_dispatched") {
+    payload.planIdentity = event.planIdentity;
+    payload.binding = event.binding;
+  } else if (event.type === "phase_execution_result_accepted") {
+    payload.result = event.result;
   }
   const serialized = stableTestJson(payload);
   assert.ok(serialized);

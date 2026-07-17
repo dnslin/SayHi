@@ -11,6 +11,11 @@ import {
   type DependencyGraphDiagnostic,
   type DependencyGraphDiagnosticCode,
 } from "./dependency-graph.js";
+import {
+  parsePhaseExecutionBinding,
+  parsePhaseExecutionResult,
+} from "./execution.js";
+
 
 import { isRepositoryRelativePath } from "./repository-path.js";
 import {
@@ -1553,9 +1558,10 @@ export function replayWorkflowEvents(
 
 
     if (projection !== null && sourceEvent.type === "phase_execution_dispatched") {
+      const binding = parsePhaseExecutionBinding(sourceEvent.binding);
       if (
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
-        !isUnknownRecord(sourceEvent.binding) ||
+        binding === null ||
         sourceEvent.planIdentity !== approvedBuildPlanIdentity(acceptedEvents)
       ) {
         return replayFailure(
@@ -1567,6 +1573,17 @@ export function replayWorkflowEvents(
           ),
         );
       }
+      const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
+        projection,
+        acceptedEvents,
+        binding,
+      );
+      if (reviewDispatchDiagnostic !== null) {
+        return replayFailure({
+          ...reviewDispatchDiagnostic,
+          path: `$[${index}].binding`,
+        });
+      }
       const event = copyPhaseExecutionDispatchedEvent(sourceEvent);
       projection = projectPhaseExecutionEvent(projection, event);
       acceptedEvents.push(event);
@@ -1576,15 +1593,17 @@ export function replayWorkflowEvents(
       projection !== null &&
       sourceEvent.type === "phase_execution_result_accepted"
     ) {
+      const result = parsePhaseExecutionResult(sourceEvent.result);
       if (
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
-        !isUnknownRecord(sourceEvent.result)
+        result === null ||
+        validateBuildReviewResultPayload(projection, result) !== null
       ) {
         return replayFailure(
           diagnostic(
             "workflow.event.invalid",
             `$[${index}]`,
-            "Phase execution result does not preserve the active Build position.",
+            "Phase execution result does not preserve the active Build position or schema-valid result payload.",
             "Restore the accepted Agent result Event or record the result through Core.",
           ),
         );
@@ -1637,6 +1656,18 @@ export function replayWorkflowEvents(
     );
     if (buildPlanDiagnostic !== null) {
       return replayFailure({ ...buildPlanDiagnostic, path: `$[${index}]` });
+    }
+    const implementationResultDiagnostic =
+      validateBuildImplementationResultTransition(
+        projection,
+        acceptedEvents,
+        sourceEvent.to,
+      );
+    if (implementationResultDiagnostic !== null) {
+      return replayFailure({
+        ...implementationResultDiagnostic,
+        path: `$[${index}]`,
+      });
     }
     const reviewResultDiagnostic = validateBuildReviewResultTransition(
       projection,
@@ -2309,27 +2340,13 @@ function validatePhaseExecutionDispatchRequest(
       "Record and approve the current Build Plan before dispatching the Phase Agent.",
     );
   }
-  if (
-    state.projection.route === "build" &&
-    state.projection.phase === "review"
-  ) {
-    const implementation = currentBuildImplementationResult(state.events);
-    if (implementation === undefined) {
-      return diagnostic(
-        "workflow.transition.illegal",
-        "$.binding.baseFingerprint",
-        "Build Review dispatch requires the current successful Implementation result.",
-        "Record the current Implementation result before dispatching either Review Agent.",
-      );
-    }
-    if (request.binding.baseFingerprint !== implementation.observedFinalFingerprint) {
-      return diagnostic(
-        "workflow.transition.illegal",
-        "$.binding.baseFingerprint",
-        "Build Review dispatch must use the Implementation final fingerprint.",
-        "Dispatch both Review Agents from the exact frozen Implementation result.",
-      );
-    }
+  const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
+    state.projection,
+    state.events,
+    request.binding,
+  );
+  if (reviewDispatchDiagnostic !== null) {
+    return reviewDispatchDiagnostic;
   }
   return null;
 }
@@ -2363,17 +2380,60 @@ function validatePhaseExecutionResultRequest(
       "Phase execution result requires a readable immutable payload.",
     );
   }
+  const reviewResultDiagnostic = validateBuildReviewResultPayload(
+    state.projection,
+    request.result,
+  );
+  if (reviewResultDiagnostic !== null) {
+    return reviewResultDiagnostic;
+  }
+  return null;
+}
+
+function validateBuildReviewDispatchBinding(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  binding: unknown,
+): WorkflowDiagnostic | null {
+  if (projection.route !== "build" || projection.phase !== "review") {
+    return null;
+  }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding.baseFingerprint",
+      "Build Review dispatch requires the current successful Implementation result.",
+      "Record the current Implementation result before dispatching either Review Agent.",
+    );
+  }
   if (
-    state.projection.route === "build" &&
-    state.projection.phase === "review" &&
-    !Array.isArray(request.result.reviewFindings)
+    !isUnknownRecord(binding) ||
+    binding.baseFingerprint !== implementation.observedFinalFingerprint
   ) {
-    return invalidRequest(
-      "$.result.reviewFindings",
-      "New Build Review results require structured reviewFindings.",
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding.baseFingerprint",
+      "Build Review dispatch must use the Implementation final fingerprint.",
+      "Dispatch both Review Agents from the exact frozen Implementation result.",
     );
   }
   return null;
+}
+
+function validateBuildReviewResultPayload(
+  projection: TaskProjection,
+  result: unknown,
+): WorkflowDiagnostic | null {
+  if (projection.route !== "build" || projection.phase !== "review") {
+    return null;
+  }
+  return isUnknownRecord(result) && Array.isArray(result.reviewFindings)
+    ? null
+    : invalidRequest(
+        "$.result.reviewFindings",
+        "New Build Review results require structured reviewFindings.",
+      );
 }
 
 function validatePhaseExecutionRequest(
