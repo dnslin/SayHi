@@ -396,6 +396,7 @@ export type WorkflowDiagnosticCode = DependencyGraphDiagnosticCode
   | "workflow.event.sequence_invalid"
   | "workflow.event.chain_invalid"
   | "workflow.event.idempotency_conflict"
+  | "workflow.event.id_conflict"
   | "workflow.repair.exhausted"
   | "workflow.graph.invalid"
   | "workflow.event.invalid";
@@ -1446,6 +1447,7 @@ export function replayWorkflowEvents(
 
   const acceptedEvents: WorkflowEvent[] = [];
   const seenIdempotencyKeys = new Set<string>();
+  const seenEventIds = new Set<string>();
   let projection: TaskProjection | null = null;
 
   for (let index = 0; index < events.length; index += 1) {
@@ -1467,6 +1469,17 @@ export function replayWorkflowEvents(
       );
     }
     seenIdempotencyKeys.add(sourceEvent.idempotencyKey);
+    if (seenEventIds.has(sourceEvent.eventId)) {
+      return replayFailure(
+        diagnostic(
+          "workflow.event.id_conflict",
+          `$[${index}].eventId`,
+          "Workflow Event id appears more than once in history.",
+          "Restore the append-only stream without duplicate Event ids.",
+        ),
+      );
+    }
+    seenEventIds.add(sourceEvent.eventId);
 
     const expectedSequence = index + 1;
     if (sourceEvent.sequence !== expectedSequence) {
@@ -2491,6 +2504,14 @@ function validateInitiativeGraphRevisionRequest(
       "Reload the current Initiative before revising its Dependency Graph.",
     );
   }
+  if (state.events.some((event) => event.eventId === request.event.eventId)) {
+    return diagnostic(
+      "workflow.event.id_conflict",
+      "$.event.eventId",
+      "Initiative graph revision Event id was already accepted for this Task.",
+      "Submit the revision with a new stable Event id.",
+    );
+  }
   if (
     state.projection.route !== "initiative" ||
     state.projection.lifecycle !== "active" ||
@@ -2527,8 +2548,8 @@ function validateInitiativeGraphRevisionRequest(
   if (!validation.ok) {
     return dependencyGraphWorkflowDiagnostic(validation.diagnostics[0]!);
   }
-  const current = currentInitiativeGraph(state.events);
-  if (current === undefined) {
+  const current = latestInitiativeGraph(state.events);
+  if (current === null) {
     return graphFailure(
       "$.graph",
       "Initiative graph revision requires an accepted current Dependency Graph.",
@@ -3250,16 +3271,16 @@ function currentBuildPlanChange(
   }
   return undefined;
 }
-function currentInitiativeGraph(
+export function latestInitiativeGraph(
   events: readonly WorkflowEvent[],
-): DependencyGraph | undefined {
+): DependencyGraph | null {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const graph = events[index]!.initiativeGraph;
     if (graph !== null) {
       return graph;
     }
   }
-  return undefined;
+  return null;
 }
 
 export function currentImplementContextChange(

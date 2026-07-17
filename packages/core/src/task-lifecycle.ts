@@ -52,6 +52,7 @@ import {
 import {
   adoptWorkflowBaseline,
   currentImplementContextChange,
+  latestInitiativeGraph,
   isRepositoryRelativePath,
   replayWorkflowEvents,
   startWorkflowTask,
@@ -195,6 +196,7 @@ export type TaskLifecycleDiagnosticCode =
   | "initiative_graph.record.missing"
   | "initiative_graph.record.invalid"
   | "initiative_graph.record.conflict"
+  | "initiative_graph.record.stale"
   | "initiative_graph.task.mismatch"
   | "initiative_graph.identity.mismatch"
   | "initiative_graph.event.mismatch"
@@ -1651,6 +1653,23 @@ async function loadInitiativeGraphRecord(
         "Restore the graph.json record accepted by this Initiative history.",
       );
     }
+    const acceptedGraph = latestInitiativeGraph(state.events);
+    if (acceptedGraph === null) {
+      return initiativeGraphFailure(
+        "initiative_graph.event.mismatch",
+        path,
+        "The graph record is not bound to an accepted Initiative Event.",
+        "Restore the graph.json record accepted by this Initiative history.",
+      );
+    }
+    if (stableJson(validated.graph) !== stableJson(acceptedGraph)) {
+      return initiativeGraphFailure(
+        "initiative_graph.record.stale",
+        path,
+        "The graph record does not match the latest accepted Initiative graph revision.",
+        "Recover graph.json from the latest accepted Initiative Event before scheduling.",
+      );
+    }
     return Object.freeze({ ok: true, graph: validated.graph });
   } catch {
     return ioFailure(path);
@@ -1702,6 +1721,7 @@ function initiativeGraphFailure(
     | "initiative_graph.record.conflict"
     | "initiative_graph.task.mismatch"
     | "initiative_graph.identity.mismatch"
+    | "initiative_graph.record.stale"
     | "initiative_graph.event.mismatch"
   >,
   path: string,
@@ -1711,15 +1731,6 @@ function initiativeGraphFailure(
   return failure([diagnostic(code, path, message, remediation)]);
 }
 
-function latestInitiativeGraph(state: WorkflowState): DependencyGraph | null {
-  for (let index = state.events.length - 1; index >= 0; index -= 1) {
-    const graph = state.events[index]!.initiativeGraph;
-    if (graph !== null) {
-      return graph;
-    }
-  }
-  return null;
-}
 
 async function writeInitiativeGraphIfChanged(
   fileSystem: TaskLifecycleFileSystem,
@@ -3540,7 +3551,7 @@ async function reviseDurableInitiativeGraphLocked(
       appended: false,
     });
   }
-  const currentGraph = latestInitiativeGraph(loaded.state);
+  const currentGraph = latestInitiativeGraph(loaded.state.events);
   if (currentGraph === null) {
     return failure([
       diagnostic(
@@ -3689,7 +3700,7 @@ async function recoverDurableTaskLocked(
       loaded.projectionPath,
       loaded.state.projection,
     );
-    const graph = latestInitiativeGraph(loaded.state);
+    const graph = latestInitiativeGraph(loaded.state.events);
     let graphRecovered = false;
     if (graph !== null) {
       activePath = paths.graphPath;

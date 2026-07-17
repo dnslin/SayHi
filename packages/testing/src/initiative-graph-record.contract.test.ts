@@ -137,6 +137,28 @@ test("Core records an approved Initiative graph revision without changing its du
   });
   assert.equal(recovered.ok, true);
   assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), revision);
+  await writeFile(graphPath, `${JSON.stringify(fixture.graph)}\n`, "utf8");
+  const stale = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.diagnostics[0]?.code, "initiative_graph.record.stale");
+  }
+  const repaired = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(repaired.ok, true);
+  const inspected = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(inspected.ok, true);
+  if (inspected.ok) {
+    assert.deepEqual(inspected.graph, revision);
+  }
 });
 
 test("Core rejects unsafe and stale Initiative graph revisions without replacing the accepted graph", async (t) => {
@@ -229,6 +251,23 @@ test("Core rejects unsafe and stale Initiative graph revisions without replacing
     });
     assert.deepEqual(after, before, candidate.name);
   }
+  const duplicateEvent = {
+    ...revisionEvent("DUPLICATE-EVENT"),
+    eventId: fixture.graph.updatedByEvent,
+  };
+  const duplicate = await reviseDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+    expectedVersion: before.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    graph: revisedGraph(fixture.graph, duplicateEvent.eventId),
+    event: duplicateEvent,
+  });
+  assert.equal(duplicate.ok, false);
+  if (!duplicate.ok) {
+    assert.equal(duplicate.diagnostics[0]?.code, "workflow.event.id_conflict");
+  }
+  assert.equal(await readFile(graphPath, "utf8"), acceptedGraphText);
 });
 
 test("CLI submits an approved Initiative graph revision through Core", async (t) => {
