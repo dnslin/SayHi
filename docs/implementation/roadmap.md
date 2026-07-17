@@ -1,6 +1,6 @@
 # SayHi Implementation Roadmap
 
-**Status:** Approved sequencing; implementation not started
+**Status:** Approved sequencing; implementation progress is established only by recorded Exit Gate evidence.
 
 ## Delivery policy
 
@@ -91,6 +91,10 @@ In a fixture project, install the packed Plugin, complete one no-change Quick, o
 ### Exit Gate
 
 The Build happy path and every fail-closed acceptance case pass with packaged artifacts. Deterministic tests do not depend on model compliance; prompt evaluations cover role behavior separately.
+
+### Exit Gate evidence
+
+**Satisfied for issue #23’s Quick and Build acceptance scope:** `npm run test:milestone-2` runs the complete contract suite. Its packaged-artifact smoke test builds, packs, and locally installs Core, CLI, OMP, and the compiled testing contracts, then reruns the installed Quick/Build matrix. That matrix verifies no-change and changed Quick persistence, escalation, approved Build completion, stale Context and identity blocking, denied Gates, Baseline drift, bounded Review repair, uninstall, and scoped Git safety. Explicit packaged-CLI requests for push, reset, stash, rebase, revert, and force checkout are refused without changing Git state.
 
 ### Primary risks
 

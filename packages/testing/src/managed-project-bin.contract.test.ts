@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -37,9 +37,19 @@ import {
 } from "./json-test-support.js";
 
 const executeFile = promisify(execFile);
+const NPM_EXECUTABLE = process.platform === "win32" ? process.execPath : "npm";
+const NPM_CLI_ENTRY_POINT =
+  process.env.npm_execpath ??
+  join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
 const CLI_BINARY = fileURLToPath(
-  new URL("../../cli/dist/bin.js", import.meta.url),
+  new URL("./bin.js", import.meta.resolve("@dnslin/sayhi-cli")),
 );
+
+function npmArguments(args: readonly string[]): readonly string[] {
+  return process.platform === "win32"
+    ? [NPM_CLI_ENTRY_POINT, ...args]
+    : args;
+}
 
 const FOUNDATION_TASK = Object.freeze({
   taskId: "TASK-15-FOUNDATION",
@@ -1965,6 +1975,56 @@ test("Core rejects a malformed persisted Finish event after completion", async (
   assert.equal((await showTaskState(repository)).projection.lifecycle, "completed");
 });
 
+test("packed artifacts execute the installed Quick and Build contract matrix", async (t) => {
+  if (process.env.SAYHI_INSTALLED_CONTRACTS === "1") {
+    t.skip("Executed by the outer installed contract matrix.");
+    return;
+  }
+  const workspace = await mkdtemp(join(tmpdir(), "sayhi-packed-artifacts-"));
+  t.after(async () => rm(workspace, { recursive: true, force: true }));
+
+  const tarballs = await packArtifactPackages(workspace);
+  const installation = join(workspace, "installation");
+  await installArtifactPackages(installation, tarballs);
+  await runInstalledContractMatrix(installation);
+});
+
+test("packaged CLI refuses destructive Git requests without changing repository state", async (t) => {
+  const repository = await mkdtemp(join(tmpdir(), "sayhi-prohibited-git-cli-"));
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await writeFile(join(repository, "README.md"), "protected Git fixture\n", "utf8");
+  await runGit(repository, "add", "README.md");
+  await runGit(repository, "commit", "--quiet", "-m", "initial state");
+
+  const headBefore = await readGitHead(repository);
+  for (const operation of [
+    "push",
+    "reset",
+    "stash",
+    "rebase",
+    "revert",
+    "force-checkout",
+  ]) {
+    const rejected = await executeCliResult(
+      "task",
+      operation,
+      "--cwd",
+      repository,
+      "--json",
+    );
+    assert.equal(rejected.exitCode, 2, operation);
+    assert.equal(readCliErrorCode(JSON.parse(rejected.stdout)), "cli.arguments.invalid", operation);
+    assert.equal(await readGitHead(repository), headBefore, operation);
+  }
+  const status = await executeFile("git", ["status", "--porcelain"], {
+    cwd: repository,
+    windowsHide: true,
+  });
+  assert.equal(status.stdout, "");
+});
 class FailingCommitEvidenceFileSystem extends NodeManagedProjectFileSystem {
   #failedPath: string | null = null;
 
@@ -2547,4 +2607,87 @@ async function locateQuickAuditFile(
   const auditFile = auditFiles.find((entry) => entry.isFile());
   assert.ok(auditFile);
   return join(auditDirectory, auditFile.name);
+}
+
+const PACKAGED_ARTIFACT_DIRECTORIES = Object.freeze({
+  cli: fileURLToPath(new URL("../../cli/", import.meta.url)),
+  core: fileURLToPath(new URL("../../core/", import.meta.url)),
+  omp: fileURLToPath(new URL("../../omp-plugin/", import.meta.url)),
+  testing: fileURLToPath(new URL("../../testing/", import.meta.url)),
+});
+
+async function packArtifactPackages(workspace: string): Promise<readonly string[]> {
+  return Promise.all(
+    Object.entries(PACKAGED_ARTIFACT_DIRECTORIES).map(async ([name, source]) => {
+      const staging = join(workspace, "packages", name);
+      await mkdir(staging, { recursive: true });
+      await cp(join(source, "package.json"), join(staging, "package.json"));
+      await cp(join(source, "dist"), join(staging, "dist"), { recursive: true });
+      await executeFile(NPM_EXECUTABLE, npmArguments(["pack", "--json"]), {
+        cwd: staging,
+        windowsHide: true,
+      });
+      const tarball = (await readdir(staging)).find((entry) => entry.endsWith(".tgz"));
+      assert.ok(tarball, `Packed ${name} artifact is missing.`);
+      return join(staging, tarball);
+    }),
+  );
+}
+
+async function installArtifactPackages(
+  installation: string,
+  tarballs: readonly string[],
+): Promise<void> {
+  await mkdir(installation, { recursive: true });
+  await writeFile(
+    join(installation, "package.json"),
+    '{"name":"sayhi-packed-fixture","private":true,"type":"module"}\n',
+    "utf8",
+  );
+  await executeFile(
+    NPM_EXECUTABLE,
+    npmArguments([
+      "install",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      "--ignore-scripts",
+      "--no-save",
+      ...tarballs,
+    ]),
+    { cwd: installation, windowsHide: true },
+  );
+}
+
+const INSTALLED_CONTRACT_FILES = Object.freeze([
+  "workflow.contract.test.js",
+  "task-lifecycle.contract.test.js",
+  "task-lifecycle-filesystem.contract.test.js",
+  "execution.contract.test.js",
+  "context-cli.contract.test.js",
+  "context-manifest.contract.test.js",
+  "spec-context-cli.contract.test.js",
+  "managed-project-cli.contract.test.js",
+  "managed-project-bin.contract.test.js",
+  "omp.contract.test.js",
+]);
+
+async function runInstalledContractMatrix(installation: string): Promise<void> {
+  const testDirectory = join(installation, "node_modules", "@sayhi", "testing", "dist");
+  const runner = join(installation, "installed-contract-matrix.mjs");
+  await writeFile(
+    runner,
+    INSTALLED_CONTRACT_FILES.map(
+      (file) => `import "./node_modules/@sayhi/testing/dist/${file}";`,
+    ).join("\n"),
+    "utf8",
+  );
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const result = await executeFile(process.execPath, ["--test", runner], {
+    cwd: installation,
+    env: { ...environment, SAYHI_INSTALLED_CONTRACTS: "1" },
+    windowsHide: true,
+  });
+  assert.match(`${result.stdout}${result.stderr}`, /tests [1-9]\d*/u, result.stderr);
 }
