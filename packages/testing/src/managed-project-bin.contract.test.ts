@@ -42,7 +42,7 @@ const NPM_CLI_ENTRY_POINT =
   process.env.npm_execpath ??
   join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
 const CLI_BINARY = fileURLToPath(
-  new URL("../../cli/dist/bin.js", import.meta.url),
+  new URL("./bin.js", import.meta.resolve("@dnslin/sayhi-cli")),
 );
 
 function npmArguments(args: readonly string[]): readonly string[] {
@@ -1975,28 +1975,18 @@ test("Core rejects a malformed persisted Finish event after completion", async (
   assert.equal((await showTaskState(repository)).projection.lifecycle, "completed");
 });
 
-test("packed Core, CLI, and OMP artifacts complete Quick scenarios and an escalated Build", async (t) => {
+test("packed artifacts execute the installed Quick and Build contract matrix", async (t) => {
+  if (process.env.SAYHI_INSTALLED_CONTRACTS === "1") {
+    t.skip("Executed by the outer installed contract matrix.");
+    return;
+  }
   const workspace = await mkdtemp(join(tmpdir(), "sayhi-packed-artifacts-"));
   t.after(async () => rm(workspace, { recursive: true, force: true }));
 
   const tarballs = await packArtifactPackages(workspace);
   const installation = join(workspace, "installation");
   await installArtifactPackages(installation, tarballs);
-  const scriptPath = join(installation, "verify-packages.mjs");
-  await writeFile(scriptPath, PACKAGED_ARTIFACT_SMOKE_SCRIPT, "utf8");
-
-  const verification = await executeFile(process.execPath, [scriptPath], {
-    cwd: installation,
-    windowsHide: true,
-  });
-  assert.deepEqual(JSON.parse(verification.stdout), {
-    changedQuick: "archived",
-    escalatedLifecycle: "archived",
-    escalatedPhase: "finish",
-    escalatedRoute: "build",
-    noChangeQuick: "archived",
-    ompMatchesCore: true,
-  });
+  await runInstalledContractMatrix(installation);
 });
 
 test("packaged CLI refuses destructive Git requests without changing repository state", async (t) => {
@@ -2623,6 +2613,7 @@ const PACKAGED_ARTIFACT_DIRECTORIES = Object.freeze({
   cli: fileURLToPath(new URL("../../cli/", import.meta.url)),
   core: fileURLToPath(new URL("../../core/", import.meta.url)),
   omp: fileURLToPath(new URL("../../omp-plugin/", import.meta.url)),
+  testing: fileURLToPath(new URL("../../testing/", import.meta.url)),
 });
 
 async function packArtifactPackages(workspace: string): Promise<readonly string[]> {
@@ -2668,484 +2659,35 @@ async function installArtifactPackages(
   );
 }
 
-const PACKAGED_ARTIFACT_SMOKE_SCRIPT = `
-import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import {
-  addDurableContextManifestEntry,
-  archiveDurableTask,
-  advanceDurableTask,
-  coreContract,
-  createDurableTask,
-  decideDurableBuildPlan,
-  dispatchDurablePhaseExecution,
-  escalateDurableQuickToBuild,
-  freezeDurableContextManifest,
-  readGateEvidenceKinds,
-  recordDurableBuildPlan,
-  recordDurablePhaseExecutionResult,
-  recoverDurableTask,
-} from "@dnslin/sayhi-core";
-import { NodeManagedProjectFileSystem, runCli } from "@dnslin/sayhi-cli";
-import { readOmpBootstrapContract } from "@dnslin/sayhi-omp";
-import { promisify } from "node:util";
+const INSTALLED_CONTRACT_FILES = Object.freeze([
+  "workflow.contract.test.js",
+  "task-lifecycle.contract.test.js",
+  "task-lifecycle-filesystem.contract.test.js",
+  "execution.contract.test.js",
+  "context-cli.contract.test.js",
+  "context-manifest.contract.test.js",
+  "spec-context-cli.contract.test.js",
+  "managed-project-cli.contract.test.js",
+  "managed-project-bin.contract.test.js",
+  "omp.contract.test.js",
+]);
 
-const executeFile = promisify(execFile);
-
-const repository = await mkdtemp(join(tmpdir(), "sayhi-packed-fixture-"));
-const auditRoot = await mkdtemp(join(tmpdir(), "sayhi-packed-audit-"));
-const previousAuditRoot = process.env.SAYHI_QUICK_AUDIT_DIR;
-process.env.SAYHI_QUICK_AUDIT_DIR = auditRoot;
-
-try {
-  await executeFile("git", ["init", "--quiet"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["config", "user.email", "sayhi-tests@example.test"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["config", "user.name", "SayHi Tests"], { cwd: repository, windowsHide: true });
-  await writeFile(join(repository, "README.md"), "packed fixture\\n", "utf8");
-  await executeFile("git", ["add", "README.md"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["commit", "--quiet", "-m", "initial state"], { cwd: repository, windowsHide: true });
-  assert.equal((await runCli(["init", "--cwd", repository, "--json"])).exitCode, 0);
-  await executeFile("git", ["add", "--all"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["commit", "--quiet", "-m", "initialize SayHi"], { cwd: repository, windowsHide: true });
-
-  const noChange = quickCompletion("TASK-23-PACKED-NO-CHANGE", []);
-  await writeJson(repository, "no-change-complete.json", noChange.request);
-  await writeJson(repository, "no-change-archive.json", noChange.archive);
-  await executeFile("git", ["add", "no-change-complete.json", "no-change-archive.json"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["commit", "--quiet", "-m", "no-change Quick request"], { cwd: repository, windowsHide: true });
-  assert.equal(
-    resultOf(await runCli(["quick", "complete", "--from", "no-change-complete.json", "--cwd", repository, "--json"]))
-      .outcome,
-    "no-change",
+async function runInstalledContractMatrix(installation: string): Promise<void> {
+  const testDirectory = join(installation, "node_modules", "@sayhi", "testing", "dist");
+  const runner = join(installation, "installed-contract-matrix.mjs");
+  await writeFile(
+    runner,
+    INSTALLED_CONTRACT_FILES.map(
+      (file) => `import "./node_modules/@sayhi/testing/dist/${file}";`,
+    ).join("\n"),
+    "utf8",
   );
-  assert.equal(
-    resultOf(await runCli(["quick", "archive", noChange.taskId, "--from", "no-change-archive.json", "--cwd", repository, "--json"]))
-      .projection.lifecycle,
-    "archived",
-  );
-
-  const changed = quickCompletion("TASK-23-PACKED-CHANGED", ["README.md"]);
-  await writeJson(repository, "changed-complete.json", {
-    ...changed.request,
-    writes: [{ path: "README.md", content: "changed by packed CLI\\n" }],
+  const environment = { ...process.env };
+  delete environment.NODE_TEST_CONTEXT;
+  const result = await executeFile(process.execPath, ["--test", runner], {
+    cwd: installation,
+    env: { ...environment, SAYHI_INSTALLED_CONTRACTS: "1" },
+    windowsHide: true,
   });
-  await writeJson(repository, "changed-archive.json", changed.archive);
-  await executeFile("git", ["add", "changed-complete.json", "changed-archive.json"], { cwd: repository, windowsHide: true });
-  await executeFile("git", ["commit", "--quiet", "-m", "changed Quick request"], { cwd: repository, windowsHide: true });
-  assert.equal(
-    resultOf(await runCli(["quick", "complete", "--from", "changed-complete.json", "--cwd", repository, "--json"]))
-      .outcome,
-    "changed",
-  );
-  assert.equal(
-    resultOf(await runCli(["quick", "archive", changed.taskId, "--from", "changed-archive.json", "--cwd", repository, "--json"]))
-      .projection.lifecycle,
-    "archived",
-  );
-
-  const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const escalationTask = startRequest("TASK-23-PACKED-ESCALATION", "quick", ["README.md"]);
-  const created = await createDurableTask({ fileSystem, start: escalationTask });
-  assert.equal(created.ok, true);
-  assert.ok(created.ok);
-  const escalated = await escalateDurableQuickToBuild({
-    fileSystem,
-    escalation: {
-      contractVersion: 1,
-      taskId: escalationTask.task.id,
-      expectedVersion: created.state.projection.version,
-      routeGate: {
-        gate: "route",
-        evidence: [{ kind: "human-approval", reference: "evidence/build-route-approved.json" }],
-      },
-      event: event(escalationTask.task.id, "ESCALATED"),
-    },
-  });
-  assert.equal(escalated.ok, true);
-  const restored = await recoverDurableTask({
-    fileSystem: new NodeManagedProjectFileSystem(repository),
-    taskId: escalationTask.task.id,
-  });
-  assert.equal(restored.ok, true);
-  assert.ok(restored.ok);
-  const completedBuild = await completeEscalatedBuild(
-    new NodeManagedProjectFileSystem(repository),
-    escalationTask.task.id,
-    restored.state,
-  );
-
-  process.stdout.write(JSON.stringify({
-    changedQuick: "archived",
-    escalatedLifecycle: completedBuild.projection.lifecycle,
-    escalatedPhase: completedBuild.projection.phase,
-    escalatedRoute: completedBuild.projection.route,
-    noChangeQuick: "archived",
-    ompMatchesCore: readOmpBootstrapContract() === coreContract.readBootstrapContract(),
-  }));
-} finally {
-  if (previousAuditRoot === undefined) {
-    delete process.env.SAYHI_QUICK_AUDIT_DIR;
-  } else {
-    process.env.SAYHI_QUICK_AUDIT_DIR = previousAuditRoot;
-  }
-  await rm(repository, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-  await rm(auditRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  assert.match(`${result.stdout}${result.stderr}`, /tests [1-9]\d*/u, result.stderr);
 }
-
-function event(taskId, suffix) {
-  return {
-    eventId: "EVENT-23-" + taskId + "-" + suffix,
-    actor: { kind: "orchestrator", id: "packed-test", sessionRef: "packed-session" },
-    reason: "Accept " + suffix,
-    idempotencyKey: "IDEMPOTENCY-23-" + taskId + "-" + suffix,
-    occurredAt: "2026-07-17T13:00:00Z",
-  };
-}
-
-function startRequest(taskId, route, files) {
-  return {
-    contractVersion: 1,
-    task: {
-      id: taskId,
-      title: "Prove packed " + route + " route",
-      route,
-      parentTaskId: null,
-      initiativeGraphId: null,
-      intent: {
-        goals: ["Prove the installed package route"],
-        nonGoals: [],
-        acceptanceCriteria: ["The installed package preserves the requested route"],
-      },
-      scope: { files, apis: [], schemas: [], locks: [] },
-      baselineRef: "baseline.json",
-      contexts: {},
-      policies: { commit: "never", push: "never", maxRepairAttempts: 2 },
-    },
-    routeGate: {
-      gate: "route",
-      evidence: [{ kind: "human-approval", reference: "evidence/route-approved.json" }],
-    },
-    event: event(taskId, "CREATED"),
-  };
-}
-
-function transition(taskId, state, lifecycle, phase, suffix) {
-  const definition = coreContract.readRouteDefinition(state.projection.route);
-  const candidate = definition.transitions.find(
-    (value) =>
-      value.from.lifecycle === state.projection.lifecycle &&
-      value.from.phase === state.projection.phase &&
-      value.to.lifecycle === lifecycle &&
-      value.to.phase === phase,
-  );
-  assert.ok(candidate);
-  return {
-    contractVersion: 1,
-    taskId,
-    expectedVersion: state.projection.version,
-    to: candidate.to,
-    gates: candidate.requiredGates.map((gate) => ({
-      gate,
-      evidence: [{ kind: readGateEvidenceKinds(gate)[0], reference: "evidence/" + suffix + "-" + gate + ".json" }],
-    })),
-    event: event(taskId, suffix),
-  };
-}
-
-function quickCompletion(taskId, files) {
-  const start = startRequest(taskId, "quick", files);
-  const initial = coreContract.startWorkflowTask(start);
-  assert.equal(initial.ok, true);
-  assert.ok(initial.ok);
-  let state = initial.state;
-  const transitions = [];
-  for (const [lifecycle, phase, suffix] of [
-    ["active", "implement", "IMPLEMENT"],
-    ["active", "review", "REVIEW"],
-    ["active", "finish", "FINISH"],
-    ["completed", "finish", "COMPLETE"],
-  ]) {
-    const next = transition(taskId, state, lifecycle, phase, suffix);
-    transitions.push(next);
-    const advanced = coreContract.transitionWorkflow(state, next);
-    assert.equal(advanced.ok, true);
-    assert.ok(advanced.ok);
-    state = advanced.state;
-  }
-  return {
-    archive: transition(taskId, state, "archived", "finish", "ARCHIVE"),
-    request: { start, transitions, writes: [] },
-    taskId,
-  };
-}
-
-function implementationAgent() {
-  return {
-  role: "implementation",
-  contractIdentity: "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
-  contract: {
-    schemaVersion: 1,
-    role: "implementation",
-    runtimeName: "sayhi-v1-implementation",
-    contractVersion: 1,
-    tools: ["read", "edit", "bash"],
-    network: "none",
-    skills: ["implement", "tdd"],
-    spawns: [],
-    repositoryAccess: "exclusive-write",
-    outputSchema: "schemas/agent/implementation-output.json",
-    promptBaseIdentity: "sha256:" + "a".repeat(64),
-    overridePolicy: "prompt-body-only",
-  },
-  skills: [
-    {
-      name: "implement",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-      },
-      content: "implement skill\\n",
-    },
-    {
-      name: "tdd",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-      },
-      content: "tdd skill\\n",
-    },
-  ],
-  };
-}
-
-function reviewAgents() {
-  return [
-  {
-    role: "standards-review",
-    contractIdentity: "sha256:21a8ae092397c5873d98bcb0f0cf6fd080f62a83096bc7aa35b4185829c0784b",
-    contract: {
-      schemaVersion: 1,
-      role: "standards-review",
-      runtimeName: "sayhi-v1-standards-review",
-      contractVersion: 1,
-      tools: [],
-      network: "none",
-      skills: [],
-      spawns: [],
-      repositoryAccess: "read-only",
-      outputSchema: "schemas/agent/standards-review-output.json",
-      promptBaseIdentity: "sha256:" + "b".repeat(64),
-      overridePolicy: "prompt-body-only",
-    },
-    skills: [],
-  },
-  {
-    role: "spec-review",
-    contractIdentity: "sha256:6a82f7bca42776d7b92abcf2facf4a88a6b1b2bb212bafc3dafd2632ce62b97f",
-    contract: {
-      schemaVersion: 1,
-      role: "spec-review",
-      runtimeName: "sayhi-v1-spec-review",
-      contractVersion: 1,
-      tools: [],
-      network: "none",
-      skills: [],
-      spawns: [],
-      repositoryAccess: "read-only",
-      outputSchema: "schemas/agent/spec-review-output.json",
-      promptBaseIdentity: "sha256:" + "b".repeat(64),
-      overridePolicy: "prompt-body-only",
-    },
-    skills: [],
-  },
-  ];
-}
-
-async function completeEscalatedBuild(fileSystem, taskId, initialState) {
-  let state = await advanceBuild(fileSystem, taskId, initialState, "active", "plan", "PLAN");
-  const added = await addDurableContextManifestEntry({
-    fileSystem,
-    taskId,
-    expectedVersion: state.projection.version,
-    phase: "implement",
-    source: "README.md",
-    event: event(taskId, "CONTEXT-ADDED"),
-  });
-  assert.equal(added.ok, true);
-  assert.ok(added.ok);
-  const frozen = await freezeDurableContextManifest({
-    fileSystem,
-    taskId,
-    expectedVersion: added.state.projection.version,
-    phase: "implement",
-    event: event(taskId, "CONTEXT-FROZEN"),
-  });
-  assert.equal(frozen.ok, true);
-  assert.ok(frozen.ok);
-  const recorded = await recordDurableBuildPlan({
-    fileSystem,
-    taskId,
-    expectedVersion: frozen.state.projection.version,
-    content: "Complete the installed Build through Finish.",
-    event: event(taskId, "PLAN-RECORDED"),
-  });
-  assert.equal(recorded.ok, true);
-  assert.ok(recorded.ok);
-  const approved = await decideDurableBuildPlan({
-    fileSystem,
-    taskId,
-    expectedVersion: recorded.state.projection.version,
-    decision: "approved",
-    planIdentity: recorded.plan.identity,
-    contextManifestIdentity: recorded.plan.contextManifestIdentity,
-    event: {
-      ...event(taskId, "PLAN-APPROVED"),
-      actor: { kind: "user", id: "packed-reviewer", sessionRef: "packed-session" },
-    },
-  });
-  assert.equal(approved.ok, true);
-  assert.ok(approved.ok);
-  const manifest = await coreContract.inspectDurableContextManifest({
-    fileSystem,
-    taskId,
-    phase: "implement",
-  });
-  assert.equal(manifest.ok, true);
-  assert.ok(manifest.ok && manifest.state === "valid");
-  const currentContext = await Promise.all(
-    manifest.entries.map(async (entry) => ({
-      source: entry.source,
-      content: await fileSystem.readRepositoryFile(entry.source.value),
-    })),
-  );
-
-  state = await completePhase(
-    fileSystem,
-    taskId,
-    approved.state,
-    "implement",
-    implementationAgent(),
-    recorded.plan.identity,
-    recorded.plan.contextManifestIdentity,
-    manifest.entries,
-    currentContext,
-  );
-  state = await advanceBuild(fileSystem, taskId, state, "active", "review", "REVIEW");
-  for (const agent of reviewAgents()) {
-    state = await completePhase(
-      fileSystem,
-      taskId,
-      state,
-      "review",
-      agent,
-      recorded.plan.identity,
-      recorded.plan.contextManifestIdentity,
-      manifest.entries,
-      currentContext,
-    );
-  }
-  state = await advanceBuild(fileSystem, taskId, state, "active", "finish", "FINISH");
-  state = await advanceBuild(fileSystem, taskId, state, "completed", "finish", "COMPLETE");
-  const archived = await archiveDurableTask({
-    fileSystem,
-    transition: transition(taskId, state, "archived", "finish", "ARCHIVE"),
-  });
-  assert.equal(archived.ok, true);
-  assert.ok(archived.ok);
-  return archived.state;
-}
-
-async function advanceBuild(fileSystem, taskId, state, lifecycle, phase, suffix) {
-  const advanced = await advanceDurableTask({
-    fileSystem,
-    transition: transition(taskId, state, lifecycle, phase, suffix),
-  });
-  assert.equal(
-    advanced.ok,
-    true,
-    advanced.ok
-      ? ""
-      : suffix + ": " + (advanced.diagnostics[0]?.code ?? "unknown") + ": " + (advanced.diagnostics[0]?.message ?? "Build transition failed"),
-  );
-  assert.ok(advanced.ok);
-  return advanced.state;
-}
-
-async function completePhase(
-  fileSystem,
-  taskId,
-  state,
-  phase,
-  agent,
-  planIdentity,
-  contextManifestIdentity,
-  manifest,
-  currentContext,
-) {
-  const dispatched = await dispatchDurablePhaseExecution({
-    fileSystem,
-    planIdentity,
-    execution: {
-      contractVersion: 1,
-      dispatch: {
-        schemaVersion: 1,
-        dispatchId: "DISPATCH-23-" + taskId + "-" + phase + "-" + state.projection.version,
-        taskId,
-        expectedTaskVersion: state.projection.version,
-        phase,
-        agentRole: agent.role,
-        baseFingerprint: "sha256:" + "d".repeat(64),
-        requestedAt: "2026-07-17T13:00:00Z",
-        contextManifestIdentity,
-        agentContractIdentity: agent.contractIdentity,
-      },
-      manifest,
-      currentContext,
-      agentContract: agent.contract,
-      skills: agent.skills,
-    },
-    event: event(taskId, phase + "-" + agent.role + "-DISPATCHED"),
-  });
-  assert.equal(dispatched.ok, true);
-  assert.ok(dispatched.ok);
-  const result = await recordDurablePhaseExecutionResult({
-    fileSystem,
-    taskId,
-    result: {
-      schemaVersion: 1,
-      dispatchId: dispatched.binding.dispatchId,
-      taskId,
-      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
-      phase,
-      agentRole: agent.role,
-      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
-      agentContractIdentity: dispatched.binding.agentContractIdentity,
-      baseFingerprint: dispatched.binding.baseFingerprint,
-      outcome: "succeeded",
-      artifacts: ["artifacts/" + agent.role + ".md"],
-      evidence: ["evidence/" + agent.role + ".json"],
-      findings: [],
-      ...(phase === "review" ? { reviewFindings: [] } : {}),
-      observedFinalFingerprint: dispatched.binding.baseFingerprint,
-    },
-    event: event(taskId, phase + "-" + agent.role + "-RESULT"),
-  });
-  assert.equal(result.ok, true);
-  assert.ok(result.ok);
-  return result.state;
-}
-
-function resultOf(result) {
-  assert.equal(result.exitCode, 0, result.stdout);
-  const envelope = JSON.parse(result.stdout);
-  assert.equal(envelope.ok, true);
-  return envelope.result;
-}
-
-async function writeJson(repository, path, value) {
-  await writeFile(join(repository, path), JSON.stringify(value), "utf8");
-}
-`;

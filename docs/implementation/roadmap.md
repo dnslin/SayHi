@@ -94,7 +94,7 @@ The Build happy path and every fail-closed acceptance case pass with packaged ar
 
 ### Exit Gate evidence
 
-**Satisfied for issue #23’s Quick and Build acceptance scope:** `npm run test:milestone-2` runs the complete contract suite. Its packaged-artifact smoke test builds, packs, and locally installs Core, CLI, and OMP before completing both Quick outcomes and the escalated Task’s approved Build through archive; the remaining contracts verify stale Context and identity blocking, denied Gates, Baseline drift, bounded Review repair, and scoped Git safety. Explicit packaged-CLI requests for push, reset, stash, rebase, revert, and force checkout are refused without changing Git state.
+**Satisfied for issue #23’s Quick and Build acceptance scope:** `npm run test:milestone-2` runs the complete contract suite. Its packaged-artifact smoke test builds, packs, and locally installs Core, CLI, OMP, and the compiled testing contracts, then reruns the installed Quick/Build matrix. That matrix verifies no-change and changed Quick persistence, escalation, approved Build completion, stale Context and identity blocking, denied Gates, Baseline drift, bounded Review repair, uninstall, and scoped Git safety. Explicit packaged-CLI requests for push, reset, stash, rebase, revert, and force checkout are refused without changing Git state.
 
 ### Primary risks
 
