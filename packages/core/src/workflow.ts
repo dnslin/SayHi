@@ -1617,7 +1617,12 @@ export function replayWorkflowEvents(
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
         result === null ||
         resultBindingDiagnostic !== null ||
-        validateBuildReviewResultPayload(projection, result, false) !== null
+        validateBuildReviewResultPayload(
+          projection,
+          acceptedEvents,
+          result,
+          false,
+        ) !== null
       ) {
         return replayFailure(
           diagnostic(
@@ -2419,6 +2424,7 @@ function validatePhaseExecutionResultRequest(
   }
   const reviewResultDiagnostic = validateBuildReviewResultPayload(
     state.projection,
+    state.events,
     result,
   );
   if (reviewResultDiagnostic !== null) {
@@ -2460,18 +2466,39 @@ function validateBuildReviewDispatchBinding(
 
 function validateBuildReviewResultPayload(
   projection: TaskProjection,
+  events: readonly WorkflowEvent[],
   result: unknown,
   requireStructured = true,
 ): WorkflowDiagnostic | null {
   if (projection.route !== "build" || projection.phase !== "review") {
     return null;
   }
-  return isUnknownRecord(result) &&
-    (!requireStructured || Array.isArray(result.reviewFindings))
+  if (
+    !isUnknownRecord(result) ||
+    (requireStructured && !Array.isArray(result.reviewFindings))
+  ) {
+    return invalidRequest(
+      "$.result.reviewFindings",
+      "New Build Review results require structured reviewFindings.",
+    );
+  }
+  const implementation = currentBuildImplementationResult(events);
+  if (implementation === undefined) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.baseFingerprint",
+      "Build Review results require the current successful Implementation result.",
+      "Record the current Implementation result before accepting a Review result.",
+    );
+  }
+  return result.baseFingerprint === implementation.observedFinalFingerprint &&
+    result.observedFinalFingerprint === implementation.observedFinalFingerprint
     ? null
-    : invalidRequest(
-        "$.result.reviewFindings",
-        "New Build Review results require structured reviewFindings.",
+    : diagnostic(
+        "workflow.transition.illegal",
+        "$.result.observedFinalFingerprint",
+        "Build Review results must assess the same frozen Implementation fingerprint.",
+        "Rerun the Review Agent from the exact Implementation final fingerprint.",
       );
 }
 

@@ -1023,7 +1023,7 @@ test("Build repair transitions stop at the configured attempt limit", () => {
 });
 
 
-test("Build Review requires matching observed final fingerprints", () => {
+test("replay rejects Build Review results with mismatched observed final fingerprints", () => {
   let state = startTask("build");
   for (const [lifecycle, phase] of [
     ["active", "explore"],
@@ -1048,21 +1048,66 @@ test("Build Review requires matching observed final fingerprints", () => {
     "succeeded",
     [],
     "observed-fingerprint-spec",
-    undefined,
-    `sha256:${"e".repeat(64)}`,
   );
-  const rejected = coreContract.transitionWorkflow(state, {
+  const resultEvent = state.events.at(-1)!;
+  assert.equal(resultEvent.type, "phase_execution_result_accepted");
+  if (resultEvent.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const payload: Record<string, unknown> = {
+    ...resultEvent,
+    result: {
+      ...(resultEvent.result as Record<string, unknown>),
+      observedFinalFingerprint: `sha256:${"e".repeat(64)}`,
+    },
+  };
+  const replayed = coreContract.replayWorkflowEvents([
+    ...state.events.slice(0, -1),
+    { ...payload, chainDigest: digestReplayEvent(payload) },
+  ]);
+  assert.equal(replayed.ok, false);
+  if (!replayed.ok) {
+    assert.equal(replayed.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+});
+
+test("Core rejects a Review result with a mismatched observed final fingerprint", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `result-fingerprint-${phase}`);
+  }
+  const accepted = recordWorkflowAgentResult(
+    state,
+    "review",
+    "spec-review",
+    "succeeded",
+    [],
+    "result-fingerprint-spec",
+  );
+  const resultEvent = accepted.events.at(-1)!;
+  assert.equal(resultEvent.type, "phase_execution_result_accepted");
+  if (resultEvent.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const dispatched = coreContract.replayWorkflowEvents(accepted.events.slice(0, -1));
+  assert.equal(dispatched.ok, true);
+  if (!dispatched.ok) {
+    return;
+  }
+  const rejected = coreContract.recordPhaseExecutionResult(dispatched.state, {
     contractVersion: 1,
-    taskId: state.projection.id,
-    expectedVersion: state.projection.version,
-    to: { lifecycle: "active", phase: "finish", step: "ready" },
-    gates: [
-      {
-        gate: "review",
-        evidence: [{ kind: "review", reference: "evidence/review.json" }],
-      },
-    ],
-    event: eventMetadata("observed-fingerprint-finish"),
+    taskId: dispatched.state.projection.id,
+    expectedVersion: dispatched.state.projection.version,
+    result: {
+      ...(resultEvent.result as Record<string, unknown>),
+      observedFinalFingerprint: `sha256:${"e".repeat(64)}`,
+    },
+    event: eventMetadata("result-fingerprint-mismatched"),
   });
   assert.equal(rejected.ok, false);
   if (!rejected.ok) {

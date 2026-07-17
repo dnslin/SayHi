@@ -14,8 +14,6 @@ import { NodeManagedProjectFileSystem } from "@dnslin/sayhi-cli";
 import {
   coreContract,
   withDurableTaskWriter,
-  type PhaseAgentContract,
-  type SkillMaterial,
   type ContractIdentity,
   type WorkflowLifecycle,
   type WorkflowPhase,
@@ -25,10 +23,12 @@ import {
 import {
   IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
+  recordTestPhaseResult,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
   taskLifecycleTransition,
   type TaskLifecycleFixture,
+  type TestPhaseAgent,
 } from "./task-lifecycle-test-support.js";
 import {
   requireRecord,
@@ -1920,12 +1920,7 @@ async function recordFoundationPhaseResult(
   repository: string,
   state: WorkflowState,
   phase: "implement" | "review",
-  agent: Readonly<{
-    role: "implementation" | "standards-review" | "spec-review";
-    contractIdentity: ContractIdentity;
-    contract: PhaseAgentContract;
-    skills?: readonly SkillMaterial[];
-  }>,
+  agent: TestPhaseAgent,
   occurredAt: string,
 ): Promise<WorkflowState> {
   const fileSystem = new NodeManagedProjectFileSystem(repository);
@@ -1945,67 +1940,22 @@ async function recordFoundationPhaseResult(
     })),
   );
   const suffix = `${state.projection.version}-${agent.role}`;
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  return recordTestPhaseResult({
     fileSystem,
+    fixture: FOUNDATION_TASK,
     planIdentity: material.planIdentity,
-    execution: {
-      contractVersion: 1,
-      dispatch: {
-        schemaVersion: 1,
-        dispatchId: `DISPATCH-${FOUNDATION_TASK.eventNamespace}-${suffix}`,
-        taskId: FOUNDATION_TASK.taskId,
-        expectedTaskVersion: state.projection.version,
-        phase,
-        agentRole: agent.role,
-        baseFingerprint: `sha256:${"d".repeat(64)}`,
-        requestedAt: occurredAt,
-        contextManifestIdentity: material.contextManifestIdentity,
-        agentContractIdentity: agent.contractIdentity,
-      },
+    contextManifestIdentity: material.contextManifestIdentity,
+    state,
+    phase,
+    agent,
+    materials: {
       manifest: manifest.entries,
       currentContext,
-      agentContract: agent.contract,
-      skills: agent.skills ?? [],
     },
-    event: taskLifecycleEventMetadata(
-      FOUNDATION_TASK,
-      `PHASE-${suffix}-DISPATCHED`,
-      occurredAt,
-    ),
+    outcome: "succeeded",
+    suffix,
+    occurredAt,
   });
-  if (!dispatched.ok) {
-    assert.fail(dispatched.diagnostics[0]?.message ?? "Foundation Phase dispatch failed");
-  }
-  const result = await coreContract.recordDurablePhaseExecutionResult({
-    fileSystem,
-    taskId: FOUNDATION_TASK.taskId,
-    result: {
-      schemaVersion: 1,
-      dispatchId: dispatched.binding.dispatchId,
-      taskId: FOUNDATION_TASK.taskId,
-      expectedTaskVersion: dispatched.binding.expectedTaskVersion,
-      phase,
-      agentRole: agent.role,
-      contextManifestIdentity: dispatched.binding.contextManifestIdentity,
-      agentContractIdentity: dispatched.binding.agentContractIdentity,
-      baseFingerprint: dispatched.binding.baseFingerprint,
-      outcome: "succeeded",
-      artifacts: [`artifacts/${agent.role}.md`],
-      evidence: [`evidence/${agent.role}.json`],
-      findings: [],
-      ...(phase === "review" ? { reviewFindings: [] } : {}),
-      observedFinalFingerprint: dispatched.binding.baseFingerprint,
-    },
-    event: taskLifecycleEventMetadata(
-      FOUNDATION_TASK,
-      `PHASE-${suffix}-RESULT`,
-      occurredAt,
-    ),
-  });
-  if (!result.ok) {
-    assert.fail(result.diagnostics[0]?.message ?? "Foundation Phase result failed");
-  }
-  return result.state;
 }
 
 function foundationBuildPlanMaterial(
