@@ -12,6 +12,7 @@ import {
   inspectDurableInitiativeGraph,
   readDurableTask,
   recoverDurableTask,
+  reviseDurableInitiativeGraph,
   readGateEvidenceKinds,
   type DependencyGraph,
   type StartWorkflowTaskRequest,
@@ -28,18 +29,13 @@ const MISSING_NODE_ID = "TASK-14-NODE-MISSING";
 
 test("Core stores an Initiative graph and CLI inspection reports its dependencies and node status", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
+  const writerLease = trackWriterLease(fixture.fileSystem);
 
-  const graphPath = join(
-    fixture.repository,
-    ".sayhi",
-    "tasks",
-    INITIATIVE_ID,
-    "graph.json",
-  );
+  const { graphPath } = fixture;
   assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), fixture.graph);
 
   const inspected = await inspectDurableInitiativeGraph({
-    fileSystem: fixture.fileSystem,
+    fileSystem: writerLease.fileSystem,
     initiativeTaskId: INITIATIVE_ID,
   });
   assert.equal(inspected.ok, true);
@@ -47,6 +43,7 @@ test("Core stores an Initiative graph and CLI inspection reports its dependencie
     return;
   }
   assert.deepEqual(inspected.graph, fixture.graph);
+  assert.equal(writerLease.acquired(), true);
   assert.deepEqual(inspected.nodes, [
     {
       taskId: RECORDED_NODE_ID,
@@ -87,15 +84,301 @@ test("Core stores an Initiative graph and CLI inspection reports its dependencie
   assert.deepEqual(envelope.result?.nodes, inspected.nodes);
 });
 
+test("Core records an approved Initiative graph revision without changing its durable node identities", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const before = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  const event = revisionEvent("CORE-REVISED");
+  const revision = revisedGraph(fixture.graph, event.eventId);
+  const revised = await reviseDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+    expectedVersion: before.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    graph: revision,
+    event,
+  });
+
+  assert.equal(revised.ok, true);
+  if (!revised.ok) {
+    return;
+  }
+  assert.equal(revised.event.type, "initiative_graph_revised");
+  assert.equal(revised.event.expectedGraphVersion, fixture.graph.version);
+  assert.deepEqual(revised.event.initiativeGraph, revision);
+  assert.equal(revised.state.projection.phase, "integrate");
+  assert.deepEqual(
+    revised.event.initiativeGraph.nodes.map((node) => node.taskId),
+    fixture.graph.nodes.map((node) => node.taskId),
+  );
+
+  const { graphPath } = fixture;
+  assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), revision);
+  await rm(graphPath);
+  const recovered = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(recovered.ok, true);
+  assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), revision);
+  await writeFile(graphPath, `${JSON.stringify(fixture.graph)}\n`, "utf8");
+  const stale = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.diagnostics[0]?.code, "initiative_graph.record.stale");
+  }
+  const repaired = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(repaired.ok, true);
+  const inspected = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(inspected.ok, true);
+  if (inspected.ok) {
+    assert.deepEqual(inspected.graph, revision);
+  }
+});
+
+test("Initiative graph revision acquires the shared Writer Lease", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const before = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  const writerLease = trackWriterLease(fixture.fileSystem);
+  const event = revisionEvent("WRITER-LEASE");
+  const revised = await reviseDurableInitiativeGraph({
+    fileSystem: writerLease.fileSystem,
+    taskId: INITIATIVE_ID,
+    expectedVersion: before.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    graph: revisedGraph(fixture.graph, event.eventId),
+    event,
+  });
+
+  assert.equal(writerLease.acquired(), true);
+  assert.equal(revised.ok, true);
+});
+
+test("Initiative graph revision repairs its Projection after a transient graph write failure", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const before = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  const graphRecordPath = `.sayhi/tasks/${INITIATIVE_ID}/graph.json`;
+  let failGraphWrite = true;
+  const faultingFileSystem = new Proxy(fixture.fileSystem, {
+    get(target, property, receiver) {
+      if (property === "writeFile") {
+        return async (path: string, content: string) => {
+          if (path === graphRecordPath && failGraphWrite) {
+            failGraphWrite = false;
+            throw new Error("Injected Initiative graph write failure.");
+          }
+          await target.writeFile(path, content);
+        };
+      }
+      const member = Reflect.get(target, property, receiver);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const event = revisionEvent("RECOVERED-WRITE");
+  const revision = revisedGraph(fixture.graph, event.eventId);
+  const revised = await reviseDurableInitiativeGraph({
+    fileSystem: faultingFileSystem,
+    taskId: INITIATIVE_ID,
+    expectedVersion: before.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    graph: revision,
+    event,
+  });
+
+  assert.equal(revised.ok, true);
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(join(fixture.repository, graphRecordPath), "utf8"),
+    ),
+    revision,
+  );
+  const inspected = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(inspected.ok, true);
+});
+
+test("Core rejects unsafe and stale Initiative graph revisions without replacing the accepted graph", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const before = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  const { graphPath } = fixture;
+  const acceptedGraphText = await readFile(graphPath, "utf8");
+  const cases = [
+    {
+      name: "cycle",
+      graph: {
+        ...revisedGraph(fixture.graph, "EVENT-14-CYCLE"),
+        edges: [
+          ...fixture.graph.edges,
+          {
+            from: MISSING_NODE_ID,
+            to: RECORDED_NODE_ID,
+            type: "blocks" as const,
+            reason: "Would create a cycle.",
+          },
+        ],
+      },
+      expectedGraphVersion: fixture.graph.version,
+      code: "dependency_graph.cycle.detected",
+    },
+    {
+      name: "dangling-edge",
+      graph: {
+        ...revisedGraph(fixture.graph, "EVENT-14-DANGLING"),
+        edges: [
+          {
+            from: RECORDED_NODE_ID,
+            to: "TASK-14-NODE-UNKNOWN",
+            type: "blocks" as const,
+            reason: "References an unknown Build Task.",
+          },
+        ],
+      },
+      expectedGraphVersion: fixture.graph.version,
+      code: "dependency_graph.edge.reference_missing",
+    },
+    {
+      name: "node-identity-rewrite",
+      graph: {
+        ...revisedGraph(fixture.graph, "EVENT-14-REWRITE"),
+        nodes: [fixture.graph.nodes[0]!],
+        edges: [],
+      },
+      expectedGraphVersion: fixture.graph.version,
+      code: "workflow.graph.invalid",
+    },
+    {
+      name: "stale-graph-version",
+      graph: revisedGraph(fixture.graph, "EVENT-14-STALE"),
+      expectedGraphVersion: fixture.graph.version + 1,
+      code: "workflow.version.stale",
+    },
+  ] as const;
+
+  for (const candidate of cases) {
+    const rejected = await reviseDurableInitiativeGraph({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+      expectedVersion: before.state.projection.version,
+      expectedGraphVersion: candidate.expectedGraphVersion,
+      graph: candidate.graph,
+      event: revisionEvent(candidate.name.toUpperCase()),
+    });
+    assert.equal(rejected.ok, false, candidate.name);
+    if (!rejected.ok) {
+      assert.equal(rejected.diagnostics[0]?.code, candidate.code, candidate.name);
+    }
+    assert.equal(await readFile(graphPath, "utf8"), acceptedGraphText, candidate.name);
+    const after = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.deepEqual(after, before, candidate.name);
+  }
+  const duplicateEvent = {
+    ...revisionEvent("DUPLICATE-EVENT"),
+    eventId: fixture.graph.updatedByEvent,
+  };
+  const duplicate = await reviseDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+    expectedVersion: before.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    graph: revisedGraph(fixture.graph, duplicateEvent.eventId),
+    event: duplicateEvent,
+  });
+  assert.equal(duplicate.ok, false);
+  if (!duplicate.ok) {
+    assert.equal(duplicate.diagnostics[0]?.code, "workflow.event.id_conflict");
+  }
+  assert.equal(await readFile(graphPath, "utf8"), acceptedGraphText);
+});
+
+test("CLI submits an approved Initiative graph revision through Core", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const before = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  const event = revisionEvent("CLI-REVISED");
+  const revision = revisedGraph(fixture.graph, event.eventId);
+  await writeFile(
+    join(fixture.repository, "revision.json"),
+    `${JSON.stringify({
+      taskId: INITIATIVE_ID,
+      expectedVersion: before.state.projection.version,
+      expectedGraphVersion: fixture.graph.version,
+      graph: revision,
+      event,
+    })}\n`,
+    "utf8",
+  );
+
+  const revised = await runCli([
+    "graph",
+    "revise",
+    INITIATIVE_ID,
+    "--from",
+    "revision.json",
+    "--apply",
+    "--cwd",
+    fixture.repository,
+    "--json",
+  ]);
+  assert.equal(revised.exitCode, 0);
+  const envelope = JSON.parse(revised.stdout) as CliJsonEnvelope;
+  assert.equal(envelope.operation, "graph.revise");
+  assert.deepEqual(envelope.result?.graph, revision);
+  assert.equal(
+    (envelope.result?.event as { type?: unknown } | undefined)?.type,
+    "initiative_graph_revised",
+  );
+});
+
 test("Task recovery rebuilds a missing Initiative graph record from accepted history", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
-  const graphPath = join(
-    fixture.repository,
-    ".sayhi",
-    "tasks",
-    INITIATIVE_ID,
-    "graph.json",
-  );
+  const { graphPath } = fixture;
   await rm(graphPath);
 
   const recovered = await recoverDurableTask({
@@ -108,13 +391,7 @@ test("Task recovery rebuilds a missing Initiative graph record from accepted his
 
 test("Task recovery replaces a corrupt Initiative graph projection from accepted history", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
-  const graphPath = join(
-    fixture.repository,
-    ".sayhi",
-    "tasks",
-    INITIATIVE_ID,
-    "graph.json",
-  );
+  const { graphPath } = fixture;
   await writeFile(graphPath, "{", "utf8");
 
   const corrupt = await inspectDurableInitiativeGraph({
@@ -143,13 +420,7 @@ test("Task recovery replaces a corrupt Initiative graph projection from accepted
 
 test("Graph inspection rejects invalid and incompatible records without changing Initiative state", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
-  const graphPath = join(
-    fixture.repository,
-    ".sayhi",
-    "tasks",
-    INITIATIVE_ID,
-    "graph.json",
-  );
+  const { graphPath } = fixture;
   const before = await readDurableTask({
     fileSystem: fixture.fileSystem,
     taskId: INITIATIVE_ID,
@@ -278,7 +549,18 @@ async function createInitiativeGraphFixture(t: test.TestContext) {
   state = await advance(fileSystem, state, "integrate", "INTEGRATE", graph);
   assert.equal(state.projection.phase, "integrate");
 
-  return Object.freeze({ repository, fileSystem, graph });
+  return Object.freeze({
+    repository,
+    fileSystem,
+    graph,
+    graphPath: join(
+      repository,
+      ".sayhi",
+      "tasks",
+      INITIATIVE_ID,
+      "graph.json",
+    ),
+  });
 }
 
 async function advance(
@@ -382,5 +664,56 @@ function eventMetadata(suffix: string) {
     reason: `Accept ${suffix}`,
     idempotencyKey: `IDEMPOTENCY-14-${suffix}`,
     occurredAt: "2026-07-15T10:00:00Z",
+  };
+}
+
+function revisionEvent(suffix: string) {
+  return {
+    eventId: `EVENT-14-${suffix}`,
+    actor: {
+      kind: "user" as const,
+      id: "initiative-owner",
+      sessionRef: "initiative-approval-session",
+    },
+    reason: `Approve Initiative graph revision ${suffix}.`,
+    idempotencyKey: `IDEMPOTENCY-14-${suffix}`,
+    occurredAt: "2026-07-15T10:05:00Z",
+  };
+}
+
+function revisedGraph(
+  graph: DependencyGraph,
+  updatedByEvent: string,
+): DependencyGraph {
+  const nodes = graph.nodes.map((node) =>
+    node.taskId === MISSING_NODE_ID
+      ? { ...node, priority: node.priority - 1 }
+      : { ...node },
+  );
+  return {
+    ...graph,
+    version: graph.version + 1,
+    nodes,
+    edges: graph.edges.map((edge) => ({ ...edge })),
+    updatedByEvent,
+  };
+}
+
+function trackWriterLease(fileSystem: NodeManagedProjectFileSystem) {
+  let acquired = false;
+  return {
+    fileSystem: new Proxy(fileSystem, {
+      get(target, property, receiver) {
+        if (property === "withWriterMutationLock") {
+          return async <Result>(operation: () => Promise<Result>): Promise<Result> => {
+            acquired = true;
+            return target.withWriterMutationLock(operation);
+          };
+        }
+        const member = Reflect.get(target, property, receiver);
+        return typeof member === "function" ? member.bind(target) : member;
+      },
+    }),
+    acquired: () => acquired,
   };
 }

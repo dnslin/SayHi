@@ -149,10 +149,10 @@ sayhi graph ready <initiative-id>
 sayhi graph add-node <initiative-id> <task-id>
 sayhi graph add-edge <initiative-id> <from> <to> --type <type>
 sayhi graph remove-edge <initiative-id> <edge-id>
-sayhi graph revise <initiative-id> --plan|--apply
+sayhi graph revise <initiative-id> --from <request.json> --plan|--apply
 ```
 
-Graph mutation after Plan requires an accepted revision reason and renewed approval. `ready` is a derived read operation.
+`revise` reads a candidate graph, expected Task and graph versions, and user approval Event from the request. `--plan` validates the revision without persistence; `--apply` appends the accepted revision Event before atomically replacing the graph and Task Projections. If a transient Projection write is interrupted, Core immediately rebuilds it from accepted Event history; a later `recover` can rebuild a missing or lagging Projection. A revision after Plan preserves existing Build Task nodes, requires a reason and renewed user approval, and rejects stale versions.
 
 ### 4.6 Workspace and Journal
 

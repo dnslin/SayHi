@@ -28,6 +28,7 @@ import {
   transitionWorkflow,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  reviseInitiativeGraph,
 } from "./workflow.js";
 import {
   advanceDurableTask,
@@ -53,6 +54,7 @@ import {
   decideDurableBuildPlan,
   recordDurableBuildPlan,
   inspectDurableInitiativeGraph,
+  reviseDurableInitiativeGraph,
   dispatchDurablePhaseExecution,
   resumeDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
@@ -263,6 +265,7 @@ export {
   recordContextManifestChange,
   recordBuildPlanChange,
   recordPhaseExecutionResult,
+  reviseInitiativeGraph,
 } from "./workflow.js";
 export type {
   DependencyGraph,
@@ -278,6 +281,8 @@ export type {
   BaselineAdoptedEvent,
   BuildPlanChange,
   BuildPlanChangedEvent,
+  InitiativeGraphRevisedEvent,
+  InitiativeGraphRevision,
   ContextManifestChange,
   ContextManifestChangedEvent,
   EscalateQuickToBuildRequest,
@@ -286,6 +291,8 @@ export type {
   RecordContextManifestChangeResult,
   RecordBuildPlanChangeRequest,
   RecordBuildPlanChangeResult,
+  ReviseInitiativeGraphRequest,
+  ReviseInitiativeGraphResult,
   BaselineAdoptedPath,
   RouteDefinition,
   RouteEscalatedEvent,
@@ -336,6 +343,7 @@ export {
   freezeDurableContextManifest,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  reviseDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
   withBoundDurableTaskWriter,
@@ -353,6 +361,7 @@ export type {
   AdvanceDurableTaskRequest,
   AddDurableContextManifestEntryRequest,
   AddDurableContextManifestEntryResult,
+  InitiativeGraphFileSystem,
   ContextManifestFileSystem,
   InspectDurableContextManifestRequest,
   InspectDurableContextManifestResult,
@@ -369,6 +378,8 @@ export type {
   AdoptDurableTaskBaselineRequest,
   AdoptDurableTaskBaselineResult,
   AdvanceDurableTaskResult,
+  ReviseDurableInitiativeGraphRequest,
+  ReviseDurableInitiativeGraphResult,
   EscalateDurableQuickToBuildRequest,
   EscalateDurableQuickToBuildResult,
   CreateDurableTaskRequest,
@@ -453,6 +464,7 @@ export interface CoreContract {
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly recordBuildPlanChange: typeof recordBuildPlanChange;
+  readonly reviseInitiativeGraph: typeof reviseInitiativeGraph;
   readonly recordPhaseExecutionDispatch: typeof recordPhaseExecutionDispatch;
   readonly recordPhaseExecutionResult: typeof recordPhaseExecutionResult;
   readonly createDurableTask: typeof createDurableTask;
@@ -476,6 +488,7 @@ export interface CoreContract {
   readonly withBoundDurableTaskWriter: typeof withBoundDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
+  readonly reviseDurableInitiativeGraph: typeof reviseDurableInitiativeGraph;
   readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
   readonly recordDurableBuildPlan: typeof recordDurableBuildPlan;
   readonly dispatchDurablePhaseExecution: typeof dispatchDurablePhaseExecution;
@@ -512,6 +525,7 @@ export const coreContract: CoreContract = Object.freeze({
   adoptWorkflowBaseline,
   recordContextManifestChange,
   recordBuildPlanChange,
+  reviseInitiativeGraph,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
   createDurableTask,
@@ -535,6 +549,7 @@ export const coreContract: CoreContract = Object.freeze({
   withBoundDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  reviseDurableInitiativeGraph,
   decideDurableBuildPlan,
   recordDurableBuildPlan,
   dispatchDurablePhaseExecution,
