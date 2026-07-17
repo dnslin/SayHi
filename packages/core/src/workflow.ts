@@ -257,6 +257,19 @@ export interface ContextManifestChangedEvent extends WorkflowEventBase {
   readonly change: ContextManifestChange;
 }
 
+export interface PhaseExecutionDispatchedEvent extends WorkflowEventBase {
+  readonly type: "phase_execution_dispatched";
+  readonly from: WorkflowPosition;
+  readonly planIdentity: ContractIdentity;
+  readonly binding: unknown;
+}
+
+export interface PhaseExecutionResultAcceptedEvent extends WorkflowEventBase {
+  readonly type: "phase_execution_result_accepted";
+  readonly from: WorkflowPosition;
+  readonly result: unknown;
+}
+
 
 
 export type WorkflowEvent =
@@ -265,7 +278,9 @@ export type WorkflowEvent =
   | RouteEscalatedEvent
   | BaselineAdoptedEvent
   | ContextManifestChangedEvent
-  | BuildPlanChangedEvent;
+  | BuildPlanChangedEvent
+  | PhaseExecutionDispatchedEvent
+  | PhaseExecutionResultAcceptedEvent;
 
 export interface WorkflowState {
   readonly events: readonly WorkflowEvent[];
@@ -325,6 +340,23 @@ export interface RecordBuildPlanChangeRequest {
   readonly requirementsIdentity: ContractIdentity;
   readonly contextManifestPath: string;
   readonly contextManifestIdentity: ContractIdentity;
+  readonly event: WorkflowEventMetadata;
+}
+
+export interface RecordPhaseExecutionDispatchRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly planIdentity: ContractIdentity;
+  readonly binding: unknown;
+  readonly event: WorkflowEventMetadata;
+}
+
+export interface RecordPhaseExecutionResultRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly result: unknown;
   readonly event: WorkflowEventMetadata;
 }
 
@@ -428,6 +460,34 @@ export type RecordBuildPlanChangeResult =
       contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
       state: WorkflowState;
       event: BuildPlanChangedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+
+export type RecordPhaseExecutionDispatchResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: PhaseExecutionDispatchedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+
+export type RecordPhaseExecutionResultResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: PhaseExecutionResultAcceptedEvent;
     }>
   | Readonly<{
       ok: false;
@@ -1069,6 +1129,172 @@ export function recordBuildPlanChange(
 }
 
 
+export function recordPhaseExecutionDispatch(
+  state: WorkflowState,
+  request: RecordPhaseExecutionDispatchRequest,
+): RecordPhaseExecutionDispatchResult {
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return phaseExecutionDispatchFailure(state, eventDiagnostic);
+  }
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "phase_execution_dispatched" &&
+      matchesPhaseExecutionDispatchIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return phaseExecutionDispatchFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Phase execution dispatch material.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+  const requestDiagnostic = validatePhaseExecutionDispatchRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return phaseExecutionDispatchFailure(state, requestDiagnostic);
+  }
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "phase_execution_dispatched" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    planIdentity: request.planIdentity,
+    binding: copyExecutionPayload(request.binding),
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectPhaseExecutionEvent(state.projection, event);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: freezeState([...state.events, event], projection),
+    event,
+  });
+}
+
+export function recordPhaseExecutionResult(
+  state: WorkflowState,
+  request: RecordPhaseExecutionResultRequest,
+): RecordPhaseExecutionResultResult {
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return phaseExecutionResultFailure(state, eventDiagnostic);
+  }
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "phase_execution_result_accepted" &&
+      matchesPhaseExecutionResultIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return phaseExecutionResultFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Phase execution result material.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+  const requestDiagnostic = validatePhaseExecutionResultRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return phaseExecutionResultFailure(state, requestDiagnostic);
+  }
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "phase_execution_result_accepted" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    result: copyExecutionPayload(request.result),
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectPhaseExecutionEvent(state.projection, event);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: freezeState([...state.events, event], projection),
+    event,
+  });
+}
+
+
 export function replayWorkflowEvents(
   events: readonly unknown[],
 ): ReplayWorkflowEventsResult {
@@ -1306,6 +1532,49 @@ export function replayWorkflowEvents(
       continue;
     }
 
+
+    if (projection !== null && sourceEvent.type === "phase_execution_dispatched") {
+      if (
+        !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
+        !isUnknownRecord(sourceEvent.binding) ||
+        sourceEvent.planIdentity !== approvedBuildPlanIdentity(acceptedEvents)
+      ) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Phase execution dispatch is not bound to the active Build, approved Plan, and current Task position.",
+            "Restore the accepted Phase dispatch Event or dispatch again from the current approved Build state.",
+          ),
+        );
+      }
+      const event = copyPhaseExecutionDispatchedEvent(sourceEvent);
+      projection = projectPhaseExecutionEvent(projection, event);
+      acceptedEvents.push(event);
+      continue;
+    }
+    if (
+      projection !== null &&
+      sourceEvent.type === "phase_execution_result_accepted"
+    ) {
+      if (
+        !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
+        !isUnknownRecord(sourceEvent.result)
+      ) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Phase execution result does not preserve the active Build position.",
+            "Restore the accepted Agent result Event or record the result through Core.",
+          ),
+        );
+      }
+      const event = copyPhaseExecutionResultAcceptedEvent(sourceEvent);
+      projection = projectPhaseExecutionEvent(projection, event);
+      acceptedEvents.push(event);
+      continue;
+    }
 
     if (
       projection === null ||
@@ -1969,6 +2238,158 @@ function validateBuildPlanChangeRequest(
 }
 
 
+function validatePhaseExecutionDispatchRequest(
+  state: WorkflowState,
+  request: RecordPhaseExecutionDispatchRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  const common = validatePhaseExecutionRequest(
+    state,
+    request.contractVersion,
+    request.taskId,
+    request.expectedVersion,
+    request.event,
+  );
+  if (common !== null) {
+    return common;
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (!isContractIdentity(request.planIdentity)) {
+    return invalidRequest(
+      "$.planIdentity",
+      "Phase execution dispatch requires an approved Build Plan identity.",
+    );
+  }
+  if (!isUnknownRecord(request.binding)) {
+    return invalidRequest(
+      "$.binding",
+      "Phase execution dispatch requires a readable immutable payload.",
+    );
+  }
+  if (approvedBuildPlanIdentity(state.events) !== request.planIdentity) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.planIdentity",
+      "Phase execution dispatch requires the exact currently approved Build Plan.",
+      "Record and approve the current Build Plan before dispatching the Phase Agent.",
+    );
+  }
+  return null;
+}
+
+function validatePhaseExecutionResultRequest(
+  state: WorkflowState,
+  request: RecordPhaseExecutionResultRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  const common = validatePhaseExecutionRequest(
+    state,
+    request.contractVersion,
+    request.taskId,
+    request.expectedVersion,
+    request.event,
+  );
+  if (common !== null) {
+    return common;
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (!isUnknownRecord(request.result)) {
+    return invalidRequest(
+      "$.result",
+      "Phase execution result requires a readable immutable payload.",
+    );
+  }
+  return null;
+}
+
+function validatePhaseExecutionRequest(
+  state: WorkflowState,
+  contractVersion: number,
+  taskId: string,
+  expectedVersion: number,
+  event: WorkflowEventMetadata,
+): WorkflowDiagnostic | null {
+  if (contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Phase execution Task id does not match the current Projection.",
+      "Reload the intended Task and submit its stable id.",
+    );
+  }
+  if (expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Task before recording Phase execution state.",
+    );
+  }
+  if (
+    state.projection.route !== "build" ||
+    state.projection.lifecycle !== "active"
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.state",
+      "Phase execution persistence requires an active Build.",
+      "Resume the active Build after its required Plan approval before persisting Phase execution state.",
+    );
+  }
+  return validateEventMetadata(event, "$.event");
+}
+
+
+function approvedBuildPlanIdentity(
+  events: readonly WorkflowEvent[],
+): ContractIdentity | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type !== "workflow_transitioned" ||
+      event.route !== "build" ||
+      event.from.phase !== "plan" ||
+      event.to.phase !== "implement"
+    ) {
+      continue;
+    }
+    const reference = event.gates
+      .find((gate) => gate.gate === "plan")
+      ?.evidence.find((evidence) => evidence.kind === "human-approval")?.reference;
+    if (
+      reference !== undefined &&
+      /^plans\/[0-9a-f]{64}\.json$/iu.test(reference)
+    ) {
+      return `sha256:${reference.slice("plans/".length, -".json".length)}`;
+    }
+  }
+  return undefined;
+}
+
+
+
 function validateInitiativeGraphTransition(
   projection: TaskProjection,
   events: readonly WorkflowEvent[],
@@ -2176,6 +2597,54 @@ function matchesBuildPlanChangeIntent(
   );
 }
 
+function matchesPhaseExecutionDispatchIntent(
+  event: PhaseExecutionDispatchedEvent,
+  request: RecordPhaseExecutionDispatchRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    event.planIdentity === request.planIdentity &&
+    stableJson(event.binding) === stableJson(request.binding) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
+
+function matchesPhaseExecutionResultIntent(
+  event: PhaseExecutionResultAcceptedEvent,
+  request: RecordPhaseExecutionResultRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    stableJson(event.result) === stableJson(request.result) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
+
+function isPhaseExecutionEventEnvelope(
+  event: PhaseExecutionDispatchedEvent | PhaseExecutionResultAcceptedEvent,
+  projection: TaskProjection,
+): boolean {
+  return (
+    event.taskId === projection.id &&
+    event.route === "build" &&
+    projection.route === "build" &&
+    projection.lifecycle === "active" &&
+    positionsEqual(event.from, positionOf(projection)) &&
+    positionsEqual(event.to, positionOf(projection)) &&
+    event.gates.length === 0 &&
+    event.initiativeGraph === null &&
+    stableJson(event.blockers) === stableJson(projection.blockers)
+  );
+}
+
 type BuildPlanMaterial = Pick<
   BuildPlanChangedEvent,
   | "planIdentity"
@@ -2321,7 +2790,11 @@ function validateReplayEvent(
             ? !isContextManifestChangedEventPayload(event)
             : event.type === "build_plan_changed"
               ? !isBuildPlanChangedEventPayload(event)
-              : true
+              : event.type === "phase_execution_dispatched"
+                ? !isPhaseExecutionDispatchedEventPayload(event)
+                : event.type === "phase_execution_result_accepted"
+                  ? !isPhaseExecutionResultAcceptedEventPayload(event)
+                  : true
   ) {
     return diagnostic(
       "workflow.event.invalid",
@@ -2427,6 +2900,27 @@ function isBuildPlanChangedEventPayload(
     isContractIdentity(event.requirementsIdentity) &&
     event.contextManifestPath === "context/implement.jsonl" &&
     isContractIdentity(event.contextManifestIdentity)
+  );
+}
+
+function isPhaseExecutionDispatchedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    isContractIdentity(event.planIdentity) &&
+    isUnknownRecord(event.binding)
+  );
+}
+
+function isPhaseExecutionResultAcceptedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    isUnknownRecord(event.result)
   );
 }
 
@@ -2831,6 +3325,18 @@ function projectBuildPlanChangedEvent(
   });
 }
 
+function projectPhaseExecutionEvent(
+  projection: TaskProjection,
+  event: PhaseExecutionDispatchedEvent | PhaseExecutionResultAcceptedEvent,
+): TaskProjection {
+  return Object.freeze({
+    ...projection,
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    updatedAt: event.occurredAt,
+  });
+}
+
 
 
 function copyTaskDefinition(task: WorkflowTaskDefinition): WorkflowTaskDefinition {
@@ -2939,6 +3445,51 @@ function copyBuildPlanChangedEvent(
     initiativeGraph: null,
   });
 }
+
+function copyPhaseExecutionDispatchedEvent(
+  event: PhaseExecutionDispatchedEvent,
+): PhaseExecutionDispatchedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph: null,
+    binding: copyExecutionPayload(event.binding),
+  });
+}
+
+function copyPhaseExecutionResultAcceptedEvent(
+  event: PhaseExecutionResultAcceptedEvent,
+): PhaseExecutionResultAcceptedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph: null,
+    result: copyExecutionPayload(event.result),
+  });
+}
+
+function copyExecutionPayload(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map(copyExecutionPayload));
+  }
+  if (!isUnknownRecord(value)) {
+    return value;
+  }
+  const copy: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    copy[key] = copyExecutionPayload(item);
+  }
+  return Object.freeze(copy);
+}
+
 
 
 
@@ -3051,6 +3602,8 @@ function digestEvent(
     | Omit<BaselineAdoptedEvent, "chainDigest">
     | Omit<ContextManifestChangedEvent, "chainDigest">
     | Omit<BuildPlanChangedEvent, "chainDigest">
+    | Omit<PhaseExecutionDispatchedEvent, "chainDigest">
+    | Omit<PhaseExecutionResultAcceptedEvent, "chainDigest">
     | WorkflowEvent,
 ): string {
   const payload: Record<string, unknown> = {
@@ -3088,6 +3641,11 @@ function digestEvent(
     payload.requirementsIdentity = event.requirementsIdentity;
     payload.contextManifestPath = event.contextManifestPath;
     payload.contextManifestIdentity = event.contextManifestIdentity;
+  } else if (event.type === "phase_execution_dispatched") {
+    payload.planIdentity = event.planIdentity;
+    payload.binding = event.binding;
+  } else if (event.type === "phase_execution_result_accepted") {
+    payload.result = event.result;
   }
   return hashCanonicalJson(payload);
 }
@@ -3175,6 +3733,30 @@ function buildPlanChangeFailure(
   state: WorkflowState,
   diagnosticValue: WorkflowDiagnostic,
 ): RecordBuildPlanChangeResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+
+function phaseExecutionDispatchFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): RecordPhaseExecutionDispatchResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+
+function phaseExecutionResultFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): RecordPhaseExecutionResultResult {
   return Object.freeze({
     ok: false,
     contractVersion: WORKFLOW_CONTRACT_VERSION,

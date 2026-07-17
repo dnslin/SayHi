@@ -368,6 +368,20 @@ test("Core rejects changed Agent and missing or changed Skill identities", () =>
           "Restore the locked Skill or regenerate the Agent Capability Contract.",
       },
     },
+    {
+      request: {
+        agentContract,
+        skills: [...skills, { ...skills[0], name: "undeclared" }],
+      },
+      diagnostic: {
+        code: "execution.skill_invalid",
+        path: "$.skills",
+        message:
+          "Skill materials must exactly match the Phase Agent's declared Skills.",
+        remediation:
+          "Provide one locked material record for each declared Skill and no undeclared Skills.",
+      },
+    },
   ] as const;
 
   for (const identityCase of cases) {

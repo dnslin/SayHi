@@ -17,6 +17,7 @@ import {
 import {
   RECORD_CONTRACT_VERSION,
   validateContractRecord,
+  type AgentResultRecord,
   type BaselineRecord,
 } from "./record-contracts.js";
 import type {
@@ -33,6 +34,17 @@ import {
   type ContextTrustTier,
 } from "./context-manifest.js";
 import {
+  authorizePhaseExecution,
+  bindPhaseExecution,
+  parsePhaseExecutionBinding,
+  parsePhaseExecutionResult,
+  phaseExecutionResultMatchesBinding,
+  type BindPhaseExecutionRequest,
+  type PhaseExecutionBinding,
+  type PhaseExecutionDiagnosticCode,
+  type PhaseExecutionMaterials,
+} from "./execution.js";
+import {
   approveSpec,
   isApprovedSpec,
   readApprovedSpecs,
@@ -47,11 +59,15 @@ import {
   recordBuildPlanChange,
   transitionWorkflow,
   escalateQuickToBuild,
+  recordPhaseExecutionDispatch,
+  recordPhaseExecutionResult,
   type BaselineAdoptedEvent,
   type StartWorkflowTaskRequest,
   type ContextManifestChangedEvent,
   type BuildPlanChangedEvent,
   type EscalateQuickToBuildRequest,
+  type PhaseExecutionDispatchedEvent,
+  type PhaseExecutionResultAcceptedEvent,
   type TaskCreatedEvent,
   type DependencyGraph,
   type DependencyGraphEdge,
@@ -120,6 +136,7 @@ export interface TaskBaselineFileSystem extends TaskLifecycleFileSystem {
 
 export type TaskLifecycleDiagnosticCode =
   | WorkflowDiagnosticCode
+  | PhaseExecutionDiagnosticCode
   | "task_lifecycle.task_id.invalid"
   | "task_lifecycle.store.invalid"
   | "task_lifecycle.task.exists"
@@ -153,7 +170,11 @@ export type TaskLifecycleDiagnosticCode =
   | "build_plan.phase.invalid"
   | "build_plan.approval_required"
   | "build_plan.context_stale"
-  | "build_plan.rejected";
+  | "build_plan.rejected"
+  | "phase_execution.binding.invalid"
+  | "phase_execution.phase.invalid"
+  | "phase_execution.missing"
+  | "phase_execution.result.invalid";
 
 export interface TaskLifecycleDiagnostic {
   readonly code: TaskLifecycleDiagnosticCode;
@@ -352,6 +373,26 @@ export interface DecideDurableBuildPlanRequest {
   readonly event: WorkflowEventMetadata;
 }
 
+export interface DispatchDurablePhaseExecutionRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly planIdentity: string;
+  readonly execution: BindPhaseExecutionRequest;
+  readonly event: WorkflowEventMetadata;
+}
+
+export interface ResumeDurablePhaseExecutionRequest {
+  readonly fileSystem: ContextManifestFileSystem;
+  readonly taskId: string;
+  readonly materials: PhaseExecutionMaterials;
+}
+
+export interface RecordDurablePhaseExecutionResultRequest {
+  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly taskId: string;
+  readonly result: AgentResultRecord;
+  readonly event: WorkflowEventMetadata;
+}
+
 
 
 
@@ -479,6 +520,48 @@ export type DecideDurableBuildPlanResult =
       state: WorkflowState;
       plan: DurableBuildPlan;
       event: BuildPlanChangedEvent;
+      appended: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+export type DispatchDurablePhaseExecutionResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      plan: DurableBuildPlan;
+      binding: PhaseExecutionBinding;
+      event: PhaseExecutionDispatchedEvent;
+      appended: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+export type ResumeDurablePhaseExecutionResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      status: "ready";
+      state: WorkflowState;
+      plan: DurableBuildPlan;
+      binding: PhaseExecutionBinding;
+    }>
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      status: "completed";
+      state: WorkflowState;
+      binding: PhaseExecutionBinding;
+      result: AgentResultRecord;
+    }>
+  | TaskLifecycleFailure;
+
+export type RecordDurablePhaseExecutionResultResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: PhaseExecutionResultAcceptedEvent;
+      result: AgentResultRecord;
       appended: boolean;
     }>
   | TaskLifecycleFailure;
@@ -1029,6 +1112,54 @@ export async function decideDurableBuildPlan(
   try {
     return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
       decideDurableBuildPlanLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+
+export async function dispatchDurablePhaseExecution(
+  request: DispatchDurablePhaseExecutionRequest,
+): Promise<DispatchDurablePhaseExecutionResult> {
+  const paths = taskPaths(request.execution?.dispatch?.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      dispatchDurablePhaseExecutionLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+
+export async function resumeDurablePhaseExecution(
+  request: ResumeDurablePhaseExecutionRequest,
+): Promise<ResumeDurablePhaseExecutionResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      resumeDurablePhaseExecutionLocked(request, paths),
+    );
+  } catch {
+    return ioFailure(paths.taskDirectory);
+  }
+}
+
+export async function recordDurablePhaseExecutionResult(
+  request: RecordDurablePhaseExecutionResultRequest,
+): Promise<RecordDurablePhaseExecutionResultResult> {
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  try {
+    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      recordDurablePhaseExecutionResultLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -2001,6 +2132,348 @@ async function persistContextManifestChange(
   } catch {
     return ioFailure(request.manifestPath);
   }
+}
+
+
+async function dispatchDurablePhaseExecutionLocked(
+  request: DispatchDurablePhaseExecutionRequest,
+  paths: TaskPaths,
+): Promise<DispatchDurablePhaseExecutionResult> {
+  const dispatch = request.execution.dispatch;
+  const loaded = await loadTask(request.fileSystem, dispatch.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const plan = await loadBuildPlan(
+    request.fileSystem,
+    paths,
+    dispatch.taskId,
+    request.planIdentity,
+  );
+  if (!plan.ok) {
+    return plan;
+  }
+  const bound = bindPhaseExecution(request.execution);
+  if (!bound.ok) {
+    return phaseExecutionFailure(bound.diagnostics);
+  }
+  if (plan.plan.contextManifestIdentity !== bound.binding.contextManifestIdentity) {
+    return buildPlanInvalid(
+      "$.execution.dispatch.contextManifestIdentity",
+      "Phase Context Manifest does not match the approved Build Plan.",
+      "Restore the frozen Plan Manifest or record and approve a new Build Plan before dispatch.",
+    );
+  }
+  if (bound.binding.phase !== loaded.state.projection.phase) {
+    return phaseExecutionPhaseInvalid(loaded.state.projection.phase);
+  }
+  const recorded = recordPhaseExecutionDispatch(loaded.state, {
+    contractVersion: 1,
+    taskId: dispatch.taskId,
+    expectedVersion: dispatch.expectedTaskVersion,
+    planIdentity: plan.plan.identity,
+    binding: bound.binding,
+    event: request.event,
+  });
+  if (!recorded.ok) {
+    return failure(recorded.diagnostics);
+  }
+  const appended = recorded.state.events.length > loaded.state.events.length;
+  const persisted = await persistPhaseExecutionEvent(
+    request.fileSystem,
+    loaded.eventsPath,
+    loaded.projectionPath,
+    recorded.state,
+    recorded.event,
+    appended,
+  );
+  if (persisted !== null) {
+    return persisted;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: recorded.state,
+    plan: plan.plan,
+    binding: bound.binding,
+    event: recorded.event,
+    appended,
+  });
+}
+
+async function resumeDurablePhaseExecutionLocked(
+  request: ResumeDurablePhaseExecutionRequest,
+  paths: TaskPaths,
+): Promise<ResumeDurablePhaseExecutionResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const dispatched = latestPhaseExecutionDispatch(
+    loaded.state.events,
+    loaded.state.projection.phase,
+  );
+  if (dispatched === undefined) {
+    return phaseExecutionMissing(loaded.state.projection.phase);
+  }
+  const binding = parsePhaseExecutionBinding(dispatched.binding);
+  if (binding === null) {
+    return phaseExecutionBindingInvalid();
+  }
+  const acceptedResult = latestPhaseExecutionResult(
+    loaded.state.events,
+    binding.dispatchId,
+    loaded.state.projection.phase,
+  );
+  if (acceptedResult !== undefined) {
+    const validated = validatePhaseExecutionResult(
+      acceptedResult.result,
+      binding,
+      "Accepted Phase execution result",
+    );
+    if (!validated.ok) {
+      return validated;
+    }
+    const result = validated.result;
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      status: "completed",
+      state: loaded.state,
+      binding,
+      result,
+    });
+  }
+  const plan = await loadBuildPlan(
+    request.fileSystem,
+    paths,
+    request.taskId,
+    dispatched.planIdentity,
+  );
+  if (!plan.ok) {
+    return plan;
+  }
+  const authorized = authorizePhaseExecution({
+    contractVersion: 1,
+    binding,
+    ...request.materials,
+    capability: { kind: "repository", access: "read" },
+  });
+  if (!authorized.ok) {
+    return phaseExecutionFailure(authorized.diagnostics);
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    status: "ready",
+    state: loaded.state,
+    plan: plan.plan,
+    binding,
+  });
+}
+
+async function recordDurablePhaseExecutionResultLocked(
+  request: RecordDurablePhaseExecutionResultRequest,
+  paths: TaskPaths,
+): Promise<RecordDurablePhaseExecutionResultResult> {
+  const loaded = await loadTask(request.fileSystem, request.taskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const dispatchId = phaseExecutionDispatchId(request.result);
+  if (dispatchId === undefined) {
+    return phaseExecutionResultInvalid("Phase execution result is invalid.");
+  }
+  const dispatched = phaseExecutionDispatchById(
+    loaded.state.events,
+    dispatchId,
+    loaded.state.projection.phase,
+  );
+  if (dispatched === undefined) {
+    return phaseExecutionResultInvalid(
+      "Phase execution result has no durable dispatch binding.",
+    );
+  }
+  const validated = validatePhaseExecutionResult(
+    request.result,
+    dispatched.binding,
+    "Phase execution result",
+  );
+  if (!validated.ok) {
+    return validated;
+  }
+  const result = validated.result;
+  const existingResult = latestPhaseExecutionResult(
+    loaded.state.events,
+    result.dispatchId,
+    loaded.state.projection.phase,
+  );
+  if (
+    existingResult !== undefined &&
+    existingResult.idempotencyKey !== request.event.idempotencyKey
+  ) {
+    return phaseExecutionResultInvalid(
+      "Phase execution result was already accepted for this dispatch.",
+    );
+  }
+  const recorded = recordPhaseExecutionResult(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: loaded.state.projection.version,
+    result,
+    event: request.event,
+  });
+  if (!recorded.ok) {
+    return failure(recorded.diagnostics);
+  }
+  const appended = recorded.state.events.length > loaded.state.events.length;
+  const persisted = await persistPhaseExecutionEvent(
+    request.fileSystem,
+    loaded.eventsPath,
+    loaded.projectionPath,
+    recorded.state,
+    recorded.event,
+    appended,
+  );
+  if (persisted !== null) {
+    return persisted;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: recorded.state,
+    event: recorded.event,
+    result,
+    appended,
+  });
+}
+
+function validatePhaseExecutionResult(
+  value: unknown,
+  binding: PhaseExecutionBinding,
+  label: string,
+): Readonly<{ ok: true; result: AgentResultRecord }> | TaskLifecycleFailure {
+  const result = parsePhaseExecutionResult(value);
+  if (result === null) {
+    return phaseExecutionResultInvalid(`${label} is invalid.`);
+  }
+  if (!phaseExecutionResultMatchesBinding(result, binding)) {
+    return phaseExecutionResultInvalid(
+      `${label} does not match its durable dispatch binding.`,
+    );
+  }
+  return Object.freeze({ ok: true, result });
+}
+
+async function persistPhaseExecutionEvent(
+  fileSystem: TaskLifecycleFileSystem,
+  eventsPath: string,
+  projectionPath: string,
+  state: WorkflowState,
+  event: PhaseExecutionDispatchedEvent | PhaseExecutionResultAcceptedEvent,
+  appended: boolean,
+): Promise<TaskLifecycleFailure | null> {
+  if (!appended) {
+    return null;
+  }
+  let activePath = eventsPath;
+  try {
+    await fileSystem.appendFile(eventsPath, serializeEvent(event));
+    activePath = projectionPath;
+    await writeProjectionIfChanged(fileSystem, projectionPath, state.projection);
+    return null;
+  } catch {
+    return ioFailure(activePath);
+  }
+}
+
+function currentPhaseEventStart(
+  events: readonly WorkflowEvent[],
+  phase: WorkflowPhase,
+): number {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "workflow_transitioned" &&
+      event.from.phase !== phase &&
+      event.to.phase === phase
+    ) {
+      return index + 1;
+    }
+  }
+  return 0;
+}
+
+function latestPhaseExecutionDispatch(
+  events: readonly WorkflowEvent[],
+  phase: WorkflowPhase,
+): PhaseExecutionDispatchedEvent | undefined {
+  const start = currentPhaseEventStart(events, phase);
+  for (let index = events.length - 1; index >= start; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "phase_execution_dispatched" &&
+      parsePhaseExecutionBinding(event.binding)?.phase === phase
+    ) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function latestPhaseExecutionResult(
+  events: readonly WorkflowEvent[],
+  dispatchId: string,
+  phase: WorkflowPhase,
+): PhaseExecutionResultAcceptedEvent | undefined {
+  const start = currentPhaseEventStart(events, phase);
+  for (let index = events.length - 1; index >= start; index -= 1) {
+    const event = events[index]!;
+    if (
+      event.type === "phase_execution_result_accepted" &&
+      phaseExecutionDispatchId(event.result) === dispatchId
+    ) {
+      return event;
+    }
+  }
+  return undefined;
+}
+
+function phaseExecutionDispatchById(
+  events: readonly WorkflowEvent[],
+  dispatchId: string,
+  phase: WorkflowPhase,
+): Readonly<{
+  event: PhaseExecutionDispatchedEvent;
+  binding: PhaseExecutionBinding;
+}> | undefined {
+  const start = currentPhaseEventStart(events, phase);
+  for (let index = events.length - 1; index >= start; index -= 1) {
+    const event = events[index]!;
+    if (event.type !== "phase_execution_dispatched") {
+      continue;
+    }
+    const binding = parsePhaseExecutionBinding(event.binding);
+    if (binding?.dispatchId === dispatchId && binding.phase === phase) {
+      return Object.freeze({ event, binding });
+    }
+  }
+  return undefined;
+}
+
+function phaseExecutionDispatchId(value: unknown): string | undefined {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    !("dispatchId" in value)
+  ) {
+    return undefined;
+  }
+  const dispatchId = value.dispatchId;
+  return typeof dispatchId === "string" && dispatchId.length > 0
+    ? dispatchId
+    : undefined;
 }
 
 
@@ -4030,6 +4503,65 @@ function writerScopeFailure(path: string): TaskLifecycleFailure {
       path,
       "Task Writer attempted to modify a path outside the declared Task scope.",
       "Restrict the mutation to a declared scope path or revise scope before adopting a new Baseline.",
+    ),
+  ]);
+}
+
+function phaseExecutionFailure(
+  diagnostics: readonly {
+    code: PhaseExecutionDiagnosticCode;
+    path: string;
+    message: string;
+    remediation: string;
+  }[],
+): TaskLifecycleFailure {
+  return failure(
+    diagnostics.map((item) =>
+      diagnostic(item.code, item.path, item.message, item.remediation),
+    ),
+  );
+}
+
+function phaseExecutionBindingInvalid(): TaskLifecycleFailure {
+  return failure([
+    diagnostic(
+      "phase_execution.binding.invalid",
+      "$.binding",
+      "The durable Phase execution binding is invalid.",
+      "Restore the accepted dispatch Event or dispatch the current Phase Agent again.",
+    ),
+  ]);
+}
+
+function phaseExecutionPhaseInvalid(phase: WorkflowPhase): TaskLifecycleFailure {
+  return failure([
+    diagnostic(
+      "phase_execution.phase.invalid",
+      "$.execution.dispatch.phase",
+      "Phase execution dispatch does not match the active Workflow Phase.",
+      `Dispatch the ${phase} Phase Agent for the current Build position.`,
+    ),
+  ]);
+}
+
+function phaseExecutionMissing(phase: WorkflowPhase): TaskLifecycleFailure {
+  return failure([
+    diagnostic(
+      "phase_execution.missing",
+      "$.phase",
+      `The active ${phase} Phase has no durable execution dispatch to resume.`,
+      "Dispatch the current Phase Agent through Core before resuming it in another session.",
+    ),
+  ]);
+}
+
+function phaseExecutionResultInvalid(message: string): TaskLifecycleFailure {
+  return failure([
+    diagnostic(
+      "phase_execution.result.invalid",
+      "$.result",
+      message,
+      "Provide the schema-valid Agent result that matches the accepted Phase dispatch.",
     ),
   ]);
 }
