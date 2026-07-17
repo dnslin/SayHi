@@ -329,7 +329,7 @@ Every Agent result MUST echo these binding values and include a schema-valid `ou
 
 For an active Build Phase, Core accepts a `phase_execution_dispatched` Workflow Event that binds the exact approved Plan identity to the complete dispatch binding, including Context Manifest, Phase Agent Capability Contract, and ordered locked Skill identities. Core accepts at most one result for that dispatch as a `phase_execution_result_accepted` Event.
 
-On resume, Core MUST load the bound Plan evidence and revalidate the live Context Manifest, Capability Contract, and Skill materials against the durable binding before work continues. A changed or missing Plan, Context, Agent capability, or Skill blocks the Phase with its actionable diagnostic. When a result is already accepted, resume returns that result and MUST NOT dispatch the Phase Agent again.
+On resume, Core MUST load the bound Plan evidence and revalidate the live Context Manifest, Capability Contract, and Skill materials against the durable binding before work continues or an accepted result returns. A changed or missing Plan, Context, Agent capability, or Skill MUST append a same-Phase Block Event using caller-supplied Event metadata and return a review-required disposition with its actionable diagnostic. When every identity is unchanged and a result is already accepted, resume returns that result and MUST NOT dispatch the Phase Agent again.
 
 ## 11. Evidence
 

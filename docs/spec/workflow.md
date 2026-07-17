@@ -22,7 +22,7 @@ Combining all dimensions into one status string is forbidden. A lifecycle value 
 3. Every completed Gate requires typed Evidence.
 4. A required Context Entry must exist and match its content identity.
 5. An Agent result must match its dispatch task, Phase, Agent role, and repository fingerprint.
-6. Before resuming an active Build Phase, Core must revalidate its exact approved Plan, Context Manifest, Phase Agent Capability Contract, and locked Skill identities.
+6. Before resuming an active Build Phase, Core must revalidate its exact approved Plan, Context Manifest, Phase Agent Capability Contract, and locked Skill identities. Identity failure MUST append a same-Phase Block transition with workflow Evidence and return a review-required disposition without dispatching the Agent.
 7. No read Agent may overlap an exclusive writer or validation operation in the shared checkout.
 8. A Task may move backward only through an explicitly allowed repair or replanning transition.
 9. Cancellation and blocking preserve artifacts and working changes.

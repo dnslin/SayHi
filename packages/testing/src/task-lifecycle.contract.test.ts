@@ -42,6 +42,14 @@ const TASK_FIXTURE = Object.freeze({
   eventNamespace: "10",
   sessionRef: "session-10",
 }) satisfies TaskLifecycleFixture;
+
+function resumeBlockEvent(suffix: string, occurredAt: string) {
+  return taskLifecycleEventMetadata(
+    TASK_FIXTURE,
+    `PHASE-RESUME-${suffix}`,
+    occurredAt,
+  );
+}
 const TASK_DIRECTORY = `.sayhi/tasks/${TASK_ID}`;
 const EVENTS_PATH = `${TASK_DIRECTORY}/events.jsonl`;
 const PROJECTION_PATH = `${TASK_DIRECTORY}/task.json`;
@@ -1394,6 +1402,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    blockEvent: resumeBlockEvent("READY", "2026-07-17T10:01:45Z"),
   });
   assert.equal(resumed.ok, true);
   if (!resumed.ok) {
@@ -1437,15 +1446,8 @@ test("Build resume returns an accepted Agent result without dispatching it again
   const completed = await coreContract.resumeDurablePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
-    materials: {
-      ...prepared.materials,
-      currentContext: [
-        {
-          ...prepared.materials.currentContext[0]!,
-          content: "Drifted completed context.\n",
-        },
-      ],
-    }
+    materials: prepared.materials,
+    blockEvent: resumeBlockEvent("COMPLETED", "2026-07-17T10:02:15Z"),
   });
   assert.equal(completed.ok, true);
   if (!completed.ok) {
@@ -1454,6 +1456,35 @@ test("Build resume returns an accepted Agent result without dispatching it again
   assert.equal(completed.status, "completed");
   assert.deepEqual(completed.result, result);
   assert.equal(completed.state.events.length, accepted.state.events.length);
+
+  const drifted = await coreContract.resumeDurablePhaseExecution({
+    fileSystem,
+    taskId: TASK_ID,
+    materials: {
+      ...prepared.materials,
+      currentContext: [
+        {
+          ...prepared.materials.currentContext[0]!,
+          content: "Drifted completed context.\n",
+        },
+      ],
+    },
+    blockEvent: resumeBlockEvent("DRIFTED", "2026-07-17T10:02:30Z"),
+  });
+  assert.equal(drifted.ok, true);
+  if (!drifted.ok) {
+    return;
+  }
+  assert.equal(drifted.status, "blocked");
+  assert.equal(drifted.reviewRequired, true);
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.equal(recovered.state.projection.lifecycle, "blocked");
+  assert.equal(recovered.state.projection.phase, "implement");
+  assert.equal(recovered.state.projection.blockers.length, 1);
 });
 
 test("Build resume rejects modified approved Plan evidence", async () => {
@@ -1466,10 +1497,13 @@ test("Build resume rejects modified approved Plan evidence", async () => {
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    blockEvent: resumeBlockEvent("PLAN", "2026-07-17T10:02:45Z"),
   });
-  assert.equal(resumed.ok, false);
-  if (!resumed.ok) {
+  assert.equal(resumed.ok, true);
+  if (resumed.ok) {
+    assert.equal(resumed.status, "blocked");
     assert.equal(resumed.diagnostics[0]?.code, "build_plan.invalid");
+    assert.equal(resumed.reviewRequired, true);
   }
 });
 
@@ -1680,6 +1714,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    blockEvent: resumeBlockEvent("REPAIR", "2026-07-17T10:02:45Z"),
   });
   assert.equal(resumed.ok, false);
   if (!resumed.ok) {
@@ -1726,6 +1761,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    blockEvent: resumeBlockEvent("RESTARTED", "2026-07-17T10:03:30Z"),
   });
   assert.equal(restarted.ok, true);
   if (restarted.ok) {
@@ -1777,10 +1813,16 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
       fileSystem,
       taskId: TASK_ID,
       materials: driftCase.mutate(prepared.materials),
+      blockEvent: resumeBlockEvent(
+        `DRIFT-${driftCase.name.replaceAll(" ", "-")}`,
+        "2026-07-17T10:02:30Z",
+      ),
     });
-    assert.equal(resumed.ok, false, driftCase.name);
-    if (!resumed.ok) {
+    assert.equal(resumed.ok, true, driftCase.name);
+    if (resumed.ok) {
+      assert.equal(resumed.status, "blocked", driftCase.name);
       assert.equal(resumed.diagnostics[0]?.code, driftCase.code);
+      assert.equal(resumed.reviewRequired, true);
     }
   }
 });

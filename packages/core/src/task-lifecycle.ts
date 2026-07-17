@@ -384,6 +384,7 @@ export interface ResumeDurablePhaseExecutionRequest {
   readonly fileSystem: ContextManifestFileSystem;
   readonly taskId: string;
   readonly materials: PhaseExecutionMaterials;
+  readonly blockEvent: WorkflowEventMetadata;
 }
 
 export interface RecordDurablePhaseExecutionResultRequest {
@@ -552,6 +553,14 @@ export type ResumeDurablePhaseExecutionResult =
       state: WorkflowState;
       binding: PhaseExecutionBinding;
       result: AgentResultRecord;
+    }>
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      status: "blocked";
+      state: WorkflowState;
+      diagnostics: readonly TaskLifecycleDiagnostic[];
+      reviewRequired: true;
     }>
   | TaskLifecycleFailure;
 
@@ -2179,7 +2188,7 @@ async function dispatchDurablePhaseExecutionLocked(
     return failure(recorded.diagnostics);
   }
   const appended = recorded.state.events.length > loaded.state.events.length;
-  const persisted = await persistPhaseExecutionEvent(
+  const persisted = await persistWorkflowEvent(
     request.fileSystem,
     loaded.eventsPath,
     loaded.projectionPath,
@@ -2209,6 +2218,9 @@ async function resumeDurablePhaseExecutionLocked(
   if (!loaded.ok) {
     return loaded;
   }
+  if (loaded.state.projection.lifecycle === "blocked") {
+    return resumeBlockedPhaseExecution(loaded.state, []);
+  }
   const dispatched = latestPhaseExecutionDispatch(
     loaded.state.events,
     loaded.state.projection.phase,
@@ -2219,6 +2231,28 @@ async function resumeDurablePhaseExecutionLocked(
   const binding = parsePhaseExecutionBinding(dispatched.binding);
   if (binding === null) {
     return phaseExecutionBindingInvalid();
+  }
+  const plan = await loadBuildPlan(
+    request.fileSystem,
+    paths,
+    request.taskId,
+    dispatched.planIdentity,
+  );
+  if (!plan.ok) {
+    return blockResumedPhaseExecution(request, loaded, plan);
+  }
+  const authorized = authorizePhaseExecution({
+    contractVersion: 1,
+    binding,
+    ...request.materials,
+    capability: { kind: "repository", access: "read" },
+  });
+  if (!authorized.ok) {
+    return blockResumedPhaseExecution(
+      request,
+      loaded,
+      phaseExecutionFailure(authorized.diagnostics),
+    );
   }
   const acceptedResult = latestPhaseExecutionResult(
     loaded.state.events,
@@ -2232,35 +2266,16 @@ async function resumeDurablePhaseExecutionLocked(
       "Accepted Phase execution result",
     );
     if (!validated.ok) {
-      return validated;
+      return blockResumedPhaseExecution(request, loaded, validated);
     }
-    const result = validated.result;
     return Object.freeze({
       ok: true,
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       status: "completed",
       state: loaded.state,
       binding,
-      result,
+      result: validated.result,
     });
-  }
-  const plan = await loadBuildPlan(
-    request.fileSystem,
-    paths,
-    request.taskId,
-    dispatched.planIdentity,
-  );
-  if (!plan.ok) {
-    return plan;
-  }
-  const authorized = authorizePhaseExecution({
-    contractVersion: 1,
-    binding,
-    ...request.materials,
-    capability: { kind: "repository", access: "read" },
-  });
-  if (!authorized.ok) {
-    return phaseExecutionFailure(authorized.diagnostics);
   }
   return Object.freeze({
     ok: true,
@@ -2327,7 +2342,7 @@ async function recordDurablePhaseExecutionResultLocked(
     return failure(recorded.diagnostics);
   }
   const appended = recorded.state.events.length > loaded.state.events.length;
-  const persisted = await persistPhaseExecutionEvent(
+  const persisted = await persistWorkflowEvent(
     request.fileSystem,
     loaded.eventsPath,
     loaded.projectionPath,
@@ -2348,6 +2363,72 @@ async function recordDurablePhaseExecutionResultLocked(
   });
 }
 
+async function blockResumedPhaseExecution(
+  request: ResumeDurablePhaseExecutionRequest,
+  loaded: Readonly<{
+    state: WorkflowState;
+    eventsPath: string;
+    projectionPath: string;
+  }>,
+  failureResult: TaskLifecycleFailure,
+): Promise<ResumeDurablePhaseExecutionResult> {
+  const transitioned = transitionWorkflow(loaded.state, {
+    contractVersion: 1,
+    taskId: request.taskId,
+    expectedVersion: loaded.state.projection.version,
+    to: {
+      lifecycle: "blocked",
+      phase: loaded.state.projection.phase,
+      step: loaded.state.projection.step,
+    },
+    gates: [
+      {
+        gate: "block",
+        evidence: [
+          {
+            kind: "workflow",
+            reference: `events/${request.blockEvent.eventId}`,
+          },
+        ],
+      },
+    ],
+    blockers: failureResult.diagnostics.map(
+      (diagnostic) => `${diagnostic.code}: ${diagnostic.message}`,
+    ),
+    event: request.blockEvent,
+  });
+  if (!transitioned.ok) {
+    return failure(transitioned.diagnostics);
+  }
+  const appended = transitioned.state.events.length > loaded.state.events.length;
+  const persisted = await persistWorkflowEvent(
+    request.fileSystem,
+    loaded.eventsPath,
+    loaded.projectionPath,
+    transitioned.state,
+    transitioned.event,
+    appended,
+  );
+  if (persisted !== null) {
+    return persisted;
+  }
+  return resumeBlockedPhaseExecution(transitioned.state, failureResult.diagnostics);
+}
+
+function resumeBlockedPhaseExecution(
+  state: WorkflowState,
+  diagnostics: readonly TaskLifecycleDiagnostic[],
+): ResumeDurablePhaseExecutionResult {
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    status: "blocked",
+    state,
+    diagnostics: Object.freeze([...diagnostics]),
+    reviewRequired: true,
+  });
+}
+
 function validatePhaseExecutionResult(
   value: unknown,
   binding: PhaseExecutionBinding,
@@ -2365,12 +2446,12 @@ function validatePhaseExecutionResult(
   return Object.freeze({ ok: true, result });
 }
 
-async function persistPhaseExecutionEvent(
+async function persistWorkflowEvent(
   fileSystem: TaskLifecycleFileSystem,
   eventsPath: string,
   projectionPath: string,
   state: WorkflowState,
-  event: PhaseExecutionDispatchedEvent | PhaseExecutionResultAcceptedEvent,
+  event: WorkflowEvent,
   appended: boolean,
 ): Promise<TaskLifecycleFailure | null> {
   if (!appended) {
