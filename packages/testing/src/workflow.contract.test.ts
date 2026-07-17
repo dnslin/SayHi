@@ -2169,7 +2169,7 @@ function recordWorkflowAgentResult(
       evidence: [],
       findings: [],
       ...(phase === "review" ? { reviewFindings: findings } : {}),
-      observedFinalFingerprint: observedFinalFingerprint ?? `sha256:${"d".repeat(64)}`, 
+      observedFinalFingerprint: observedFinalFingerprint ?? `sha256:${"d".repeat(64)}`,
     },
     event: eventMetadata(`RESULT-${suffix}`),
   });
