@@ -27,6 +27,7 @@ import {
 
 import {
   createCompletedDurableTask,
+  IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
   taskLifecycleEventMetadata,
   taskLifecycleExploreTransition,
@@ -1366,40 +1367,6 @@ test("a superseded Build Plan cannot be rejected", async () => {
 
 const PHASE_CONTEXT_SOURCE = "docs/phase-context.md";
 const PHASE_CONTEXT_CONTENT = "Stable implementation context.\n";
-const PHASE_AGENT_CONTRACT = {
-  schemaVersion: 1,
-  role: "implementation",
-  runtimeName: "sayhi-v1-implementation",
-  contractVersion: 1,
-  tools: ["read", "edit", "bash"],
-  network: "none",
-  skills: ["implement", "tdd"],
-  spawns: [],
-  repositoryAccess: "exclusive-write",
-  outputSchema: "schemas/agent/implementation-output.json",
-  promptBaseIdentity: `sha256:${"a".repeat(64)}`,
-  overridePolicy: "prompt-body-only",
-} as const;
-const PHASE_AGENT_CONTRACT_ID =
-  "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08";
-const PHASE_SKILLS = [
-  {
-    name: "implement",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-    },
-    content: "implement skill\n",
-  },
-  {
-    name: "tdd",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-    },
-    content: "tdd skill\n",
-  },
-] as const;
 
 
 test("Build resume returns an accepted Agent result without dispatching it again", async () => {
@@ -2272,6 +2239,53 @@ test("Build blocks when configured Review repair attempts are exhausted", async 
   ]);
 });
 
+test("Bound Writer blocks invalid capability material with a deterministic Event id", async () => {
+  const fileSystem = new MemoryTaskLifecycleFileSystem();
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-BOUND-WRITER",
+  );
+  const before = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(before.ok, true);
+  if (!before.ok) {
+    return;
+  }
+  let entered = false;
+  const blocked = await coreContract.withBoundDurableTaskWriter({
+    fileSystem: fileSystem as unknown as Parameters<
+      typeof coreContract.withBoundDurableTaskWriter
+    >[0]["fileSystem"],
+    taskId: TASK_ID,
+    materials: {
+      ...prepared.materials,
+      agentContract: {
+        ...prepared.materials.agentContract,
+        tools: [...prepared.materials.agentContract.tools, "validate"],
+      },
+    },
+    operation: async () => {
+      entered = true;
+    },
+  });
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) {
+    assert.equal(blocked.diagnostics[0]?.code, "execution.agent_invalid");
+  }
+  assert.equal(entered, false);
+  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.ok(
+    recovered.state.events.some(
+      (event) =>
+        event.eventId ===
+        `EVENT-BOUND-WRITER-${TASK_ID}-${before.state.projection.version}`,
+    ),
+  );
+});
+
 async function recordSucceededImplementation(
   fileSystem: MemoryTaskLifecycleFileSystem,
   execution: BindPhaseExecutionRequest,
@@ -2486,7 +2500,7 @@ async function dispatchApprovedBuildPhase(
       baseFingerprint: `sha256:${"d".repeat(64)}`,
       requestedAt: "2026-07-17T10:01:15Z",
       contextManifestIdentity: recorded.plan.contextManifestIdentity,
-      agentContractIdentity: PHASE_AGENT_CONTRACT_ID,
+      agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
     },
     manifest: manifest.entries,
     currentContext: [
@@ -2495,8 +2509,8 @@ async function dispatchApprovedBuildPhase(
         content: PHASE_CONTEXT_CONTENT,
       },
     ],
-    agentContract: PHASE_AGENT_CONTRACT,
-    skills: PHASE_SKILLS,
+    agentContract: IMPLEMENTATION_AGENT.contract,
+    skills: IMPLEMENTATION_AGENT.skills,
   } as const;
   const dispatched = await coreContract.dispatchDurablePhaseExecution({
     fileSystem,

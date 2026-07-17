@@ -899,6 +899,15 @@ export async function withDurableTaskWriter<Value>(
 export async function withBoundDurableTaskWriter<Value>(
   request: WithBoundDurableTaskWriterRequest<Value>,
 ): Promise<WithDurableTaskWriterResult<Value>> {
+  const current = await readDurableTask({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+  });
+  if (!current.ok) {
+    return current;
+  }
+  const revalidationId =
+    `BOUND-WRITER-${request.taskId}-${current.state.projection.version}`;
   const now = new Date();
   const timestamp = now.toISOString();
   const resumed = await resumeDurablePhaseExecution({
@@ -906,14 +915,14 @@ export async function withBoundDurableTaskWriter<Value>(
     taskId: request.taskId,
     materials: request.materials,
     blockEvent: {
-      eventId: `EVENT-${request.taskId}-BOUND-WRITER-${now.getTime()}`,
+      eventId: `EVENT-${revalidationId}`,
       actor: {
         kind: "system",
         id: "sayhi-core",
         sessionRef: "bound-writer",
       },
       reason: "Bound Implementation Writer revalidation failed.",
-      idempotencyKey: `BOUND-WRITER-${request.taskId}-${now.getTime()}`,
+      idempotencyKey: revalidationId,
       occurredAt: timestamp,
     },
   });

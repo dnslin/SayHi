@@ -23,6 +23,7 @@ import {
 } from "@dnslin/sayhi-core";
 
 import {
+  IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
@@ -54,43 +55,6 @@ const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const CURRENT_RUNTIME_IGNORE_CONTENT =
   "# SayHi local runtime state\n/.runtime/\n";
 
-const FOUNDATION_IMPLEMENTATION_AGENT = {
-  role: "implementation",
-  contractIdentity:
-    "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
-  contract: {
-    schemaVersion: 1,
-    role: "implementation",
-    runtimeName: "sayhi-v1-implementation",
-    contractVersion: 1,
-    tools: ["read", "edit", "bash"],
-    network: "none",
-    skills: ["implement", "tdd"],
-    spawns: [],
-    repositoryAccess: "exclusive-write",
-    outputSchema: "schemas/agent/implementation-output.json",
-    promptBaseIdentity: `sha256:${"a".repeat(64)}`,
-    overridePolicy: "prompt-body-only",
-  } as const satisfies PhaseAgentContract,
-  skills: [
-    {
-      name: "implement",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-      },
-      content: "implement skill\n",
-    },
-    {
-      name: "tdd",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-      },
-      content: "tdd skill\n",
-    },
-  ] as const satisfies readonly SkillMaterial[],
-} as const;
 
 
 
@@ -1818,7 +1782,7 @@ async function advanceFoundationTask(
         repository,
         state,
         "implement",
-        FOUNDATION_IMPLEMENTATION_AGENT,
+        IMPLEMENTATION_AGENT,
         occurredAt,
       );
     }

@@ -34,6 +34,7 @@ import {
 
 import {
   createCompletedDurableTask,
+  IMPLEMENTATION_AGENT,
   taskLifecycleExploreTransition,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
@@ -507,38 +508,6 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
     assert.fail(approved.diagnostics[0]?.message ?? "Build Plan approval failed");
   }
   assert.equal(approved.ok, true);
-  const implementationContract = {
-    schemaVersion: 1,
-    role: "implementation",
-    runtimeName: "sayhi-v1-implementation",
-    contractVersion: 1,
-    tools: ["read", "edit", "bash"],
-    network: "none",
-    skills: ["implement", "tdd"],
-    spawns: [],
-    repositoryAccess: "exclusive-write",
-    outputSchema: "schemas/agent/implementation-output.json",
-    promptBaseIdentity: `sha256:${"a".repeat(64)}`,
-    overridePolicy: "prompt-body-only",
-  } as const;
-  const implementationSkills = [
-    {
-      name: "implement",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-      },
-      content: "implement skill\n",
-    },
-    {
-      name: "tdd",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-      },
-      content: "tdd skill\n",
-    },
-  ] as const;
   const materials = {
     manifest: frozen.entries,
     currentContext: [
@@ -547,8 +516,8 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
         content: "Stable implementation context.\n",
       },
     ],
-    agentContract: implementationContract,
-    skills: implementationSkills,
+    agentContract: IMPLEMENTATION_AGENT.contract,
+    skills: IMPLEMENTATION_AGENT.skills,
   } as const;
   const dispatched = await dispatchDurablePhaseExecution({
     fileSystem,
@@ -565,8 +534,7 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
         baseFingerprint: `sha256:${"d".repeat(64)}`,
         requestedAt: "2026-07-15T10:05:15Z",
         contextManifestIdentity: recorded.plan.contextManifestIdentity,
-        agentContractIdentity:
-          "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
+        agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
       },
       ...materials,
     },

@@ -27,40 +27,43 @@ export interface TaskLifecycleFixture {
   readonly sessionRef: string;
 }
 
-const IMPLEMENTATION_AGENT_CONTRACT = {
-  schemaVersion: 1,
+export const IMPLEMENTATION_AGENT = {
   role: "implementation",
-  runtimeName: "sayhi-v1-implementation",
-  contractVersion: 1,
-  tools: ["read", "edit", "bash"],
-  network: "none",
-  skills: ["implement", "tdd"],
-  spawns: [],
-  repositoryAccess: "exclusive-write",
-  outputSchema: "schemas/agent/implementation-output.json",
-  promptBaseIdentity: `sha256:${"a".repeat(64)}`,
-  overridePolicy: "prompt-body-only",
+  contractIdentity:
+    "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08",
+  contract: {
+    schemaVersion: 1,
+    role: "implementation",
+    runtimeName: "sayhi-v1-implementation",
+    contractVersion: 1,
+    tools: ["read", "edit", "bash"],
+    network: "none",
+    skills: ["implement", "tdd"],
+    spawns: [],
+    repositoryAccess: "exclusive-write",
+    outputSchema: "schemas/agent/implementation-output.json",
+    promptBaseIdentity: `sha256:${"a".repeat(64)}`,
+    overridePolicy: "prompt-body-only",
+  },
+  skills: [
+    {
+      name: "implement",
+      identity: {
+        algorithm: "sha256-lf-v1",
+        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
+      },
+      content: "implement skill\n",
+    },
+    {
+      name: "tdd",
+      identity: {
+        algorithm: "sha256-lf-v1",
+        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
+      },
+      content: "tdd skill\n",
+    },
+  ],
 } as const;
-const IMPLEMENTATION_AGENT_CONTRACT_ID =
-  "sha256:c98ac3a4104841044e7aa58e7564fd140fd9386861d8b8d5c4176f964f19bd08";
-const IMPLEMENTATION_SKILLS = [
-  {
-    name: "implement",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-    },
-    content: "implement skill\n",
-  },
-  {
-    name: "tdd",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-    },
-    content: "tdd skill\n",
-  },
-] as const;
 export const REVIEW_AGENTS = [
   {
     role: "standards-review",
@@ -326,12 +329,12 @@ export async function createCompletedDurableTask(
         baseFingerprint: `sha256:${"d".repeat(64)}`,
         requestedAt: transitionedAt,
         contextManifestIdentity: planned.plan.contextManifestIdentity,
-        agentContractIdentity: IMPLEMENTATION_AGENT_CONTRACT_ID,
+        agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
       },
       manifest: [],
       currentContext: [],
-      agentContract: IMPLEMENTATION_AGENT_CONTRACT,
-      skills: IMPLEMENTATION_SKILLS,
+      agentContract: IMPLEMENTATION_AGENT.contract,
+      skills: IMPLEMENTATION_AGENT.skills,
     },
     event: taskLifecycleEventMetadata(
       fixture,

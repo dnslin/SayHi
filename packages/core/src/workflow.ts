@@ -14,6 +14,7 @@ import {
 import {
   parsePhaseExecutionBinding,
   parsePhaseExecutionResult,
+  phaseExecutionResultMatchesBinding,
 } from "./execution.js";
 
 
@@ -1573,6 +1574,16 @@ export function replayWorkflowEvents(
           ),
         );
       }
+      const dispatchBindingDiagnostic = validatePhaseExecutionDispatchBinding(
+        projection,
+        binding,
+      );
+      if (dispatchBindingDiagnostic !== null) {
+        return replayFailure({
+          ...dispatchBindingDiagnostic,
+          path: `$[${index}].binding`,
+        });
+      }
       const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
         projection,
         acceptedEvents,
@@ -1594,16 +1605,25 @@ export function replayWorkflowEvents(
       sourceEvent.type === "phase_execution_result_accepted"
     ) {
       const result = parsePhaseExecutionResult(sourceEvent.result);
+      const resultBindingDiagnostic =
+        result === null
+          ? null
+          : validatePhaseExecutionResultBinding(
+              projection,
+              acceptedEvents,
+              result,
+            );
       if (
         !isPhaseExecutionEventEnvelope(sourceEvent, projection) ||
         result === null ||
+        resultBindingDiagnostic !== null ||
         validateBuildReviewResultPayload(projection, result) !== null
       ) {
         return replayFailure(
           diagnostic(
             "workflow.event.invalid",
             `$[${index}]`,
-            "Phase execution result does not preserve the active Build position or schema-valid result payload.",
+            "Phase execution result does not preserve the active Build position, binding, or schema-valid result payload.",
             "Restore the accepted Agent result Event or record the result through Core.",
           ),
         );
@@ -2326,11 +2346,19 @@ function validatePhaseExecutionDispatchRequest(
       "Phase execution dispatch requires an approved Build Plan identity.",
     );
   }
-  if (!isUnknownRecord(request.binding)) {
+  const binding = parsePhaseExecutionBinding(request.binding);
+  if (binding === null) {
     return invalidRequest(
       "$.binding",
-      "Phase execution dispatch requires a readable immutable payload.",
+      "Phase execution dispatch requires a schema-valid immutable binding.",
     );
+  }
+  const bindingDiagnostic = validatePhaseExecutionDispatchBinding(
+    state.projection,
+    binding,
+  );
+  if (bindingDiagnostic !== null) {
+    return bindingDiagnostic;
   }
   if (approvedBuildPlanIdentity(state.events) !== request.planIdentity) {
     return diagnostic(
@@ -2343,7 +2371,7 @@ function validatePhaseExecutionDispatchRequest(
   const reviewDispatchDiagnostic = validateBuildReviewDispatchBinding(
     state.projection,
     state.events,
-    request.binding,
+    binding,
   );
   if (reviewDispatchDiagnostic !== null) {
     return reviewDispatchDiagnostic;
@@ -2374,15 +2402,24 @@ function validatePhaseExecutionResultRequest(
       "Rebuild the Projection from a complete valid Event stream before mutation.",
     );
   }
-  if (!isUnknownRecord(request.result)) {
+  const result = parsePhaseExecutionResult(request.result);
+  if (result === null) {
     return invalidRequest(
       "$.result",
-      "Phase execution result requires a readable immutable payload.",
+      "Phase execution result requires a schema-valid immutable Agent result.",
     );
+  }
+  const bindingDiagnostic = validatePhaseExecutionResultBinding(
+    state.projection,
+    state.events,
+    result,
+  );
+  if (bindingDiagnostic !== null) {
+    return bindingDiagnostic;
   }
   const reviewResultDiagnostic = validateBuildReviewResultPayload(
     state.projection,
-    request.result,
+    result,
   );
   if (reviewResultDiagnostic !== null) {
     return reviewResultDiagnostic;
@@ -2434,6 +2471,80 @@ function validateBuildReviewResultPayload(
         "$.result.reviewFindings",
         "New Build Review results require structured reviewFindings.",
       );
+}
+
+function validatePhaseExecutionDispatchBinding(
+  projection: TaskProjection,
+  binding: Readonly<{
+    taskId: string;
+    expectedTaskVersion: number;
+    phase: WorkflowPhase;
+  }>,
+): WorkflowDiagnostic | null {
+  if (
+    binding.taskId !== projection.id ||
+    binding.expectedTaskVersion !== projection.version ||
+    binding.phase !== projection.phase
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.binding",
+      "Phase execution dispatch must bind the active Task version and Phase.",
+      "Dispatch the Agent from the current Task state.",
+    );
+  }
+  return null;
+}
+
+function validatePhaseExecutionResultBinding(
+  projection: TaskProjection,
+  events: readonly WorkflowEvent[],
+  result: ReturnType<typeof parsePhaseExecutionResult> & {},
+): WorkflowDiagnostic | null {
+  if (result.phase !== projection.phase) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.phase",
+      "Phase execution result must match the active Phase.",
+      "Record the result only while its dispatched Phase remains active.",
+    );
+  }
+  const binding = [...events]
+    .reverse()
+    .filter((event) => event.type === "phase_execution_dispatched")
+    .map((event) => parsePhaseExecutionBinding(event.binding))
+    .find((candidate) => candidate?.dispatchId === result.dispatchId);
+  if (binding === undefined || binding === null) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "Phase execution result requires an accepted dispatch binding.",
+      "Dispatch the Phase Agent before recording its result.",
+    );
+  }
+  if (!phaseExecutionResultMatchesBinding(result, binding)) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result",
+      "Phase execution result does not match its accepted dispatch binding.",
+      "Echo every binding value returned by the Phase dispatch.",
+    );
+  }
+  if (
+    events.some(
+      (event) =>
+        event.type === "phase_execution_result_accepted" &&
+        parsePhaseExecutionResult(event.result)?.dispatchId === result.dispatchId,
+    )
+  ) {
+    return diagnostic(
+      "workflow.transition.illegal",
+      "$.result.dispatchId",
+      "A Phase dispatch accepts at most one result.",
+      "Reuse the accepted result on retry instead of recording another result.",
+    );
+  }
+  return null;
 }
 
 function validatePhaseExecutionRequest(

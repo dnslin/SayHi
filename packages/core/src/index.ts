@@ -26,6 +26,7 @@ import {
   recordContextManifestChange,
   recordBuildPlanChange,
   transitionWorkflow,
+  recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
 } from "./workflow.js";
 import {
@@ -438,6 +439,7 @@ export interface CoreContract {
   readonly adoptWorkflowBaseline: typeof adoptWorkflowBaseline;
   readonly recordContextManifestChange: typeof recordContextManifestChange;
   readonly recordBuildPlanChange: typeof recordBuildPlanChange;
+  readonly recordPhaseExecutionDispatch: typeof recordPhaseExecutionDispatch;
   readonly recordPhaseExecutionResult: typeof recordPhaseExecutionResult;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
@@ -494,6 +496,7 @@ export const coreContract: CoreContract = Object.freeze({
   adoptWorkflowBaseline,
   recordContextManifestChange,
   recordBuildPlanChange,
+  recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
   createDurableTask,
   createDurableTaskHandoff,

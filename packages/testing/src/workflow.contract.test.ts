@@ -1022,7 +1022,8 @@ test("Build repair transitions stop at the configured attempt limit", () => {
   assert.equal(state.projection.lifecycle, "blocked");
 });
 
-test("Build Review exit requires one frozen Implementation fingerprint", () => {
+
+test("Core rejects malformed, unbound, and duplicate Phase results", () => {
   let state = startTask("build");
   for (const [lifecycle, phase] of [
     ["active", "explore"],
@@ -1030,41 +1031,69 @@ test("Build Review exit requires one frozen Implementation fingerprint", () => {
     ["active", "implement"],
     ["active", "review"],
   ] as const) {
-    state = advanceTask(state, lifecycle, phase, `fingerprint-${phase}`);
+    state = advanceTask(state, lifecycle, phase, `result-binding-${phase}`);
   }
-  state = recordWorkflowAgentResult(
+  const malformed = coreContract.recordPhaseExecutionResult(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    result: {},
+    event: eventMetadata("result-malformed"),
+  });
+  assert.equal(malformed.ok, false);
+  if (!malformed.ok) {
+    assert.equal(malformed.diagnostics[0]?.code, "workflow.request.invalid");
+  }
+  const unbound = coreContract.recordPhaseExecutionResult(state, {
+    contractVersion: 1,
+    taskId: state.projection.id,
+    expectedVersion: state.projection.version,
+    result: {
+      schemaVersion: 1,
+      dispatchId: "DISPATCH-UNBOUND",
+      taskId: state.projection.id,
+      expectedTaskVersion: state.projection.version,
+      phase: "review",
+      agentRole: "standards-review",
+      contextManifestIdentity: `sha256:${"a".repeat(64)}`,
+      agentContractIdentity: `sha256:${"b".repeat(64)}`,
+      baseFingerprint: `sha256:${"d".repeat(64)}`,
+      outcome: "succeeded",
+      artifacts: [],
+      evidence: [],
+      findings: [],
+      reviewFindings: [],
+      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+    event: eventMetadata("result-unbound"),
+  });
+  assert.equal(unbound.ok, false);
+  if (!unbound.ok) {
+    assert.equal(unbound.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
+  const acceptedState = recordWorkflowAgentResult(
     state,
     "review",
     "standards-review",
     "succeeded",
     [],
-    "fingerprint-standards",
+    "result-duplicate",
   );
-  state = recordWorkflowAgentResult(
-    state,
-    "review",
-    "spec-review",
-    "succeeded",
-    [],
-    "fingerprint-spec",
-    `sha256:${"e".repeat(64)}`,
-  );
-  const rejected = coreContract.transitionWorkflow(state, {
+  const acceptedResult = acceptedState.events.at(-1)!;
+  assert.equal(acceptedResult.type, "phase_execution_result_accepted");
+  if (acceptedResult.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const duplicate = coreContract.recordPhaseExecutionResult(acceptedState, {
     contractVersion: 1,
-    taskId: state.projection.id,
-    expectedVersion: state.projection.version,
-    to: { lifecycle: "active", phase: "finish", step: "ready" },
-    gates: [
-      {
-        gate: "review",
-        evidence: [{ kind: "review", reference: "evidence/review.json" }],
-      },
-    ],
-    event: eventMetadata("fingerprint-finish"),
+    taskId: acceptedState.projection.id,
+    expectedVersion: acceptedState.projection.version,
+    result: acceptedResult.result,
+    event: eventMetadata("result-duplicate"),
   });
-  assert.equal(rejected.ok, false);
-  if (!rejected.ok) {
-    assert.equal(rejected.diagnostics[0]?.code, "workflow.transition.illegal");
+  assert.equal(duplicate.ok, false);
+  if (!duplicate.ok) {
+    assert.equal(duplicate.diagnostics[0]?.code, "workflow.transition.illegal");
   }
 });
 
@@ -1185,6 +1214,25 @@ test("replay requires Review dispatches to use the Implementation fingerprint", 
   if (!replayed.ok) {
     assert.equal(replayed.diagnostics[0]?.code, "workflow.transition.illegal");
   }
+  const stalePayload: Record<string, unknown> = {
+    ...payload,
+    eventId: "EVENT-REPLAY-STALE-DISPATCH",
+    idempotencyKey: "REPLAY-STALE-DISPATCH",
+    binding: {
+      ...(payload.binding as Record<string, unknown>),
+      dispatchId: "DISPATCH-REPLAY-STALE",
+      expectedTaskVersion: state.projection.version - 1,
+      baseFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+  };
+  const stale = coreContract.replayWorkflowEvents([
+    ...state.events,
+    { ...stalePayload, chainDigest: digestReplayEvent(stalePayload) },
+  ]);
+  assert.equal(stale.ok, false);
+  if (!stale.ok) {
+    assert.equal(stale.diagnostics[0]?.code, "workflow.transition.illegal");
+  }
 });
 
 test("replay validates structured Review findings", () => {
@@ -1218,12 +1266,105 @@ test("replay validates structured Review findings", () => {
     },
   };
   const replayed = coreContract.replayWorkflowEvents([
-    ...state.events,
+    ...recorded.events.slice(0, -1),
     { ...payload, chainDigest: digestReplayEvent(payload) },
   ]);
   assert.equal(replayed.ok, false);
   if (!replayed.ok) {
     assert.equal(replayed.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+});
+
+test("replay rejects unbound and duplicate Phase results", () => {
+  let state = startTask("build");
+  for (const [lifecycle, phase] of [
+    ["active", "explore"],
+    ["active", "plan"],
+    ["active", "implement"],
+    ["active", "review"],
+  ] as const) {
+    state = advanceTask(state, lifecycle, phase, `replay-result-link-${phase}`);
+  }
+  const unboundPayload: Record<string, unknown> = {
+    schemaVersion: 1,
+    eventId: "EVENT-REPLAY-RESULT-UNBOUND",
+    taskId: state.projection.id,
+    route: "build",
+    sequence: state.projection.version + 1,
+    previousChainDigest: state.events.at(-1)!.chainDigest,
+    type: "phase_execution_result_accepted",
+    from: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    to: {
+      lifecycle: state.projection.lifecycle,
+      phase: state.projection.phase,
+      step: state.projection.step,
+    },
+    actor: { kind: "agent", id: "reviewer", sessionRef: "replay" },
+    outcome: "accepted",
+    gates: [],
+    blockers: [],
+    initiativeGraph: null,
+    reason: "Record an unbound Review result.",
+    idempotencyKey: "REPLAY-RESULT-UNBOUND",
+    occurredAt: "2026-07-17T10:11:00Z",
+    result: {
+      schemaVersion: 1,
+      dispatchId: "DISPATCH-REPLAY-MISSING",
+      taskId: state.projection.id,
+      expectedTaskVersion: state.projection.version,
+      phase: "review",
+      agentRole: "standards-review",
+      contextManifestIdentity: `sha256:${"a".repeat(64)}`,
+      agentContractIdentity: `sha256:${"b".repeat(64)}`,
+      baseFingerprint: `sha256:${"d".repeat(64)}`,
+      outcome: "succeeded",
+      artifacts: [],
+      evidence: [],
+      findings: [],
+      reviewFindings: [],
+      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
+    },
+  };
+  const unbound = coreContract.replayWorkflowEvents([
+    ...state.events,
+    { ...unboundPayload, chainDigest: digestReplayEvent(unboundPayload) },
+  ]);
+  assert.equal(unbound.ok, false);
+  if (!unbound.ok) {
+    assert.equal(unbound.diagnostics[0]?.code, "workflow.event.invalid");
+  }
+  const recorded = recordWorkflowAgentResult(
+    state,
+    "review",
+    "standards-review",
+    "succeeded",
+    [],
+    "replay-result-duplicate",
+  );
+  const acceptedResult = recorded.events.at(-1)!;
+  assert.equal(acceptedResult.type, "phase_execution_result_accepted");
+  if (acceptedResult.type !== "phase_execution_result_accepted") {
+    return;
+  }
+  const duplicatePayload: Record<string, unknown> = {
+    ...acceptedResult,
+    eventId: "EVENT-REPLAY-RESULT-DUPLICATE",
+    sequence: recorded.projection.version + 1,
+    previousChainDigest: acceptedResult.chainDigest,
+    idempotencyKey: "REPLAY-RESULT-DUPLICATE",
+    occurredAt: "2026-07-17T10:11:15Z",
+  };
+  const duplicate = coreContract.replayWorkflowEvents([
+    ...recorded.events,
+    { ...duplicatePayload, chainDigest: digestReplayEvent(duplicatePayload) },
+  ]);
+  assert.equal(duplicate.ok, false);
+  if (!duplicate.ok) {
+    assert.equal(duplicate.diagnostics[0]?.code, "workflow.event.invalid");
   }
 });
 
@@ -1752,30 +1893,66 @@ function recordWorkflowAgentResult(
   suffix: string,
   baseFingerprint?: ContractIdentity,
 ): WorkflowState {
-  const recorded = coreContract.recordPhaseExecutionResult(state, {
+  const planApproval = state.events.find(
+    (event) =>
+      event.type === "workflow_transitioned" &&
+      event.from.phase === "plan" &&
+      event.to.phase === "implement",
+  );
+  assert.ok(planApproval, "Build Plan approval Event is missing");
+  const planReference = planApproval.gates
+    .find((gate) => gate.gate === "plan")
+    ?.evidence.find((evidence) => evidence.reference.startsWith("plans/"));
+  assert.ok(planReference, "Build Plan reference is missing");
+  const fingerprint =
+    baseFingerprint ??
+    (phase === "review"
+      ? `sha256:${"d".repeat(64)}`
+      : `sha256:${"c".repeat(64)}`);
+  const binding = {
+    schemaVersion: 1 as const,
+    dispatchId: `DISPATCH-${suffix}`,
+    taskId: state.projection.id,
+    expectedTaskVersion: state.projection.version,
+    phase,
+    agentRole,
+    baseFingerprint: fingerprint,
+    requestedAt: "2026-07-17T10:00:00Z",
+    contextManifestIdentity: `sha256:${"a".repeat(64)}`,
+    agentContractIdentity: `sha256:${"b".repeat(64)}`,
+    skillIdentities: [],
+  };
+  const dispatched = coreContract.recordPhaseExecutionDispatch(state, {
     contractVersion: 1,
     taskId: state.projection.id,
     expectedVersion: state.projection.version,
+    planIdentity: `sha256:${planReference.reference.slice("plans/".length, -".json".length)}`,
+    binding,
+    event: eventMetadata(`DISPATCH-${suffix}`),
+  });
+  if (!dispatched.ok) {
+    assert.fail(dispatched.diagnostics[0]?.message ?? "Phase dispatch failed");
+  }
+  const recorded = coreContract.recordPhaseExecutionResult(dispatched.state, {
+    contractVersion: 1,
+    taskId: dispatched.state.projection.id,
+    expectedVersion: dispatched.state.projection.version,
     result: {
       schemaVersion: 1,
-      dispatchId: `DISPATCH-${suffix}`,
-      taskId: state.projection.id,
-      expectedTaskVersion: state.projection.version,
+      dispatchId: binding.dispatchId,
+      taskId: binding.taskId,
+      expectedTaskVersion: binding.expectedTaskVersion,
       phase,
       agentRole,
-      contextManifestIdentity: `sha256:${"a".repeat(64)}`,
-      agentContractIdentity: `sha256:${"b".repeat(64)}`,
-      baseFingerprint:
-        baseFingerprint ??
-        (phase === "review"
-          ? `sha256:${"d".repeat(64)}`
-          : `sha256:${"c".repeat(64)}`),
+      contextManifestIdentity: binding.contextManifestIdentity,
+      agentContractIdentity: binding.agentContractIdentity,
+      baseFingerprint: binding.baseFingerprint,
       outcome,
       artifacts: [],
       evidence: [],
       findings: [],
       ...(phase === "review" ? { reviewFindings: findings } : {}),
-      observedFinalFingerprint: `sha256:${"d".repeat(64)}`, 
+      observedFinalFingerprint: `sha256:${"d".repeat(64)}`,
     },
     event: eventMetadata(`RESULT-${suffix}`),
   });
