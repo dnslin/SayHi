@@ -4201,6 +4201,10 @@ async function recoverInitiativeRepairTasks(
     if (!repairPaths.ok) {
       return repairPaths;
     }
+    const prepared = prepareInitiativeRepairTask(state, node);
+    if (!prepared.ok) {
+      return prepared;
+    }
     const entry = await fileSystem.inspect(repairPaths.taskDirectory);
     if (entry.kind !== "missing") {
       const existing = await loadTask(fileSystem, node.taskId);
@@ -4213,28 +4217,11 @@ async function recoverInitiativeRepairTasks(
         ) {
           return existing;
         }
-        const creationEvent = initiativeRepairCreationEvent(state, node.taskId);
-        if (creationEvent === null) {
-          return failure([
-            diagnostic(
-              "workflow.graph.invalid",
-              repairPaths.taskDirectory,
-              "A Repair node has no accepted Initiative graph revision Event.",
-              "Recover the Initiative Event history before recreating Repair Tasks.",
-            ),
-          ]);
-        }
-        const started = startWorkflowTask(
-          startInitiativeRepairTask(state.projection, creationEvent, node),
-        );
-        if (!started.ok) {
-          return failure(started.diagnostics);
-        }
         const ensured = await ensureDurableInitiativeRepairTask(
           fileSystem,
           repairPaths,
-          started.state,
-          started.event,
+          prepared.state,
+          prepared.event,
         );
         if (ensured !== null) {
           return ensured;
@@ -4243,6 +4230,7 @@ async function recoverInitiativeRepairTasks(
         continue;
       }
       if (
+        !matchesInitiativeRepairTask(existing.state, prepared.event) ||
         existing.state.projection.route !== "build" ||
         existing.state.projection.parentTaskId !== state.projection.id
       ) {
@@ -4255,6 +4243,20 @@ async function recoverInitiativeRepairTasks(
           ),
         ]);
       }
+      const projectionRecovered = await runWithTaskLock(
+        fileSystem,
+        repairPaths.lockPath,
+        () =>
+          writeProjectionIfChanged(
+            fileSystem,
+            repairPaths.projectionPath,
+            existing.state.projection,
+          ),
+      );
+      if (typeof projectionRecovered !== "boolean") {
+        return projectionRecovered;
+      }
+      recovered ||= projectionRecovered;
       continue;
     }
     const archivedEntry = await fileSystem.inspect(repairPaths.archiveTaskDirectory);
@@ -4278,6 +4280,7 @@ async function recoverInitiativeRepairTasks(
         return archived;
       }
       if (
+        !matchesInitiativeRepairTask(archived.state, prepared.event) ||
         archived.state.projection.lifecycle !== "archived" ||
         archived.state.projection.route !== "build" ||
         archived.state.projection.parentTaskId !== state.projection.id
@@ -4293,28 +4296,11 @@ async function recoverInitiativeRepairTasks(
       }
       continue;
     }
-    const creationEvent = initiativeRepairCreationEvent(state, node.taskId);
-    if (creationEvent === null) {
-      return failure([
-        diagnostic(
-          "workflow.graph.invalid",
-          repairPaths.taskDirectory,
-          "A Repair node has no accepted Initiative graph revision Event.",
-          "Recover the Initiative Event history before recreating Repair Tasks.",
-        ),
-      ]);
-    }
-    const started = startWorkflowTask(
-      startInitiativeRepairTask(state.projection, creationEvent, node),
-    );
-    if (!started.ok) {
-      return failure(started.diagnostics);
-    }
     const ensured = await ensureDurableInitiativeRepairTask(
       fileSystem,
       repairPaths,
-      started.state,
-      started.event,
+      prepared.state,
+      prepared.event,
     );
     if (ensured !== null) {
       return ensured;
@@ -4359,6 +4345,44 @@ function serializeInitiativeRepairOperationJournal(
   return `${JSON.stringify(journal)}\n`;
 }
 
+type InitiativeRepairTaskPreparation =
+  | Readonly<{
+      ok: true;
+      state: WorkflowState;
+      event: TaskCreatedEvent;
+    }>
+  | TaskLifecycleFailure;
+
+function prepareInitiativeRepairTask(
+  initiative: WorkflowState,
+  node: DependencyGraph["nodes"][number],
+): InitiativeRepairTaskPreparation {
+  const creationEvent = initiativeRepairCreationEvent(initiative, node.taskId);
+  if (creationEvent === null) {
+    return failure([
+      diagnostic(
+        "workflow.graph.invalid",
+        `$.initiativeGraph.nodes.${node.taskId}`,
+        "A Repair node has no accepted Initiative graph revision Event.",
+        "Recover the Initiative Event history before recreating Repair Tasks.",
+      ),
+    ]);
+  }
+  const started = startWorkflowTask(
+    startInitiativeRepairTask(initiative.projection, creationEvent, node),
+  );
+  return started.ok
+    ? Object.freeze({ ok: true, state: started.state, event: started.event })
+    : failure(started.diagnostics);
+}
+
+function matchesInitiativeRepairTask(
+  state: WorkflowState,
+  creationEvent: TaskCreatedEvent,
+): boolean {
+  return stableJson(state.events[0]) === stableJson(creationEvent);
+}
+
 function initiativeRepairCreationEvent(
   state: WorkflowState,
   taskId: string,
@@ -4382,8 +4406,11 @@ function startInitiativeRepairTask(
   node: DependencyGraph["nodes"][number],
 ): StartWorkflowTaskRequest {
   const repair = node.repair;
-  if (repair === undefined) {
-    throw new TypeError("Initiative Repair Task requires Repair context.");
+  const repairIntent = node.repairIntent;
+  if (repair === undefined || repairIntent === undefined) {
+    throw new TypeError(
+      "Initiative Repair Task requires failure context and Repair Task intent.",
+    );
   }
   const identifier = `REPAIR-${event.eventId}-${node.taskId}`;
   return {
@@ -4394,11 +4421,7 @@ function startInitiativeRepairTask(
       route: "build",
       parentTaskId: initiative.id,
       initiativeGraphId: null,
-      intent: {
-        goals: [repair.summary],
-        nonGoals: [],
-        acceptanceCriteria: [repair.summary],
-      },
+      intent: repairIntent,
       scope: node.resources,
       baselineRef: "baseline.json",
       contexts: { triage: "context/triage.jsonl" },

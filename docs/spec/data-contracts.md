@@ -392,7 +392,7 @@ Secrets and excessive raw output MUST be redacted or stored in local diagnostic 
 
 `supersedes` edges retain replaced nodes; they do not delete historical Tasks. Readiness is derived and SHOULD NOT be persisted as an independent source of truth.
 
-Ordinary Build nodes omit `repair`. A graph-visible Repair node retains the failed Integration context in `repair`: `failureKind` is `conflict` or `acceptance-failed`, `summary` is non-empty, and `evidence` contains at least one typed Evidence reference. Repair creation also creates the matching durable child Build Task with the Initiative as `parentTaskId`. The Repair node has explicit `blocks` edges from its completed prerequisite Build nodes; a later graph revision retains both the original nodes and their Events.
+Ordinary Build nodes omit `repair` and `repairIntent`. A graph-visible Repair node retains the failed Integration context in `repair`: `failureKind` is `conflict` or `acceptance-failed`, `summary` is non-empty, and `evidence` contains at least one typed Evidence reference. Its `repairIntent` retains the child Build Task's non-empty goals and independently verifiable acceptance criteria. Repair creation also creates the matching durable child Build Task with the Initiative as `parentTaskId`. The Repair node has explicit `blocks` edges from its completed prerequisite Build nodes; a later graph revision retains both the original nodes and their Events.
 
 ## 13. External Reference
 

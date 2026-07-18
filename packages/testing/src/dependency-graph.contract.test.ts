@@ -58,7 +58,7 @@ test("Core validates an acyclic Dependency Graph without losing durable identity
   assert.ok(Object.isFrozen(result.graph.edges));
 });
 
-test("Core preserves graph-visible Repair context and rejects ungrounded failures", () => {
+test("Core preserves graph-visible Repair context and requires Repair Task intent", () => {
   const repairNode = {
     taskId: "TASK-5-REPAIR",
     priority: 30,
@@ -72,6 +72,11 @@ test("Core preserves graph-visible Repair context and rejects ungrounded failure
           reference: "evidence/integration-conflict.json",
         },
       ],
+    },
+    repairIntent: {
+      goals: ["Resolve the Integration conflict."],
+      nonGoals: [],
+      acceptanceCriteria: ["The Integration validation passes."],
     },
   } as const;
   const graph = {
@@ -119,6 +124,27 @@ test("Core preserves graph-visible Repair context and rejects ungrounded failure
           "Dependency Graph Repair context must retain at least one evidence reference.",
         remediation:
           "Reference the conflict or failed acceptance evidence for the Repair node.",
+      },
+    ],
+  });
+  const missingIntent = coreContract.validateDependencyGraph({
+    contractVersion: 1,
+    graph: {
+      ...graph,
+      nodes: [...validGraph.nodes, { ...repairNode, repairIntent: undefined }],
+    },
+  });
+  assert.deepEqual(missingIntent, {
+    ok: false,
+    contractVersion: 1,
+    diagnostics: [
+      {
+        code: "dependency_graph.graph.invalid",
+        path: "$.graph.nodes[2].repairIntent",
+        message:
+          "Dependency Graph Repair nodes must retain both failure context and Repair Task intent.",
+        remediation:
+          "Provide matching repair and repairIntent values for each Repair node.",
       },
     ],
   });

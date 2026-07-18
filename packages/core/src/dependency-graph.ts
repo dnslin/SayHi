@@ -6,6 +6,7 @@ import type {
   DependencyGraphEdgeType,
   DependencyGraphNode,
   InitiativeRepairContext,
+  TaskIntent,
 } from "./workflow.js";
 
 export const DEPENDENCY_GRAPH_CONTRACT_VERSION = 1 as const;
@@ -292,6 +293,15 @@ function validateNode(
   if (repairFailure !== null) {
     return repairFailure;
   }
+  const repairIntentFailure = validateRepairTaskIntent(
+    value.repair,
+    value.repairIntent,
+    path,
+  );
+  if (repairIntentFailure !== null) {
+    return repairIntentFailure;
+  }
+
 
   return null;
 }
@@ -346,6 +356,51 @@ function validateRepairContext(
         `${path}.evidence[${index}]`,
         "Dependency Graph Repair evidence must be a typed non-empty reference.",
         "Provide Gate Evidence that identifies the failed Integration result.",
+      );
+    }
+  }
+  return null;
+}
+
+function validateRepairTaskIntent(
+  repair: unknown,
+  value: unknown,
+  nodePath: string,
+): DependencyGraphValidationFailure | null {
+  if (repair === undefined && value === undefined) {
+    return null;
+  }
+  if (repair === undefined || value === undefined) {
+    return invalidGraph(
+      `${nodePath}.${repair === undefined ? "repair" : "repairIntent"}`,
+      "Dependency Graph Repair nodes must retain both failure context and Repair Task intent.",
+      "Provide matching repair and repairIntent values for each Repair node.",
+    );
+  }
+  if (!isUnknownRecord(value)) {
+    return invalidGraph(
+      `${nodePath}.repairIntent`,
+      "Dependency Graph Repair Task intent must be a readable object.",
+      "Provide goals, nonGoals, and acceptanceCriteria for the Repair Build Task.",
+    );
+  }
+  const fields = ["goals", "nonGoals", "acceptanceCriteria"] as const;
+  for (const field of fields) {
+    const entries = value[field];
+    if (
+      !Array.isArray(entries) ||
+      entries.some(
+        (entry) => typeof entry !== "string" || entry.trim().length === 0,
+      ) ||
+      ((field === "goals" || field === "acceptanceCriteria") &&
+        entries.length === 0)
+    ) {
+      return invalidGraph(
+        `${nodePath}.repairIntent.${field}`,
+        `Dependency Graph Repair Task intent ${field} must contain valid text${
+          field === "goals" || field === "acceptanceCriteria" ? " and cannot be empty" : ""
+        }.`,
+        "Provide independently verifiable Repair Build Task intent.",
       );
     }
   }
@@ -530,6 +585,10 @@ function copyDependencyGraph(graph: DependencyGraph): DependencyGraph {
           ...(node.repair === undefined
             ? {}
             : { repair: copyRepairContext(node.repair) }),
+          ...(node.repairIntent === undefined
+            ? {}
+            : { repairIntent: copyTaskIntent(node.repairIntent) }),
+
 
         }),
       ),
@@ -557,6 +616,14 @@ function copyRepairContext(context: InitiativeRepairContext): InitiativeRepairCo
         Object.freeze({ kind: evidence.kind, reference: evidence.reference }),
       ),
     ),
+  });
+}
+
+function copyTaskIntent(intent: TaskIntent): TaskIntent {
+  return Object.freeze({
+    goals: copyStrings(intent.goals),
+    nonGoals: copyStrings(intent.nonGoals),
+    acceptanceCriteria: copyStrings(intent.acceptanceCriteria),
   });
 }
 

@@ -142,6 +142,7 @@ export interface DependencyGraphNode {
   readonly priority: number;
   readonly resources: TaskScope;
   readonly repair?: InitiativeRepairContext;
+  readonly repairIntent?: TaskIntent;
 }
 
 export interface DependencyGraphEdge {

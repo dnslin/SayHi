@@ -6,6 +6,7 @@ import type { InitiativeReadinessResult } from "./initiative-readiness.js";
 import type {
   DependencyGraph,
   InitiativeRepairContext,
+  TaskIntent,
   TaskScope,
 } from "./workflow.js";
 
@@ -15,6 +16,7 @@ export interface InitiativeRepairNode {
   readonly resources: TaskScope;
   readonly blockers: readonly string[];
   readonly context: InitiativeRepairContext;
+  readonly intent: TaskIntent;
 }
 
 export interface PrepareInitiativeRepairGraphRequest {
@@ -96,6 +98,11 @@ export function prepareInitiativeRepairGraph(
         );
       }
     }
+    if (!hasRepairIntent(repair.intent)) {
+      throw new TypeError(
+        `Initiative Repair Task ${repair.taskId} must declare goals and independently verifiable acceptance criteria.`,
+      );
+    }
     return repair;
   });
 
@@ -109,6 +116,7 @@ export function prepareInitiativeRepairGraph(
         priority: repair.priority,
         resources: repair.resources,
         repair: repair.context,
+        repairIntent: repair.intent,
       })),
     ],
     edges: [
@@ -132,4 +140,29 @@ export function prepareInitiativeRepairGraph(
     throw new TypeError(validation.diagnostics[0]?.message ?? "Invalid Initiative Repair graph.");
   }
   return validation.graph;
+}
+
+function hasRepairIntent(value: unknown): value is TaskIntent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const intent = value as Record<string, unknown>;
+  return (
+    isNonEmptyStringList(intent.goals) &&
+    isStringList(intent.nonGoals) &&
+    isNonEmptyStringList(intent.acceptanceCriteria)
+  );
+}
+
+function isNonEmptyStringList(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.length > 0 && isStringList(value);
+}
+
+function isStringList(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) => typeof entry === "string" && entry.trim().length > 0,
+    )
+  );
 }

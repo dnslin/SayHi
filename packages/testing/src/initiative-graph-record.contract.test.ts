@@ -477,6 +477,11 @@ test("Core rejects unsafe and stale Initiative graph revisions without replacing
                 },
               ],
             },
+            repairIntent: {
+              goals: ["Repair the bypassed Integration failure."],
+              nonGoals: [],
+              acceptanceCriteria: ["The parent integration validation passes."],
+            },
           },
         ],
         edges: [
@@ -799,6 +804,13 @@ test("Integration creates a durable Repair node behind the Writer barrier and re
                 },
               ],
             },
+            intent: {
+              goals: ["Repair the failed parent integration validation."],
+              nonGoals: [],
+              acceptanceCriteria: [
+                "The parent integration validation passes with the repaired Build output.",
+              ],
+            },
           },
         ],
       };
@@ -838,6 +850,13 @@ test("Integration creates a durable Repair node behind the Writer barrier and re
           kind: "validation",
           reference: "evidence/integration-failure.json",
         },
+      ],
+    },
+    repairIntent: {
+      goals: ["Repair the failed parent integration validation."],
+      nonGoals: [],
+      acceptanceCriteria: [
+        "The parent integration validation passes with the repaired Build output.",
       ],
     },
   });
@@ -910,6 +929,13 @@ test("Integration creates a durable Repair node behind the Writer barrier and re
   }
   assert.equal(repair.state.projection.route, "build");
   assert.equal(repair.state.projection.parentTaskId, INITIATIVE_ID);
+  assert.deepEqual(repair.state.projection.intent, {
+    goals: ["Repair the failed parent integration validation."],
+    nonGoals: [],
+    acceptanceCriteria: [
+      "The parent integration validation passes with the repaired Build output.",
+    ],
+  });
 
   await mkdir(
     join(fixture.repository, ".sayhi", "tasks", repairFixture.taskId, "context"),
@@ -1054,6 +1080,11 @@ test("Task recovery creates missing Repair children after an interrupted Integra
               },
             ],
           },
+          intent: {
+            goals: ["Resolve the incompatible generated output."],
+            nonGoals: [],
+            acceptanceCriteria: ["Integration accepts the regenerated output."],
+          },
         },
       ],
     }),
@@ -1099,6 +1130,156 @@ test("Task recovery creates missing Repair children after an interrupted Integra
   if (repair.ok) {
     assert.equal(repair.state.projection.parentTaskId, INITIATIVE_ID);
   }
+});
+
+test("Task recovery rebuilds a Repair child Projection after its Event persists", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t, "completed");
+  const parent = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(parent.ok, true);
+  if (!parent.ok) {
+    return;
+  }
+  const repairTaskId = "TASK-14-RECOVERY-PROJECTION";
+  let failProjectionWrite = true;
+  const faultingFileSystem = new Proxy(fixture.fileSystem, {
+    get(target, property, receiver) {
+      if (property === "writeFile") {
+        return async (path: string, content: string) => {
+          if (
+            failProjectionWrite &&
+            path === `.sayhi/tasks/${repairTaskId}/task.json`
+          ) {
+            failProjectionWrite = false;
+            throw new Error("Injected Repair Projection write interruption.");
+          }
+          await target.writeFile(path, content);
+        };
+      }
+      const member = Reflect.get(target, property, receiver);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const interrupted = await new InitiativeExecutionScheduler().integrate({
+    fileSystem: faultingFileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: parent.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    event: revisionEvent("RECOVERY-PROJECTION"),
+    run: async () => ({
+      kind: "repair-required" as const,
+      repairs: [
+        {
+          taskId: repairTaskId,
+          priority: 60,
+          resources: { files: [], apis: [], schemas: [], locks: [] },
+          blockers: [RECORDED_NODE_ID],
+          context: {
+            failureKind: "conflict",
+            summary: "Integration found incompatible generated output.",
+            evidence: [
+              {
+                kind: "validation",
+                reference: "evidence/integration-conflict.json",
+              },
+            ],
+          },
+          intent: {
+            goals: ["Resolve the incompatible generated output."],
+            nonGoals: [],
+            acceptanceCriteria: ["Integration accepts the regenerated output."],
+          },
+        },
+      ],
+    }),
+  });
+  assert.equal(interrupted.status, "failed");
+  const projectionPath = join(
+    fixture.repository,
+    ".sayhi",
+    "tasks",
+    repairTaskId,
+    "task.json",
+  );
+  await assert.rejects(readFile(projectionPath, "utf8"), { code: "ENOENT" });
+
+  const recovered = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(recovered.ok, true);
+  if (!recovered.ok) {
+    return;
+  }
+  assert.equal(recovered.recovered, true);
+  assert.equal(
+    JSON.parse(await readFile(projectionPath, "utf8")).id,
+    repairTaskId,
+  );
+});
+
+test("Integration rejects an unrelated child Build at a Repair task identity", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t, "completed");
+  const parent = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(parent.ok, true);
+  if (!parent.ok) {
+    return;
+  }
+  const repairTaskId = "TASK-14-REPAIR-IDENTITY";
+  const unrelated = await createDurableTask({
+    fileSystem: fixture.fileSystem,
+    start: startRequest(
+      repairTaskId,
+      "build",
+      null,
+      "UNRELATED-REPAIR-IDENTITY",
+      INITIATIVE_ID,
+    ),
+  });
+  assert.equal(unrelated.ok, true);
+  if (!unrelated.ok) {
+    return;
+  }
+
+  const integration = await new InitiativeExecutionScheduler().integrate({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: parent.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    event: revisionEvent("REPAIR-IDENTITY"),
+    run: async () => ({
+      kind: "repair-required" as const,
+      repairs: [
+        {
+          taskId: repairTaskId,
+          priority: 60,
+          resources: { files: [], apis: [], schemas: [], locks: [] },
+          blockers: [RECORDED_NODE_ID],
+          context: {
+            failureKind: "conflict",
+            summary: "Integration found incompatible generated output.",
+            evidence: [
+              {
+                kind: "validation",
+                reference: "evidence/integration-conflict.json",
+              },
+            ],
+          },
+          intent: {
+            goals: ["Resolve the incompatible generated output."],
+            nonGoals: [],
+            acceptanceCriteria: ["Integration accepts the regenerated output."],
+          },
+        },
+      ],
+    }),
+  });
+  assert.equal(integration.status, "failed");
 });
 
 
