@@ -2664,6 +2664,7 @@ const INSTALLED_CONTRACT_FILES = Object.freeze([
   "task-lifecycle.contract.test.js",
   "task-lifecycle-filesystem.contract.test.js",
   "execution.contract.test.js",
+  "initiative-scheduler.contract.test.js",
   "context-cli.contract.test.js",
   "context-manifest.contract.test.js",
   "spec-context-cli.contract.test.js",
