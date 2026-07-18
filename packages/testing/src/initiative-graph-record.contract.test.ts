@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { NodeManagedProjectFileSystem, runCli, type CliJsonEnvelope } from "@dnslin/sayhi-cli";
 import {
+  archiveDurableTask,
   advanceDurableTask,
   coreContract,
   createDurableTask,
@@ -21,6 +22,8 @@ import {
   type WorkflowRoute,
   type WorkflowState,
 } from "@dnslin/sayhi-core";
+
+import { createCompletedDurableTask } from "./task-lifecycle-test-support.js";
 
 const INITIATIVE_ID = "TASK-14-INITIATIVE";
 const GRAPH_ID = "GRAPH-14";
@@ -82,6 +85,172 @@ test("Core stores an Initiative graph and CLI inspection reports its dependencie
   assert.equal(envelope.operation, "graph.show");
   assert.deepEqual(envelope.result?.graph, fixture.graph);
   assert.deepEqual(envelope.result?.nodes, inspected.nodes);
+});
+
+test("Core derives the ready Initiative frontier from local durable Task state", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+
+  const derived = await coreContract.inspectDurableInitiativeReadiness({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(derived.ok, true);
+  if (!derived.ok) {
+    return;
+  }
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      {
+        taskId: RECORDED_NODE_ID,
+        readiness: "ready",
+        blockerCodes: [],
+      },
+      {
+        taskId: MISSING_NODE_ID,
+        readiness: "waiting",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_incomplete",
+        ],
+      },
+    ],
+  );
+  assert.deepEqual(derived.frontier, [RECORDED_NODE_ID]);
+
+  const replayed = await coreContract.inspectDurableInitiativeReadiness({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.deepEqual(replayed, derived);
+
+  const shown = await runCli([
+    "graph",
+    "ready",
+    INITIATIVE_ID,
+    "--cwd",
+    fixture.repository,
+    "--json",
+  ]);
+  assert.equal(shown.exitCode, 0);
+  const envelope = JSON.parse(shown.stdout) as CliJsonEnvelope;
+  assert.equal(envelope.operation, "graph.ready");
+  assert.deepEqual(envelope.result?.frontier, derived.frontier);
+  assert.deepEqual(envelope.result?.nodes, derived.nodes);
+});
+
+test("Core rejects Initiative readiness derived for a stale graph version", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const request = {
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedGraphVersion: fixture.graph.version + 1,
+  };
+
+  const derived = await coreContract.inspectDurableInitiativeReadiness(request);
+  assert.equal(derived.ok, false);
+  if (derived.ok) {
+    return;
+  }
+  assert.equal(derived.diagnostics[0]?.code, "workflow.version.stale");
+  assert.equal(derived.diagnostics[0]?.path, "$.expectedGraphVersion");
+
+  const shown = await runCli([
+    "graph",
+    "ready",
+    INITIATIVE_ID,
+    "--expected-graph-version",
+    String(fixture.graph.version + 1),
+    "--cwd",
+    fixture.repository,
+    "--json",
+  ]);
+  assert.equal(
+    (JSON.parse(shown.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.version.stale",
+  );
+});
+
+test("Core holds a Node outside the frontier when its required triage Context is missing", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  await rm(
+    join(
+      fixture.repository,
+      ".sayhi",
+      "tasks",
+      RECORDED_NODE_ID,
+      "context",
+      "triage.jsonl",
+    ),
+  );
+
+  const derived = await coreContract.inspectDurableInitiativeReadiness({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(derived.ok, true);
+  if (!derived.ok) {
+    return;
+  }
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      {
+        taskId: RECORDED_NODE_ID,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.task_context_invalid"],
+      },
+      {
+        taskId: MISSING_NODE_ID,
+        readiness: "waiting",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_incomplete",
+        ],
+      },
+    ],
+  );
+  assert.deepEqual(derived.frontier, []);
+});
+
+test("Core treats an archived completed Node Task as satisfying its blocking dependency", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t, "archived");
+
+  const derived = await coreContract.inspectDurableInitiativeReadiness({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(derived.ok, true);
+  if (!derived.ok) {
+    return;
+  }
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      {
+        taskId: RECORDED_NODE_ID,
+        readiness: "completed",
+        blockerCodes: [],
+      },
+      {
+        taskId: MISSING_NODE_ID,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.task_missing"],
+      },
+    ],
+  );
 });
 
 test("Core records an approved Initiative graph revision without changing its durable node identities", async (t) => {
@@ -490,7 +659,10 @@ test("Graph inspection rejects invalid and incompatible records without changing
   assert.deepEqual(after, before);
 });
 
-async function createInitiativeGraphFixture(t: test.TestContext) {
+async function createInitiativeGraphFixture(
+  t: test.TestContext,
+  recordedNodeState: "active" | "archived" = "active",
+) {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-initiative-graph-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   await mkdir(join(repository, ".git"));
@@ -500,12 +672,72 @@ async function createInitiativeGraphFixture(t: test.TestContext) {
   );
   const fileSystem = new NodeManagedProjectFileSystem(repository);
 
-  const recordedNode = await createDurableTask({
-    fileSystem,
-    start: startRequest(RECORDED_NODE_ID, "build", null, "NODE-CREATED"),
-  });
-  if (!recordedNode.ok) {
-    assert.fail(recordedNode.diagnostics[0]?.message ?? "Node creation failed");
+  if (recordedNodeState === "archived") {
+    const completed = await createCompletedDurableTask(
+      fileSystem,
+      {
+        taskId: RECORDED_NODE_ID,
+        title: `Exercise ${RECORDED_NODE_ID}`,
+        goal: `Complete ${RECORDED_NODE_ID}`,
+        acceptanceCriterion: `${RECORDED_NODE_ID} persists correctly`,
+        files: ["packages/core/**", "packages/cli/**"],
+        eventNamespace: "14-ARCHIVED",
+        sessionRef: "session-14",
+      },
+      "2026-07-15T10:00:00Z",
+      "2026-07-15T10:01:00Z",
+    );
+    const archived = await archiveDurableTask({
+      fileSystem,
+      transition: {
+        contractVersion: 1,
+        taskId: RECORDED_NODE_ID,
+        expectedVersion: completed.projection.version,
+        to: { lifecycle: "archived", phase: "finish", step: "archived" },
+        gates: [
+          {
+            gate: "archive",
+            evidence: [
+              { kind: "validation", reference: "evidence/node-archived.json" },
+            ],
+          },
+        ],
+        event: eventMetadata("NODE-ARCHIVED"),
+      },
+    });
+    if (!archived.ok) {
+      assert.fail(archived.diagnostics[0]?.message ?? "Node archive failed");
+    }
+  } else {
+    const recordedNode = await createDurableTask({
+      fileSystem,
+      start: startRequest(RECORDED_NODE_ID, "build", null, "NODE-CREATED"),
+    });
+    if (!recordedNode.ok) {
+      assert.fail(recordedNode.diagnostics[0]?.message ?? "Node creation failed");
+    }
+    await mkdir(
+      join(
+        repository,
+        ".sayhi",
+        "tasks",
+        RECORDED_NODE_ID,
+        "context",
+      ),
+      { recursive: true },
+    );
+    await writeFile(
+      join(
+        repository,
+        ".sayhi",
+        "tasks",
+        RECORDED_NODE_ID,
+        "context",
+        "triage.jsonl",
+      ),
+      "",
+      "utf8",
+    );
   }
 
   const created = await createDurableTask({
@@ -641,7 +873,7 @@ function startRequest(
         locks: [],
       },
       baselineRef: "baseline.json",
-      contexts: {},
+      contexts: route === "build" ? { triage: "context/triage.jsonl" } : {},
       policies: { commit: "never", push: "never", maxRepairAttempts: 2 },
     },
     routeGate: {

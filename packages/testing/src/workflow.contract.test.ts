@@ -874,6 +874,405 @@ test("Initiative cannot leave Plan without a validated graph snapshot", () => {
   assert.deepEqual(state, snapshot);
 });
 
+test("Core propagates blocked, cancelled, failed, and repair-required states through blocking edges", () => {
+  const ready = startTask("build", 2, "ready");
+
+  let blocked = startTask("build", 2, "blocked");
+  blocked = advanceTask(blocked, "blocked", "triage", "blocked", ["Dependency failed."]);
+
+  let cancelled = startTask("build", 2, "cancelled");
+  cancelled = advanceTask(cancelled, "cancelled", "triage", "cancelled");
+
+  let failed = startTask("build", 2, "failed");
+  failed = advanceTask(failed, "active", "explore", "failed-explore");
+  failed = advanceTask(failed, "active", "plan", "failed-plan");
+  failed = advanceTask(failed, "active", "implement", "failed-implement");
+  failed = recordWorkflowAgentResult(
+    failed,
+    "implement",
+    "implementation",
+    "blocked",
+    [],
+    "failed-result",
+  );
+
+  let repair = startTask("build", 2, "repair");
+  repair = advanceTask(repair, "active", "explore", "repair-explore");
+  repair = advanceTask(repair, "active", "plan", "repair-plan");
+  repair = advanceTask(repair, "active", "implement", "repair-implement");
+  repair = advanceTask(repair, "active", "review", "repair-review");
+  repair = advanceTask(repair, "active", "implement", "repair-required");
+
+  const states = [
+    { taskId: ready.projection.id, state: ready },
+    { taskId: blocked.projection.id, state: blocked },
+    { taskId: `${blocked.projection.id}-dependent`, state: null },
+    { taskId: `${blocked.projection.id}-dependent-dependent`, state: null },
+    { taskId: cancelled.projection.id, state: cancelled },
+    { taskId: `${cancelled.projection.id}-dependent`, state: null },
+    { taskId: failed.projection.id, state: failed },
+    { taskId: `${failed.projection.id}-dependent`, state: null },
+    { taskId: repair.projection.id, state: repair },
+    { taskId: `${repair.projection.id}-dependent`, state: null },
+  ] as const;
+  const graph = {
+    schemaVersion: 1,
+    id: "GRAPH-3-READINESS",
+    initiativeTaskId: "TASK-3-INITIATIVE",
+    version: 1,
+    nodes: states.map(({ taskId }, index) => ({
+      taskId,
+      priority: 100 - index,
+      resources: { files: [], apis: [], schemas: [], locks: [] },
+    })),
+    edges: [
+      blockingEdge(blocked.projection.id),
+      blockingEdge(`${blocked.projection.id}-dependent`),
+      blockingEdge(cancelled.projection.id),
+      blockingEdge(failed.projection.id),
+      blockingEdge(repair.projection.id),
+    ],
+    updatedByEvent: "EVENT-3-READINESS",
+  } as const satisfies DependencyGraph;
+
+  const derived = coreContract.deriveInitiativeReadiness(
+    graph,
+    states.map(({ taskId, state }) => ({
+      taskId,
+      state,
+      contextState: "valid" as const,
+    })),
+  );
+  assert.deepEqual(derived.frontier, [ready.projection.id]);
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      { taskId: ready.projection.id, readiness: "ready", blockerCodes: [] },
+      {
+        taskId: blocked.projection.id,
+        readiness: "blocked",
+        blockerCodes: ["initiative_readiness.task_blocked"],
+      },
+      {
+        taskId: `${blocked.projection.id}-dependent`,
+        readiness: "blocked",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_blocked",
+        ],
+      },
+      {
+        taskId: `${blocked.projection.id}-dependent-dependent`,
+        readiness: "blocked",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_blocked",
+        ],
+      },
+      {
+        taskId: cancelled.projection.id,
+        readiness: "blocked",
+        blockerCodes: ["initiative_readiness.task_cancelled"],
+      },
+      {
+        taskId: `${cancelled.projection.id}-dependent`,
+        readiness: "blocked",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_cancelled",
+        ],
+      },
+      {
+        taskId: failed.projection.id,
+        readiness: "blocked",
+        blockerCodes: ["initiative_readiness.task_failed"],
+      },
+      {
+        taskId: `${failed.projection.id}-dependent`,
+        readiness: "blocked",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_failed",
+        ],
+      },
+      {
+        taskId: repair.projection.id,
+        readiness: "blocked",
+        blockerCodes: ["initiative_readiness.task_repair_required"],
+      },
+      {
+        taskId: `${repair.projection.id}-dependent`,
+        readiness: "blocked",
+        blockerCodes: [
+          "initiative_readiness.task_missing",
+          "initiative_readiness.dependency_repair_required",
+        ],
+      },
+    ],
+  );
+
+  const transitive = derived.nodes.find(
+    (node) => node.taskId === `${blocked.projection.id}-dependent-dependent`,
+  );
+  assert.deepEqual(
+    transitive?.blockers.map((blocker) => ({ code: blocker.code, taskId: blocker.taskId })),
+    [
+      {
+        code: "initiative_readiness.task_missing",
+        taskId: `${blocked.projection.id}-dependent-dependent`,
+      },
+      {
+        code: "initiative_readiness.dependency_blocked",
+        taskId: blocked.projection.id,
+      },
+    ],
+  );
+
+  const replayed = states.map(({ taskId, state }) => {
+    if (state === null) {
+      return { taskId, state, contextState: "valid" as const };
+    }
+    const result = coreContract.replayWorkflowEvents(state.events);
+    assert.equal(result.ok, true);
+    return {
+      taskId,
+      state: result.ok ? result.state : null,
+      contextState: "valid" as const,
+    };
+  });
+  assert.deepEqual(coreContract.deriveInitiativeReadiness(graph, replayed), derived);
+});
+
+test("Core excludes in-progress Nodes from the frontier and clears a superseded failed result", () => {
+  let inProgress = startTask("build", 2, "in-progress");
+  inProgress = advanceTask(inProgress, "active", "explore", "in-progress-explore");
+
+  let retried = startTask("build", 2, "retried");
+  retried = advanceTask(retried, "active", "explore", "retried-explore");
+  retried = advanceTask(retried, "active", "plan", "retried-plan");
+  retried = advanceTask(retried, "active", "implement", "retried-implement");
+  retried = recordWorkflowAgentResult(
+    retried,
+    "implement",
+    "implementation",
+    "blocked",
+    [],
+    "retried-failed-result",
+  );
+  retried = recordWorkflowAgentResult(
+    retried,
+    "implement",
+    "implementation",
+    "succeeded",
+    [],
+    "retried-successful-result",
+  );
+
+  const graph = {
+    schemaVersion: 1,
+    id: "GRAPH-3-IN-PROGRESS",
+    initiativeTaskId: "TASK-3-INITIATIVE",
+    version: 1,
+    nodes: [inProgress, retried].map((state, index) => ({
+      taskId: state.projection.id,
+      priority: 100 - index,
+      resources: { files: [], apis: [], schemas: [], locks: [] },
+    })),
+    edges: [],
+    updatedByEvent: "EVENT-3-IN-PROGRESS",
+  } as const satisfies DependencyGraph;
+  const derived = coreContract.deriveInitiativeReadiness(graph, [
+    { taskId: inProgress.projection.id, state: inProgress, contextState: "valid" },
+    { taskId: retried.projection.id, state: retried, contextState: "valid" },
+  ]);
+
+  assert.deepEqual(derived.frontier, []);
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      {
+        taskId: inProgress.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.task_in_progress"],
+      },
+      {
+        taskId: retried.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.task_in_progress"],
+      },
+    ],
+  );
+});
+
+test("Core holds informative and validation dependents outside the ready frontier", () => {
+  const prerequisite = startTask("build", 2, "prerequisite");
+  const informed = startTask("build", 2, "informed");
+  const validated = startTask("build", 2, "validated");
+  const graph = {
+    schemaVersion: 1,
+    id: "GRAPH-3-NONBLOCKING",
+    initiativeTaskId: "TASK-3-INITIATIVE",
+    version: 1,
+    nodes: [prerequisite, informed, validated].map((state, index) => ({
+      taskId: state.projection.id,
+      priority: 100 - index,
+      resources: { files: [], apis: [], schemas: [], locks: [] },
+    })),
+    edges: [
+      {
+        from: prerequisite.projection.id,
+        to: informed.projection.id,
+        type: "informs",
+        reason: "The informed Node needs the predecessor evidence.",
+      },
+      {
+        from: prerequisite.projection.id,
+        to: validated.projection.id,
+        type: "validates",
+        reason: "The validated Node needs the predecessor result.",
+      },
+    ],
+    updatedByEvent: "EVENT-3-NONBLOCKING",
+  } as const satisfies DependencyGraph;
+  const derived = coreContract.deriveInitiativeReadiness(graph, [
+    { taskId: prerequisite.projection.id, state: prerequisite, contextState: "valid" },
+    { taskId: informed.projection.id, state: informed, contextState: "valid" },
+    { taskId: validated.projection.id, state: validated, contextState: "valid" },
+  ]);
+
+  assert.deepEqual(derived.frontier, [prerequisite.projection.id]);
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      { taskId: prerequisite.projection.id, readiness: "ready", blockerCodes: [] },
+      {
+        taskId: informed.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.dependency_incomplete"],
+      },
+      {
+        taskId: validated.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.dependency_incomplete"],
+      },
+    ],
+  );
+});
+
+test("Core rejects non-Build Tasks from an Initiative ready frontier", () => {
+  const quick = startTask("quick", 2, "quick-node");
+  const graph = {
+    schemaVersion: 1,
+    id: "GRAPH-3-QUICK-NODE",
+    initiativeTaskId: "TASK-3-INITIATIVE",
+    version: 1,
+    nodes: [
+      {
+        taskId: quick.projection.id,
+        priority: 100,
+        resources: { files: [], apis: [], schemas: [], locks: [] },
+      },
+    ],
+    edges: [],
+    updatedByEvent: "EVENT-3-QUICK-NODE",
+  } as const satisfies DependencyGraph;
+  const derived = coreContract.deriveInitiativeReadiness(graph, [
+    { taskId: quick.projection.id, state: quick, contextState: "valid" },
+  ]);
+
+  assert.deepEqual(derived.frontier, []);
+  assert.deepEqual(derived.nodes, [
+    {
+      taskId: quick.projection.id,
+      readiness: "blocked",
+      blockers: [
+        {
+          code: "initiative_readiness.task_route_invalid",
+          taskId: quick.projection.id,
+          message: `Task ${quick.projection.id} uses the quick Route; Initiative graph nodes must be Build Tasks.`,
+        },
+      ],
+    },
+  ]);
+});
+
+test("Core fails closed when completed informative or validating dependencies lack evidence bindings", () => {
+  let completed = startTask("build", 2, "completed-evidence");
+  completed = advanceTask(completed, "active", "explore", "evidence-explore");
+  completed = advanceTask(completed, "active", "plan", "evidence-plan");
+  completed = advanceTask(completed, "active", "implement", "evidence-implement");
+  completed = advanceTask(completed, "active", "review", "evidence-review");
+  completed = advanceTask(completed, "active", "finish", "evidence-finish");
+  completed = advanceTask(completed, "completed", "finish", "evidence-completed");
+  const informed = startTask("build", 2, "evidence-informed");
+  const validated = startTask("build", 2, "evidence-validated");
+  const graph = {
+    schemaVersion: 1,
+    id: "GRAPH-3-EVIDENCE",
+    initiativeTaskId: "TASK-3-INITIATIVE",
+    version: 1,
+    nodes: [completed, informed, validated].map((state, index) => ({
+      taskId: state.projection.id,
+      priority: 100 - index,
+      resources: { files: [], apis: [], schemas: [], locks: [] },
+    })),
+    edges: [
+      {
+        from: completed.projection.id,
+        to: informed.projection.id,
+        type: "informs",
+        reason: "The informed Node needs bound evidence.",
+      },
+      {
+        from: completed.projection.id,
+        to: validated.projection.id,
+        type: "validates",
+        reason: "The validated Node needs bound evidence.",
+      },
+    ],
+    updatedByEvent: "EVENT-3-EVIDENCE",
+  } as const satisfies DependencyGraph;
+  const derived = coreContract.deriveInitiativeReadiness(graph, [
+    { taskId: completed.projection.id, state: completed, contextState: "valid" },
+    { taskId: informed.projection.id, state: informed, contextState: "valid" },
+    { taskId: validated.projection.id, state: validated, contextState: "valid" },
+  ]);
+
+  assert.deepEqual(derived.frontier, []);
+  assert.deepEqual(
+    derived.nodes.map((node) => ({
+      taskId: node.taskId,
+      readiness: node.readiness,
+      blockerCodes: node.blockers.map((blocker) => blocker.code),
+    })),
+    [
+      { taskId: completed.projection.id, readiness: "completed", blockerCodes: [] },
+      {
+        taskId: informed.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.dependency_evidence_required"],
+      },
+      {
+        taskId: validated.projection.id,
+        readiness: "waiting",
+        blockerCodes: ["initiative_readiness.dependency_evidence_required"],
+      },
+    ],
+  );
+});
+
 test("a block retry must repeat the accepted blocker intent", () => {
   const started = startTask("build");
   const request = {
@@ -2318,9 +2717,13 @@ function expectedStep(
     : "ready";
 }
 
-function startTask(route: WorkflowRoute, maxRepairAttempts = 2): WorkflowState {
+function startTask(
+  route: WorkflowRoute,
+  maxRepairAttempts = 2,
+  taskIdSuffix: string = route,
+): WorkflowState {
   const result = coreContract.startWorkflowTask(
-    startTaskRequest(route, maxRepairAttempts),
+    startTaskRequest(route, maxRepairAttempts, taskIdSuffix),
   );
 
   if (!result.ok) {
@@ -2333,11 +2736,12 @@ function startTask(route: WorkflowRoute, maxRepairAttempts = 2): WorkflowState {
 function startTaskRequest(
   route: WorkflowRoute,
   maxRepairAttempts = 2,
+  taskIdSuffix: string = route,
 ): StartWorkflowTaskRequest {
   return {
     contractVersion: 1,
     task: {
-      id: `TASK-3-${route}`,
+      id: `TASK-3-${taskIdSuffix}`,
       title: `Exercise the ${route} workflow`,
       route,
       parentTaskId: null,
@@ -2370,7 +2774,16 @@ function startTaskRequest(
         },
       ],
     },
-    event: eventMetadata(`${route}-created`),
+    event: eventMetadata(`${taskIdSuffix}-created`),
+  };
+}
+
+function blockingEdge(from: string): DependencyGraph["edges"][number] {
+  return {
+    from,
+    to: `${from}-dependent`,
+    type: "blocks",
+    reason: `Task ${from} must complete first.`,
   };
 }
 

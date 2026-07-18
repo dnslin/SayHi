@@ -1,4 +1,5 @@
 import { validateDependencyGraph } from "./dependency-graph.js";
+import { deriveInitiativeReadiness } from "./initiative-readiness.js";
 import {
   authorizePhaseExecution,
   bindPhaseExecution,
@@ -54,6 +55,7 @@ import {
   decideDurableBuildPlan,
   recordDurableBuildPlan,
   inspectDurableInitiativeGraph,
+  inspectDurableInitiativeReadiness,
   reviseDurableInitiativeGraph,
   dispatchDurablePhaseExecution,
   resumeDurablePhaseExecution,
@@ -175,6 +177,8 @@ export {
   DEPENDENCY_GRAPH_CONTRACT_VERSION,
   validateDependencyGraph,
 } from "./dependency-graph.js";
+
+export { deriveInitiativeReadiness } from "./initiative-readiness.js";
 export type {
   DependencyGraphDiagnostic,
   DependencyGraphDiagnosticCode,
@@ -183,6 +187,16 @@ export type {
   DependencyGraphValidationResult,
   DependencyGraphValidationSuccess,
 } from "./dependency-graph.js";
+
+export type {
+  InitiativeReadiness,
+  InitiativeReadinessBlocker,
+  InitiativeReadinessBlockerCode,
+  InitiativeReadinessNode,
+  InitiativeReadinessResult,
+  InitiativeReadinessTask,
+  InitiativeReadinessContextState,
+} from "./initiative-readiness.js";
 
 export type { ContractIdentity } from "./identity.js";
 
@@ -343,6 +357,7 @@ export {
   freezeDurableContextManifest,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  inspectDurableInitiativeReadiness,
   reviseDurableInitiativeGraph,
   removeDurableContextManifestEntry,
   withDurableTaskWriter,
@@ -362,6 +377,7 @@ export type {
   AddDurableContextManifestEntryRequest,
   AddDurableContextManifestEntryResult,
   InitiativeGraphFileSystem,
+  InitiativeReadinessFileSystem,
   ContextManifestFileSystem,
   InspectDurableContextManifestRequest,
   InspectDurableContextManifestResult,
@@ -369,6 +385,8 @@ export type {
   InitiativeGraphNodeStatus,
   InspectDurableInitiativeGraphRequest,
   InspectDurableInitiativeGraphResult,
+  InspectDurableInitiativeReadinessRequest,
+  InspectDurableInitiativeReadinessResult,
   RefreshDurableContextManifestRequest,
   RefreshDurableContextManifestResult,
   FreezeDurableContextManifestRequest,
@@ -446,6 +464,7 @@ export interface CoreContract {
   readBootstrapContract(): BootstrapContract;
   readonly validateDomainValue: typeof validateDomainValue;
   readonly validateDependencyGraph: typeof validateDependencyGraph;
+  readonly deriveInitiativeReadiness: typeof deriveInitiativeReadiness;
   readonly validateContractRecord: typeof validateContractRecord;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
   readonly initializeManagedProject: typeof initializeManagedProject;
@@ -488,6 +507,7 @@ export interface CoreContract {
   readonly withBoundDurableTaskWriter: typeof withBoundDurableTaskWriter;
   readonly inspectDurableContextManifest: typeof inspectDurableContextManifest;
   readonly inspectDurableInitiativeGraph: typeof inspectDurableInitiativeGraph;
+  readonly inspectDurableInitiativeReadiness: typeof inspectDurableInitiativeReadiness;
   readonly reviseDurableInitiativeGraph: typeof reviseDurableInitiativeGraph;
   readonly decideDurableBuildPlan: typeof decideDurableBuildPlan;
   readonly recordDurableBuildPlan: typeof recordDurableBuildPlan;
@@ -507,6 +527,7 @@ export const coreContract: CoreContract = Object.freeze({
   readBootstrapContract: () => bootstrapContract,
   validateDomainValue,
   validateDependencyGraph,
+  deriveInitiativeReadiness,
   validateContractRecord,
   diagnoseManagedProject,
   initializeManagedProject,
@@ -549,6 +570,7 @@ export const coreContract: CoreContract = Object.freeze({
   withBoundDurableTaskWriter,
   inspectDurableContextManifest,
   inspectDurableInitiativeGraph,
+  inspectDurableInitiativeReadiness,
   reviseDurableInitiativeGraph,
   decideDurableBuildPlan,
   recordDurableBuildPlan,

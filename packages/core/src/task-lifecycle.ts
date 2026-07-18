@@ -15,6 +15,12 @@ import {
   type DependencyGraphDiagnostic,
 } from "./dependency-graph.js";
 import {
+  deriveInitiativeReadiness,
+  requiresInitiativeTriageContext,
+  type InitiativeReadinessNode,
+  type InitiativeReadinessTask,
+} from "./initiative-readiness.js";
+import {
   RECORD_CONTRACT_VERSION,
   validateContractRecord,
   type AgentResultRecord,
@@ -134,6 +140,10 @@ export interface InitiativeGraphFileSystem extends TaskLifecycleFileSystem {
     operation: (writer: TaskWriter) => Promise<Result>,
   ): Promise<Result>;
 }
+
+export interface InitiativeReadinessFileSystem
+  extends InitiativeGraphFileSystem,
+    ContextManifestFileSystem {}
 
 export interface TaskBaselineFileSystem extends InitiativeGraphFileSystem {
   captureBaseline(request: TaskBaselineCaptureRequest): Promise<BaselineRecord>;
@@ -329,6 +339,21 @@ export type InspectDurableInitiativeGraphResult =
       contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
       graph: DependencyGraph;
       nodes: readonly InitiativeGraphNodeInspection[];
+    }>
+  | TaskLifecycleFailure;
+
+export interface InspectDurableInitiativeReadinessRequest {
+  readonly fileSystem: InitiativeReadinessFileSystem;
+  readonly initiativeTaskId: string;
+  readonly expectedGraphVersion?: number;
+}
+export type InspectDurableInitiativeReadinessResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      graph: DependencyGraph;
+      nodes: readonly InitiativeReadinessNode[];
+      frontier: readonly string[];
     }>
   | TaskLifecycleFailure;
 
@@ -1287,6 +1312,109 @@ async function inspectDurableInitiativeGraphLocked(
   request: InspectDurableInitiativeGraphRequest,
   paths: TaskPaths,
 ): Promise<InspectDurableInitiativeGraphResult> {
+  const inspection = await loadDurableInitiativeGraphInspection(request, paths);
+  if (!inspection.ok) {
+    return inspection;
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    graph: inspection.graph,
+    nodes: Object.freeze(inspection.nodes.map((node) => node.inspection)),
+  });
+}
+
+export async function inspectDurableInitiativeReadiness(
+  request: InspectDurableInitiativeReadinessRequest,
+): Promise<InspectDurableInitiativeReadinessResult> {
+  const paths = taskPaths(request.initiativeTaskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
+    inspectDurableInitiativeReadinessLocked(request, paths),
+  );
+}
+
+async function inspectDurableInitiativeReadinessLocked(
+  request: InspectDurableInitiativeReadinessRequest,
+  paths: TaskPaths,
+): Promise<InspectDurableInitiativeReadinessResult> {
+  const inspection = await loadDurableInitiativeGraphInspection(request, paths);
+  if (!inspection.ok) {
+    return inspection;
+  }
+  if (
+    request.expectedGraphVersion !== undefined &&
+    request.expectedGraphVersion !== inspection.graph.version
+  ) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedGraphVersion",
+        `Expected Initiative graph version ${request.expectedGraphVersion} does not match accepted version ${inspection.graph.version}.`,
+        "Reload the accepted Initiative graph before calculating readiness.",
+      ),
+    ]);
+  }
+  const tasks = await Promise.all(
+    inspection.nodes.map((node) =>
+      inspectInitiativeReadinessTask(request.fileSystem, node),
+    ),
+  );
+  const readiness = deriveInitiativeReadiness(inspection.graph, tasks);
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    graph: inspection.graph,
+    nodes: readiness.nodes,
+    frontier: readiness.frontier,
+  });
+}
+
+async function inspectInitiativeReadinessTask(
+  fileSystem: InitiativeReadinessFileSystem,
+  node: Readonly<{
+    inspection: InitiativeGraphNodeInspection;
+    state: WorkflowState | null;
+  }>,
+): Promise<InitiativeReadinessTask> {
+  const state = node.state;
+  if (!requiresInitiativeTriageContext(state)) {
+    return Object.freeze({
+      taskId: node.inspection.taskId,
+      state,
+      contextState: "valid" as const,
+    });
+  }
+  const context = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: node.inspection.taskId,
+    phase: "triage",
+  });
+  return Object.freeze({
+    taskId: node.inspection.taskId,
+    state,
+    contextState:
+      context.ok && context.state === "valid" ? ("valid" as const) : ("invalid" as const),
+  });
+}
+
+type DurableInitiativeGraphInspection =
+  | Readonly<{
+      ok: true;
+      graph: DependencyGraph;
+      nodes: readonly Readonly<{
+        inspection: InitiativeGraphNodeInspection;
+        state: WorkflowState | null;
+      }>[];
+    }>
+  | TaskLifecycleFailure;
+
+async function loadDurableInitiativeGraphInspection(
+  request: InspectDurableInitiativeGraphRequest,
+  paths: TaskPaths,
+): Promise<DurableInitiativeGraphInspection> {
   const loaded = await loadTask(request.fileSystem, request.initiativeTaskId);
   if (!loaded.ok) {
     return loaded;
@@ -1304,16 +1432,25 @@ async function inspectDurableInitiativeGraphLocked(
       inspectInitiativeGraphNode(request.fileSystem, graphRecord.graph, node),
     ),
   );
-  const nodes: InitiativeGraphNodeInspection[] = [];
+  const nodes: Array<
+    Readonly<{
+      inspection: InitiativeGraphNodeInspection;
+      state: WorkflowState | null;
+    }>
+  > = [];
   for (const inspectedNode of inspectedNodes) {
     if (!inspectedNode.ok) {
       return inspectedNode;
     }
-    nodes.push(inspectedNode.value);
+    nodes.push(
+      Object.freeze({
+        inspection: inspectedNode.value,
+        state: inspectedNode.state,
+      }),
+    );
   }
   return Object.freeze({
     ok: true,
-    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
     graph: graphRecord.graph,
     nodes: Object.freeze(nodes),
   });
@@ -1548,7 +1685,11 @@ type InitiativeGraphRecordLoadResult =
   | Readonly<{ ok: true; graph: DependencyGraph }>
   | TaskLifecycleFailure;
 type InitiativeGraphNodeInspectionResult =
-  | Readonly<{ ok: true; value: InitiativeGraphNodeInspection }>
+  | Readonly<{
+      ok: true;
+      value: InitiativeGraphNodeInspection;
+      state: WorkflowState | null;
+    }>
   | TaskLifecycleFailure;
 
 async function inspectInitiativeGraphNode(
@@ -1567,22 +1708,61 @@ async function inspectInitiativeGraphNode(
         }),
       ),
   );
-  const task = await readDurableTask({ fileSystem, taskId: node.taskId });
-  if (!task.ok) {
-    return task.diagnostics.some(
+  const activeTask = await readDurableTask({ fileSystem, taskId: node.taskId });
+  let state: WorkflowState | null;
+  if (activeTask.ok) {
+    state = activeTask.state;
+  } else if (
+    activeTask.diagnostics.some(
       (item) => item.code === "task_lifecycle.history.missing",
     )
-      ? Object.freeze({
-          ok: true,
-          value: Object.freeze({
-            taskId: node.taskId,
-            dependencies,
-            status: Object.freeze({ state: "missing" as const }),
-          }),
-        })
-      : task;
+  ) {
+    const paths = taskPaths(node.taskId);
+    if (!paths.ok) {
+      return paths;
+    }
+    const archivedTask = await loadTask(
+      fileSystem,
+      node.taskId,
+      paths.archiveTaskDirectory,
+    );
+    if (!archivedTask.ok) {
+      if (
+        archivedTask.diagnostics.some(
+          (item) => item.code === "task_lifecycle.history.missing",
+        )
+      ) {
+        state = null;
+      } else {
+        return archivedTask;
+      }
+    } else if (archivedTask.state.projection.lifecycle !== "archived") {
+      return failure([
+        diagnostic(
+          "task_lifecycle.history.invalid",
+          paths.archiveTaskDirectory,
+          "The archived Task directory does not contain an archived Task.",
+          "Restore the Task to its active path or archive it through the durable archive operation.",
+        ),
+      ]);
+    } else {
+      state = archivedTask.state;
+    }
+  } else {
+    return activeTask;
   }
-  const projection = task.state.projection;
+  if (state === null) {
+    return Object.freeze({
+      ok: true,
+      value: Object.freeze({
+        taskId: node.taskId,
+        dependencies,
+        status: Object.freeze({ state: "missing" as const }),
+      }),
+      state: null,
+    });
+  }
+  const projection = state.projection;
   return Object.freeze({
     ok: true,
     value: Object.freeze({
@@ -1596,6 +1776,7 @@ async function inspectInitiativeGraphNode(
         version: projection.version,
       }),
     }),
+    state,
   });
 }
 
