@@ -244,6 +244,7 @@ interface ParsedGraphArguments {
   readonly cwd: string;
   readonly json: boolean;
   readonly initiativeTaskId: string;
+  readonly expectedGraphVersion?: number;
   readonly source?: string;
   readonly mode?: GraphMutationMode;
 }
@@ -339,7 +340,7 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           "graph",
           2,
           graph.message,
-        "Run sayhi graph show <initiative-id>, graph ready <initiative-id>, or graph revise <initiative-id> --from <request.json> --plan|--apply.",
+        "Run sayhi graph show <initiative-id>, graph ready <initiative-id> [--expected-graph-version <version>], or graph revise <initiative-id> --from <request.json> --plan|--apply.",
           args.includes("--json"),
         );
   }
@@ -2162,10 +2163,18 @@ async function runGraphCli(parsed: ParsedGraphArguments): Promise<CliRunResult> 
       : cliDomainFailure(operation, result.diagnostics[0], parsed.json);
   }
   if (parsed.subcommand === "ready") {
-    const result = await coreContract.inspectDurableInitiativeReadiness({
-      fileSystem,
-      initiativeTaskId: parsed.initiativeTaskId,
-    });
+    const readinessRequest =
+      parsed.expectedGraphVersion === undefined
+        ? {
+            fileSystem,
+            initiativeTaskId: parsed.initiativeTaskId,
+          }
+        : {
+            fileSystem,
+            initiativeTaskId: parsed.initiativeTaskId,
+            expectedGraphVersion: parsed.expectedGraphVersion,
+          };
+    const result = await coreContract.inspectDurableInitiativeReadiness(readinessRequest);
     return result.ok
       ? cliSuccess(
           operation,
@@ -2666,6 +2675,7 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
   let json = false;
   let source: string | undefined;
   let mode: GraphMutationMode | undefined;
+  let expectedGraphVersion: number | undefined;
   let graphCount = 0;
   const values: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -2692,6 +2702,25 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
       index += 1;
       continue;
     }
+    if (argument === "--expected-graph-version") {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, message: "--expected-graph-version requires an integer." };
+      }
+      const parsedVersion = Number(value);
+      if (!Number.isSafeInteger(parsedVersion) || parsedVersion < 0) {
+        return {
+          ok: false,
+          message: "--expected-graph-version requires a non-negative integer.",
+        };
+      }
+      if (expectedGraphVersion !== undefined) {
+        return { ok: false, message: "Specify --expected-graph-version exactly once." };
+      }
+      expectedGraphVersion = parsedVersion;
+      index += 1;
+      continue;
+    }
     if (argument === "--plan" || argument === "--apply") {
       if (mode !== undefined) {
         return { ok: false, message: "Specify --plan or --apply exactly once." };
@@ -2713,18 +2742,33 @@ function parseGraphArguments(args: readonly string[]): GraphArgumentResult | nul
   }
   const [subcommand, initiativeTaskId, ...tail] = values;
   if (subcommand === "show" || subcommand === "ready") {
-    return initiativeTaskId !== undefined &&
-      tail.length === 0 &&
-      source === undefined &&
-      mode === undefined
-      ? { ok: true, command: "graph", subcommand, cwd, json, initiativeTaskId }
-      : { ok: false, message: `graph ${subcommand} requires exactly one Initiative id.` };
+    if (
+      initiativeTaskId === undefined ||
+      tail.length !== 0 ||
+      source !== undefined ||
+      mode !== undefined ||
+      (subcommand === "show" && expectedGraphVersion !== undefined)
+    ) {
+      return { ok: false, message: `graph ${subcommand} requires exactly one Initiative id.` };
+    }
+    const parsed: ParsedGraphArguments = {
+      ok: true,
+      command: "graph",
+      subcommand,
+      cwd,
+      json,
+      initiativeTaskId,
+    };
+    return expectedGraphVersion === undefined
+      ? parsed
+      : { ...parsed, expectedGraphVersion };
   }
   if (subcommand === "revise") {
     return initiativeTaskId !== undefined &&
       tail.length === 0 &&
       source !== undefined &&
-      mode !== undefined
+      mode !== undefined &&
+      expectedGraphVersion === undefined
       ? {
           ok: true,
           command: "graph",

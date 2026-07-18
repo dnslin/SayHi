@@ -143,6 +143,38 @@ test("Core derives the ready Initiative frontier from local durable Task state",
   assert.deepEqual(envelope.result?.nodes, derived.nodes);
 });
 
+test("Core rejects Initiative readiness derived for a stale graph version", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t);
+  const request = {
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedGraphVersion: fixture.graph.version + 1,
+  };
+
+  const derived = await coreContract.inspectDurableInitiativeReadiness(request);
+  assert.equal(derived.ok, false);
+  if (derived.ok) {
+    return;
+  }
+  assert.equal(derived.diagnostics[0]?.code, "workflow.version.stale");
+  assert.equal(derived.diagnostics[0]?.path, "$.expectedGraphVersion");
+
+  const shown = await runCli([
+    "graph",
+    "ready",
+    INITIATIVE_ID,
+    "--expected-graph-version",
+    String(fixture.graph.version + 1),
+    "--cwd",
+    fixture.repository,
+    "--json",
+  ]);
+  assert.equal(
+    (JSON.parse(shown.stdout) as CliJsonEnvelope).error?.code,
+    "workflow.version.stale",
+  );
+});
+
 test("Core holds a Node outside the frontier when its required triage Context is missing", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
   await rm(

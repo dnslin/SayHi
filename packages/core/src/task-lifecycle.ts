@@ -16,6 +16,7 @@ import {
 } from "./dependency-graph.js";
 import {
   deriveInitiativeReadiness,
+  requiresInitiativeTriageContext,
   type InitiativeReadinessNode,
   type InitiativeReadinessTask,
 } from "./initiative-readiness.js";
@@ -344,6 +345,7 @@ export type InspectDurableInitiativeGraphResult =
 export interface InspectDurableInitiativeReadinessRequest {
   readonly fileSystem: InitiativeReadinessFileSystem;
   readonly initiativeTaskId: string;
+  readonly expectedGraphVersion?: number;
 }
 export type InspectDurableInitiativeReadinessResult =
   | Readonly<{
@@ -1342,6 +1344,19 @@ async function inspectDurableInitiativeReadinessLocked(
   if (!inspection.ok) {
     return inspection;
   }
+  if (
+    request.expectedGraphVersion !== undefined &&
+    request.expectedGraphVersion !== inspection.graph.version
+  ) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedGraphVersion",
+        `Expected Initiative graph version ${request.expectedGraphVersion} does not match accepted version ${inspection.graph.version}.`,
+        "Reload the accepted Initiative graph before calculating readiness.",
+      ),
+    ]);
+  }
   const tasks = await Promise.all(
     inspection.nodes.map((node) =>
       inspectInitiativeReadinessTask(request.fileSystem, node),
@@ -1365,12 +1380,7 @@ async function inspectInitiativeReadinessTask(
   }>,
 ): Promise<InitiativeReadinessTask> {
   const state = node.state;
-  if (
-    state === null ||
-    state.projection.route !== "build" ||
-    state.projection.lifecycle !== "active" ||
-    state.projection.phase !== "triage"
-  ) {
+  if (!requiresInitiativeTriageContext(state)) {
     return Object.freeze({
       taskId: node.inspection.taskId,
       state,

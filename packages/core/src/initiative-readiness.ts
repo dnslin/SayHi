@@ -33,6 +33,17 @@ export interface InitiativeReadinessTask {
   readonly contextState: InitiativeReadinessContextState;
 }
 
+export function requiresInitiativeTriageContext(
+  state: WorkflowState | null,
+): boolean {
+  return (
+    state !== null &&
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "active" &&
+    state.projection.phase === "triage"
+  );
+}
+
 export interface InitiativeReadinessNode {
   readonly taskId: string;
   readonly readiness: InitiativeReadiness;
@@ -157,16 +168,11 @@ function readinessForTask(
   blockers: readonly InitiativeReadinessBlocker[];
 }> {
   if (state === null) {
-    return Object.freeze({
-      readiness: "waiting" as const,
-      blockers: Object.freeze([
-        blocker(
-          "initiative_readiness.task_missing",
-          taskId,
-          `Task ${taskId} has not been created in the Project Store.`,
-        ),
-      ]),
-    });
+    return waitingState(
+      "initiative_readiness.task_missing",
+      taskId,
+      `Task ${taskId} has not been created in the Project Store.`,
+    );
   }
   if (state.projection.route !== "build") {
     return blockedState(
@@ -179,7 +185,7 @@ function readinessForTask(
     state.projection.lifecycle === "completed" ||
     state.projection.lifecycle === "archived"
   ) {
-    return unblockedState("completed");
+    return readinessState("completed");
   }
   if (state.projection.lifecycle === "cancelled") {
     return blockedState(
@@ -210,10 +216,7 @@ function readinessForTask(
       `Task ${taskId} requires Review repair before dependent work can proceed.`,
     );
   }
-  if (
-    state.projection.lifecycle !== "active" ||
-    state.projection.phase !== "triage"
-  ) {
+  if (!requiresInitiativeTriageContext(state)) {
     return waitingState(
       "initiative_readiness.task_in_progress",
       taskId,
@@ -234,33 +237,34 @@ function readinessForTask(
       `Task ${taskId} has no valid triage Context Manifest.`,
     );
   }
-  return unblockedState("ready");
+  return readinessState("ready");
 }
 
-function unblockedState(
-  readiness: "ready" | "completed",
+const EMPTY_READINESS_BLOCKERS: readonly InitiativeReadinessBlocker[] = Object.freeze([]);
+
+function readinessState(
+  readiness: InitiativeReadiness,
+  blockers: readonly InitiativeReadinessBlocker[] = EMPTY_READINESS_BLOCKERS,
 ): Readonly<{
   readiness: InitiativeReadiness;
   blockers: readonly InitiativeReadinessBlocker[];
 }> {
-  return Object.freeze({ readiness, blockers: Object.freeze([]) });
+  return Object.freeze({
+    readiness,
+    blockers:
+      blockers.length === 0 ? EMPTY_READINESS_BLOCKERS : Object.freeze(blockers),
+  });
 }
 
 function waitingState(
-  code:
-    | "initiative_readiness.task_in_progress"
-    | "initiative_readiness.task_gate_unmet"
-    | "initiative_readiness.task_context_invalid",
+  code: Extract<InitiativeReadinessBlockerCode, `initiative_readiness.task_${string}`>,
   taskId: string,
   message: string,
 ): Readonly<{
   readiness: InitiativeReadiness;
   blockers: readonly InitiativeReadinessBlocker[];
 }> {
-  return Object.freeze({
-    readiness: "waiting" as const,
-    blockers: Object.freeze([blocker(code, taskId, message)]),
-  });
+  return readinessState("waiting", [blocker(code, taskId, message)]);
 }
 
 function blockedState(
@@ -271,10 +275,7 @@ function blockedState(
   readiness: InitiativeReadiness;
   blockers: readonly InitiativeReadinessBlocker[];
 }> {
-  return Object.freeze({
-    readiness: "blocked" as const,
-    blockers: Object.freeze([blocker(code, taskId, message)]),
-  });
+  return readinessState("blocked", [blocker(code, taskId, message)]);
 }
 
 function hasAcceptedRouteGate(state: WorkflowState): boolean {
