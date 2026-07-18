@@ -198,6 +198,20 @@ export type {
   InitiativeReadinessContextState,
 } from "./initiative-readiness.js";
 
+export {
+  InitiativeExecutionScheduler,
+  InitiativeReadWriteBarrier,
+} from "./initiative-scheduler.js";
+export type {
+  InitiativeNodeExecution,
+  InitiativeNodeExecutionOutcome,
+  InitiativeNodeExecutionResult,
+  InitiativeScheduleFailure,
+  InitiativeScheduleRequest,
+  InitiativeScheduleResult,
+  InitiativeWriterOwner,
+} from "./initiative-scheduler.js";
+
 export type { ContractIdentity } from "./identity.js";
 
 export { DURABLE_BUILD_PLAN_SCHEMA_VERSION } from "./build-plan.js";
