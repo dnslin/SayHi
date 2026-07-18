@@ -353,6 +353,7 @@ export async function completeDurableTask(
   fixture: TaskLifecycleFixture,
   initialState: WorkflowState,
   transitionedAt: string,
+  markCompleted = true,
 ): Promise<WorkflowState> {
   let state = initialState;
   for (const [lifecycle, phase] of [
@@ -462,26 +463,37 @@ export async function completeDurableTask(
       occurredAt: transitionedAt,
     });
   }
-  for (const [lifecycle, phase] of [
-    ["active", "finish"],
-    ["completed", "finish"],
-  ] as const) {
-    const advanced = await advanceDurableTask({
-      fileSystem,
-      transition: taskLifecycleTransition(
-        fixture,
-        state,
-        lifecycle,
-        phase,
-        `${lifecycle}-${phase}`,
-        transitionedAt,
-      ),
-    });
-    if (!advanced.ok) {
-      throw new Error(advanced.diagnostics[0]?.message ?? "Task advancement failed");
-    }
-    state = advanced.state;
+  const enteredFinish = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      fixture,
+      state,
+      "active",
+      "finish",
+      "active-finish",
+      transitionedAt,
+    ),
+  });
+  if (!enteredFinish.ok) {
+    throw new Error(enteredFinish.diagnostics[0]?.message ?? "Finish entry failed");
   }
-  return state;
+  if (!markCompleted) {
+    return enteredFinish.state;
+  }
+  const completed = await advanceDurableTask({
+    fileSystem,
+    transition: taskLifecycleTransition(
+      fixture,
+      enteredFinish.state,
+      "completed",
+      "finish",
+      "completed-finish",
+      transitionedAt,
+    ),
+  });
+  if (!completed.ok) {
+    throw new Error(completed.diagnostics[0]?.message ?? "Task completion failed");
+  }
+  return completed.state;
 }
 

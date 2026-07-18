@@ -427,12 +427,16 @@ Local state changes based on an External Reference require a local Event. Remote
   "confidence": "high",
   "proposedAction": "update-spec",
   "target": ".sayhi/spec/backend/api-guidelines.md",
+  "contentHash": "sha256:...",
+  "targetIdentity": { "algorithm": "sha256-lf-v1", "digest": "..." },
   "status": "pending",
-  "createdBy": "knowledge-agent-result-id"
+  "createdBy": "knowledge-agent-result-id",
+  "createdAt": "...",
+  "review": null
 }
 ```
 
-Only a human-authorized promotion Event can change `pending` to accepted, rejected, or superseded. Acceptance creates or updates the target through the User-owned content workflow and invalidates affected Context Manifests.
+`contentHash` covers the proposed knowledge content, while `taskId`, `evidence`, and `createdBy` retain provenance. `targetIdentity` snapshots an existing target or is `null` when the target was absent. Any later target appearance, removal, type change, or content change makes the Candidate stale and requires revision. Human review changes only the Candidate status to `accepted`, `rejected`, or `revision-requested` and records reviewer, reason, and timestamp; it MUST NOT change the target. A later human-authorized promotion Event may change Approved knowledge, record promotion provenance, and invalidate affected Context Manifests.
 
 ## 15. Skill Lock
 

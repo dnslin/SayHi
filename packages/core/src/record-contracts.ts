@@ -3,6 +3,8 @@ import {
   isContractIdentity,
   type ContractIdentity,
 } from "./identity.js";
+import { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
+
 
 import { isRepositoryRelativePath } from "./repository-path.js";
 import {
@@ -38,8 +40,19 @@ export type KnowledgeCandidateStatus =
   | "pending"
   | "accepted"
   | "rejected"
+  | "revision-requested"
   | "superseded";
+export type KnowledgeReviewDisposition =
+  | "approved"
+  | "rejected"
+  | "revision-requested";
 export type KnowledgeConfidence = "low" | "medium" | "high";
+export interface KnowledgeCandidateReview {
+  readonly disposition: KnowledgeReviewDisposition;
+  readonly reviewer: string;
+  readonly reason: string;
+  readonly reviewedAt: string;
+}
 export type ManagedFileOwnershipClass =
   | "engine-owned"
   | "user-owned"
@@ -56,8 +69,12 @@ export type KnowledgeCandidateRecord = Readonly<Record<string, unknown>> & {
   readonly confidence: KnowledgeConfidence;
   readonly proposedAction: string;
   readonly target: string;
+  readonly contentHash: ContractIdentity;
+  readonly targetIdentity: ContentHash | null;
   readonly status: KnowledgeCandidateStatus;
   readonly createdBy: string;
+  readonly createdAt: string;
+  readonly review: KnowledgeCandidateReview | null;
 };
 
 export type ExternalReferenceRecord = Readonly<Record<string, unknown>> & {
@@ -458,10 +475,48 @@ function validateKnowledgeCandidate(
       "target must be a repository-relative promotion path.",
     );
   }
+  if (!isContractIdentity(record.contentHash)) {
+    return invalidKnowledge(
+      "$.record.contentHash",
+      "contentHash must be a SHA-256 identity.",
+    );
+  }
+  const expectedContentHash = hashKnowledgeCandidateContent({
+    type: record.type as string,
+    statement: record.statement as string,
+    scope: record.scope as readonly string[],
+    confidence: record.confidence as KnowledgeConfidence,
+    proposedAction: record.proposedAction as string,
+    target: record.target as string,
+  });
+  if (record.contentHash !== expectedContentHash) {
+    return invalidKnowledge(
+      "$.record.contentHash",
+      "contentHash must match the immutable Knowledge Candidate content.",
+    );
+  }
+  if (record.targetIdentity !== null && !isContentHash(record.targetIdentity)) {
+    return invalidKnowledge(
+      "$.record.targetIdentity",
+      "targetIdentity must be a Content Hash or null when the target does not exist.",
+    );
+  }
   if (!isKnowledgeStatus(record.status)) {
     return invalidKnowledge(
       "$.record.status",
-      "status must be pending, accepted, rejected, or superseded.",
+      "status must be pending, accepted, rejected, revision-requested, or superseded.",
+    );
+  }
+  if (!isTimestamp(record.createdAt)) {
+    return invalidKnowledge(
+      "$.record.createdAt",
+      "createdAt must be an RFC 3339 UTC timestamp.",
+    );
+  }
+  if (!isKnowledgeReview(record.review, record.status)) {
+    return invalidKnowledge(
+      "$.record.review",
+      "review must match the Candidate status and record an attributable human decision.",
     );
   }
   return null;
@@ -1341,7 +1396,44 @@ function isKnowledgeStatus(value: unknown): value is KnowledgeCandidateStatus {
     value === "pending" ||
     value === "accepted" ||
     value === "rejected" ||
+    value === "revision-requested" ||
     value === "superseded"
+  );
+}
+
+function isKnowledgeReview(
+  value: unknown,
+  status: KnowledgeCandidateStatus,
+): value is KnowledgeCandidateReview | null {
+  if (status === "pending") {
+    return value === null;
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (
+    !isKnowledgeReviewDisposition(value.disposition) ||
+    !isIdentifier(value.reviewer) ||
+    !isNonEmptyString(value.reason) ||
+    !isTimestamp(value.reviewedAt)
+  ) {
+    return false;
+  }
+  return (
+    status === "superseded" ||
+    (status === "accepted" && value.disposition === "approved") ||
+    (status === "rejected" && value.disposition === "rejected") ||
+    (status === "revision-requested" && value.disposition === "revision-requested")
+  );
+}
+
+function isKnowledgeReviewDisposition(
+  value: unknown,
+): value is KnowledgeReviewDisposition {
+  return (
+    value === "approved" ||
+    value === "rejected" ||
+    value === "revision-requested"
   );
 }
 

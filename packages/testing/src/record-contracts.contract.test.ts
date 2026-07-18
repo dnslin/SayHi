@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coreContract } from "@dnslin/sayhi-core";
+import { coreContract, hashKnowledgeCandidateContent } from "@dnslin/sayhi-core";
 
 const SHA256_A = `sha256:${"a".repeat(64)}`;
 const CONTENT_HASH_A = {
@@ -129,8 +129,19 @@ test("Core round-trips every versioned knowledge, External Reference, Skill, and
         confidence: "high",
         proposedAction: "update-spec",
         target: ".sayhi/spec/backend/api-guidelines.md",
+        contentHash: hashKnowledgeCandidateContent({
+          type: "convention",
+          statement: "Public APIs return structured diagnostics.",
+          scope: ["packages/core/**"],
+          confidence: "high",
+          proposedAction: "update-spec",
+          target: ".sayhi/spec/backend/api-guidelines.md",
+        }),
+        targetIdentity: null,
         status: "pending",
         createdBy: "RESULT-KNOWLEDGE-42",
+        createdAt: "2026-07-18T10:00:00Z",
+        review: null,
         extension: { source: "future-producer" },
       },
     },
@@ -307,8 +318,19 @@ test("Core rejects unknown record versions and cross-contract identity mismatche
     confidence: "high",
     proposedAction: "update-spec",
     target: ".sayhi/spec/identity.md",
+    contentHash: hashKnowledgeCandidateContent({
+      type: "convention",
+      statement: "Durable identities are exact.",
+      scope: ["packages/core/**"],
+      confidence: "high",
+      proposedAction: "update-spec",
+      target: ".sayhi/spec/identity.md",
+    }),
+    targetIdentity: null,
     status: "pending",
     createdBy: "RESULT-IDENTITY",
+    createdAt: "2026-07-18T10:00:00Z",
+    review: null,
   };
   const cases = [
     [
@@ -402,6 +424,29 @@ test("Core rejects malformed records and duplicate immutable Skill identities", 
       },
       "record_contract.knowledge.invalid",
       "$.record.evidence",
+    ],
+    [
+      "knowledgeCandidate",
+      {
+        schemaVersion: 1,
+        id: "KNOWLEDGE-HASH-BAD",
+        taskId: "TASK-HASH-BAD",
+        type: "convention",
+        statement: "Candidate content hashes are immutable.",
+        scope: ["packages/core/**"],
+        evidence: ["evidence/hash.json"],
+        confidence: "high",
+        proposedAction: "update-spec",
+        target: ".sayhi/spec/hash.md",
+        contentHash: SHA256_A,
+        targetIdentity: null,
+        status: "pending",
+        createdBy: "RESULT-HASH-BAD",
+        createdAt: "2026-07-18T10:00:00Z",
+        review: null,
+      },
+      "record_contract.knowledge.invalid",
+      "$.record.contentHash",
     ],
     [
       "externalReference",
