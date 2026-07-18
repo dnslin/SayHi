@@ -198,7 +198,7 @@ interface ParsedPlanArguments {
 }
 type PlanArgumentResult = ParsedPlanArguments | InvalidCliArguments;
 
-type KnowledgeSubcommand = "list" | "show" | "review";
+type KnowledgeSubcommand = "list" | "show" | "review" | "promote";
 interface ParsedKnowledgeArguments {
   readonly ok: true;
   readonly command: "knowledge";
@@ -206,6 +206,8 @@ interface ParsedKnowledgeArguments {
   readonly cwd: string;
   readonly json: boolean;
   readonly candidateId?: string;
+  readonly source?: string;
+  readonly promotionMode?: "plan" | "apply";
   readonly status?: KnowledgeCandidateStatus;
   readonly disposition?: KnowledgeReviewDisposition;
   readonly reason?: string;
@@ -224,6 +226,11 @@ interface PlanDecisionRequest {
   readonly expectedVersion: number;
   readonly planIdentity: string;
   readonly contextManifestIdentity: string;
+  readonly event: WorkflowEventMetadata;
+}
+interface KnowledgePromotionRequest {
+  readonly candidateHash: ContractIdentity;
+  readonly content: string;
   readonly event: WorkflowEventMetadata;
 }
 type TaskSubcommand =
@@ -334,7 +341,7 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           "knowledge",
           2,
           knowledge.message,
-          "Run sayhi knowledge list, show <candidate-id>, or review <candidate-id> --approve|--reject|--request-revision --reason <text>.",
+          "Run sayhi knowledge list, show <candidate-id>, review <candidate-id> --approve|--reject|--request-revision --reason <text>, or promote <candidate-id> --from <promotion.json> --plan|--apply.",
           args.includes("--json"),
         );
   }
@@ -577,6 +584,48 @@ async function runKnowledgeCli(
             parsed.json,
           )
         : cliDomainFailure("knowledge.review", result.diagnostics[0], parsed.json);
+    }
+    case "promote": {
+      const source = await readTaskJsonRequest(
+        fileSystem,
+        parsed.source!,
+        "knowledge.promote",
+        parsed.json,
+      );
+      if (!source.ok) {
+        return source.result;
+      }
+      const request = parseKnowledgePromotionRequest(source.value);
+      if (request === null) {
+        return cliDomainFailure(
+          "knowledge.promote",
+          Object.freeze({
+            code: "knowledge.promotion.request.invalid",
+            message:
+              "Knowledge promotion requires candidateHash, content, and an attributable approval Event.",
+            remediation:
+              "Provide a JSON request with the exact Candidate hash, new content, and user Event metadata.",
+          }),
+          parsed.json,
+        );
+      }
+      const result = await coreContract.promoteKnowledgeCandidate({
+        fileSystem,
+        candidateId: parsed.candidateId!,
+        persist: parsed.promotionMode === "apply",
+        ...request,
+      });
+      return result.ok
+        ? cliSuccess(
+            "knowledge.promote",
+            Object.freeze({
+              promotion: result.promotion,
+              appended: result.appended,
+              planned: result.planned,
+            }),
+            parsed.json,
+          )
+        : cliDomainFailure("knowledge.promote", result.diagnostics[0], parsed.json);
     }
   }
 }
@@ -2456,6 +2505,21 @@ function parsePlanDecisionRequest(
       })
     : null;
 }
+function parseKnowledgePromotionRequest(
+  value: Record<string, unknown>,
+): KnowledgePromotionRequest | null {
+  return (
+    typeof value.candidateHash === "string" &&
+    typeof value.content === "string" &&
+    isWorkflowEventMetadata(value.event)
+  )
+    ? Object.freeze({
+        candidateHash: value.candidateHash as ContractIdentity,
+        content: value.content,
+        event: value.event,
+      })
+    : null;
+}
 function parseGraphRevisionRequest(
   value: Record<string, unknown>,
 ): GraphRevisionRequest | null {
@@ -2984,6 +3048,8 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   let disposition: KnowledgeReviewDisposition | undefined;
   let reviewer: string | undefined;
   let reason: string | undefined;
+  let source: string | undefined;
+  let promotionMode: "plan" | "apply" | undefined;
   let knowledgeCount = 0;
   const values: string[] = [];
   for (let index = 0; index < args.length; index += 1) {
@@ -2997,6 +3063,7 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
     }
     if (
       argument === "--cwd" ||
+      argument === "--from" ||
       argument === "--status" ||
       argument === "--reason" ||
       argument === "--reviewer"
@@ -3007,6 +3074,11 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
       }
       if (argument === "--cwd") {
         cwd = value;
+      } else if (argument === "--from") {
+        if (source !== undefined) {
+          return { ok: false, message: "Specify --from exactly once." };
+        }
+        source = value;
       } else if (argument === "--status") {
         if (status !== undefined) {
           return { ok: false, message: "Specify --status at most once." };
@@ -3044,6 +3116,13 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
             : "revision-requested";
       continue;
     }
+    if (argument === "--plan" || argument === "--apply") {
+      if (promotionMode !== undefined) {
+        return { ok: false, message: "Specify --plan or --apply exactly once." };
+      }
+      promotionMode = argument === "--plan" ? "plan" : "apply";
+      continue;
+    }
     if (argument === "knowledge") {
       knowledgeCount += 1;
       continue;
@@ -3060,6 +3139,8 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   if (subcommand === "list") {
     return candidateId === undefined &&
       tail.length === 0 &&
+      source === undefined &&
+      promotionMode === undefined &&
       disposition === undefined &&
       reason === undefined &&
       reviewer === undefined
@@ -3076,6 +3157,8 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   if (subcommand === "show") {
     return candidateId !== undefined &&
       tail.length === 0 &&
+      source === undefined &&
+      promotionMode === undefined &&
       status === undefined &&
       disposition === undefined &&
       reason === undefined &&
@@ -3086,6 +3169,8 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   if (subcommand === "review") {
     return candidateId !== undefined &&
       tail.length === 0 &&
+      source === undefined &&
+      promotionMode === undefined &&
       status === undefined &&
       disposition !== undefined &&
       reviewer !== undefined &&
@@ -3105,6 +3190,31 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
           ok: false,
           message:
             "knowledge review requires one Candidate id, one review disposition, --reviewer <id>, and --reason <text>.",
+        };
+  }
+  if (subcommand === "promote") {
+    return candidateId !== undefined &&
+      tail.length === 0 &&
+      source !== undefined &&
+      promotionMode !== undefined &&
+      status === undefined &&
+      disposition === undefined &&
+      reviewer === undefined &&
+      reason === undefined
+      ? {
+          ok: true,
+          command: "knowledge",
+          subcommand,
+          cwd,
+          json,
+          candidateId,
+          source,
+          promotionMode,
+        }
+      : {
+          ok: false,
+          message:
+            "knowledge promote requires one Candidate id, --from <promotion.json>, and --plan or --apply.",
         };
   }
   return { ok: false, message: "Knowledge command is not supported." };

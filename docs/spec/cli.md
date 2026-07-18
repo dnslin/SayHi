@@ -176,9 +176,10 @@ Journal commands MUST distinguish committed shared summaries from local machine 
 sayhi knowledge list [--status pending]
 sayhi knowledge show <candidate-id>
 sayhi knowledge review <candidate-id> --approve|--reject|--request-revision --reviewer <id> --reason <text>
+sayhi knowledge promote <candidate-id> --from <promotion.json> --plan|--apply
 ```
 
-`knowledge review` records a human decision on the Candidate only. It presents the Candidate provenance and current disposition but never changes its target; promotion and supersession remain separate, human-authorized operations.
+`knowledge review` records a human decision on the Candidate only. It presents the Candidate provenance and current disposition but never changes its target. `knowledge promote --plan` returns the exact Candidate hash, target change, and affected Context Manifests without mutation; `--apply` is the explicit confirmation and requires replacement shared-knowledge content plus a `user` Event. Core preserves the reviewed Candidate as provenance, records supersession, stages recovery before mutating the target, and makes every bound Context Manifest stale. `update-spec`, `update-adr`, `update-domain`, and `update-runbook` Candidates target their respective Spec, ADR, `CONTEXT.md`, and runbook paths. Promotion and supersession remain separate, human-authorized operations.
 
 ### 4.8 Tracker synchronization
 

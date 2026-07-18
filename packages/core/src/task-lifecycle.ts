@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   hashCanonicalJson,
   isContractIdentity,
@@ -37,6 +39,7 @@ import type {
   ManagedProjectFileSystem,
   ManagedProjectPathKind,
 } from "./managed-project.js";
+import { canonicalRepositoryRelativePath } from "./repository-path.js";
 import {
   contentMatchesIdentity,
   hashTextContent,
@@ -151,6 +154,25 @@ export interface InitiativeGraphFileSystem extends TaskLifecycleFileSystem {
     operation: (writer: TaskWriter) => Promise<Result>,
   ): Promise<Result>;
 }
+export interface SharedCheckoutReaderLease {
+  readonly dispatchId: string;
+  readonly token: string;
+}
+export interface SharedCheckoutReaderFileSystem extends InitiativeGraphFileSystem {
+  acquireSharedCheckoutReaderLease(lease: SharedCheckoutReaderLease): Promise<void>;
+  acquireSharedCheckoutReaderLeaseFromWriter(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<void>;
+  assertSharedCheckoutReaderLease(lease: SharedCheckoutReaderLease): Promise<void>;
+  releaseSharedCheckoutReaderLease(lease: SharedCheckoutReaderLease): Promise<void>;
+  releaseSharedCheckoutReaderLeaseIfPresent(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<boolean>;
+}
+export interface PhaseExecutionFileSystem
+  extends ContextManifestFileSystem,
+    SharedCheckoutReaderFileSystem {}
+
 
 export interface InitiativeReadinessFileSystem
   extends InitiativeGraphFileSystem,
@@ -269,6 +291,7 @@ export interface ArchiveDurableTaskRequest {
 export interface RecoverDurableTaskRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
   readonly taskId: string;
+  readonly readerLease?: SharedCheckoutReaderLease;
 }
 
 export interface CreateDurableTaskHandoffRequest {
@@ -428,9 +451,10 @@ export interface WithDurableTaskWriterRequest<Value> {
   readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
 }
 export interface WithBoundDurableTaskWriterRequest<Value> {
-  readonly fileSystem: ContextManifestFileSystem & TaskBaselineFileSystem;
+  readonly fileSystem: PhaseExecutionFileSystem & TaskBaselineFileSystem;
   readonly taskId: string;
   readonly materials: PhaseExecutionMaterials;
+  readonly readerLease: SharedCheckoutReaderLease;
   readonly operation: (writer: ScopedTaskWriter) => Promise<Value>;
 }
 export interface PlanDurableTaskCommitRequest {
@@ -489,14 +513,14 @@ export interface RemoveDurableContextManifestEntryRequest {
 }
 
 export interface RecordDurableBuildPlanRequest {
-  readonly fileSystem: ContextManifestFileSystem;
+  readonly fileSystem: InitiativeReadinessFileSystem;
   readonly taskId: string;
   readonly expectedVersion: number;
   readonly content: string;
   readonly event: WorkflowEventMetadata;
 }
 export interface DecideDurableBuildPlanRequest {
-  readonly fileSystem: ContextManifestFileSystem;
+  readonly fileSystem: InitiativeReadinessFileSystem;
   readonly taskId: string;
   readonly expectedVersion: number;
   readonly decision: "approved" | "rejected";
@@ -506,23 +530,25 @@ export interface DecideDurableBuildPlanRequest {
 }
 
 export interface DispatchDurablePhaseExecutionRequest {
-  readonly fileSystem: ContextManifestFileSystem;
+  readonly fileSystem: PhaseExecutionFileSystem;
   readonly planIdentity: string;
   readonly execution: BindPhaseExecutionRequest;
   readonly event: WorkflowEventMetadata;
 }
 
 export interface ResumeDurablePhaseExecutionRequest {
-  readonly fileSystem: ContextManifestFileSystem;
+  readonly fileSystem: PhaseExecutionFileSystem;
   readonly taskId: string;
   readonly materials: PhaseExecutionMaterials;
   readonly blockEvent: WorkflowEventMetadata;
+  readonly readerLease: SharedCheckoutReaderLease;
 }
 
 export interface RecordDurablePhaseExecutionResultRequest {
-  readonly fileSystem: TaskLifecycleFileSystem;
+  readonly fileSystem: SharedCheckoutReaderFileSystem;
   readonly taskId: string;
   readonly result: AgentResultRecord;
+  readonly readerLease: SharedCheckoutReaderLease;
   readonly event: WorkflowEventMetadata;
 }
 
@@ -611,7 +637,8 @@ export type WithDurableTaskWriterResult<Value> =
       finalBaseline: BaselineRecord;
       changedPaths: readonly string[];
     }>
-  | TaskLifecycleFailure;
+  | (TaskLifecycleFailure &
+      Readonly<{ readonly readerLease?: SharedCheckoutReaderLease }>);
 export type AddDurableContextManifestEntryResult =
   | Readonly<{
       ok: true;
@@ -694,8 +721,10 @@ export type DispatchDurablePhaseExecutionResult =
       binding: PhaseExecutionBinding;
       event: PhaseExecutionDispatchedEvent;
       appended: boolean;
+      readerLease: SharedCheckoutReaderLease;
     }>
-  | TaskLifecycleFailure;
+  | (TaskLifecycleFailure &
+      Readonly<{ readonly readerLease?: SharedCheckoutReaderLease }>);
 
 export type ResumeDurablePhaseExecutionResult =
   | Readonly<{
@@ -705,6 +734,7 @@ export type ResumeDurablePhaseExecutionResult =
       state: WorkflowState;
       plan: DurableBuildPlan;
       binding: PhaseExecutionBinding;
+      readerLease: SharedCheckoutReaderLease;
     }>
   | Readonly<{
       ok: true;
@@ -721,8 +751,10 @@ export type ResumeDurablePhaseExecutionResult =
       state: WorkflowState;
       diagnostics: readonly TaskLifecycleDiagnostic[];
       reviewRequired: true;
+      readerLease?: SharedCheckoutReaderLease;
     }>
-  | TaskLifecycleFailure;
+  | (TaskLifecycleFailure &
+      Readonly<{ readonly readerLease?: SharedCheckoutReaderLease }>);
 
 export type RecordDurablePhaseExecutionResultResult =
   | Readonly<{
@@ -733,7 +765,8 @@ export type RecordDurablePhaseExecutionResultResult =
       result: AgentResultRecord;
       appended: boolean;
     }>
-  | TaskLifecycleFailure;
+  | (TaskLifecycleFailure &
+      Readonly<{ readonly readerLease?: SharedCheckoutReaderLease }>);
 
 
 
@@ -777,7 +810,8 @@ export type RecoverDurableTaskResult =
       recovered: boolean;
       handoff: DurableTaskHandoff | null;
     }>
-  | TaskLifecycleFailure;
+  | (TaskLifecycleFailure &
+      Readonly<{ readonly readerLease?: SharedCheckoutReaderLease }>);
 
 export type CreateDurableTaskHandoffResult =
   | Readonly<{
@@ -1209,6 +1243,42 @@ export async function recoverDurableTask(
   if (!current.ok) {
     return current;
   }
+  const dispatched = latestPhaseExecutionDispatch(
+    current.state.events,
+    current.state.projection.phase,
+  );
+  const binding = dispatched === undefined
+    ? null
+    : parsePhaseExecutionBinding(dispatched.binding);
+  const readerFileSystem = isSharedCheckoutReaderFileSystem(request.fileSystem)
+    ? request.fileSystem
+    : null;
+  const unfinishedDispatch =
+    binding !== null &&
+    latestPhaseExecutionResult(
+      current.state.events,
+      binding.dispatchId,
+      current.state.projection.phase,
+    ) === undefined;
+  if (unfinishedDispatch) {
+    if (
+      readerFileSystem === null ||
+      request.readerLease === undefined ||
+      request.readerLease.dispatchId !== binding.dispatchId
+    ) {
+      return phaseExecutionResultInvalid(
+        "Recovery requires the fenced Reader Lease for an unfinished Phase dispatch.",
+      );
+    }
+    try {
+      await readerFileSystem.assertSharedCheckoutReaderLease(request.readerLease);
+    } catch {
+      return Object.freeze({
+        ...ioFailure(paths.taskDirectory),
+        readerLease: request.readerLease,
+      });
+    }
+  }
   const graph = latestInitiativeGraph(current.state.events);
   if (
     graph !== null &&
@@ -1217,12 +1287,78 @@ export async function recoverDurableTask(
   ) {
     return writerUnavailable();
   }
+  if (
+    unfinishedDispatch &&
+    request.readerLease !== undefined &&
+    readerFileSystem !== null
+  ) {
+    const readerLease = request.readerLease;
+    let readerRestored = false;
+    const restoreReader = async (fromWriter: boolean): Promise<void> => {
+      if (readerRestored) {
+        return;
+      }
+      if (fromWriter) {
+        await readerFileSystem.acquireSharedCheckoutReaderLeaseFromWriter(
+          readerLease,
+        );
+      } else {
+        await readerFileSystem.acquireSharedCheckoutReaderLease(readerLease);
+      }
+      readerRestored = true;
+    };
+    try {
+      await readerFileSystem.releaseSharedCheckoutReaderLease(readerLease);
+      return await readerFileSystem.withWriterMutationLock(async () => {
+        const recovered = await runWithTaskLock(
+          readerFileSystem,
+          paths.lockPath,
+          () => recoverDurableTaskLocked(request, paths),
+        );
+        if (!recovered.ok) {
+          await restoreReader(true);
+          return Object.freeze({ ...recovered, readerLease });
+        }
+        const recoveredDispatch = latestPhaseExecutionDispatch(
+          recovered.state.events,
+          recovered.state.projection.phase,
+        );
+        if (
+          parsePhaseExecutionBinding(recoveredDispatch?.binding)?.dispatchId ===
+            binding.dispatchId &&
+          latestPhaseExecutionResult(
+            recovered.state.events,
+            binding.dispatchId,
+            recovered.state.projection.phase,
+          ) === undefined
+        ) {
+          await restoreReader(true);
+        }
+        return recovered;
+      });
+    } catch {
+      try {
+        await restoreReader(false);
+      } catch {
+        return Object.freeze({
+          ...ioFailure(paths.taskDirectory),
+          readerLease,
+        });
+      }
+      return Object.freeze({
+        ...ioFailure(paths.taskDirectory),
+        readerLease,
+      });
+    }
+  }
   return isInitiativeGraphFileSystem(request.fileSystem)
     ? runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
         recoverDurableTaskLocked(request, paths),
       )
-    : runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-        recoverDurableTaskLocked(request, paths),
+    : runWithContextManifestMutationLease(
+        request.fileSystem,
+        paths.lockPath,
+        () => recoverDurableTaskLocked(request, paths),
       );
 }
 
@@ -1264,7 +1400,7 @@ export async function withBoundDurableTaskWriter<Value>(
     taskId: request.taskId,
   });
   if (!current.ok) {
-    return current;
+    return Object.freeze({ ...current, readerLease: request.readerLease });
   }
   const revalidationId =
     `BOUND-WRITER-${request.taskId}-${current.state.projection.version}`;
@@ -1274,6 +1410,7 @@ export async function withBoundDurableTaskWriter<Value>(
     fileSystem: request.fileSystem,
     taskId: request.taskId,
     materials: request.materials,
+    readerLease: request.readerLease,
     blockEvent: {
       eventId: `EVENT-${revalidationId}`,
       actor: {
@@ -1287,23 +1424,35 @@ export async function withBoundDurableTaskWriter<Value>(
     },
   });
   if (!resumed.ok) {
-    return resumed;
+    return Object.freeze({
+      ...resumed,
+      readerLease: resumed.readerLease ?? request.readerLease,
+    });
   }
   if (resumed.status === "blocked") {
-    return failure(resumed.diagnostics);
+    return Object.freeze({
+      ...failure(resumed.diagnostics),
+      readerLease: resumed.readerLease ?? request.readerLease,
+    });
   }
   if (resumed.status !== "ready") {
-    return phaseExecutionResultInvalid(
-      "Bound Implementation dispatch is not ready for a Writer operation.",
-    );
+    return Object.freeze({
+      ...phaseExecutionResultInvalid(
+        "Bound Implementation dispatch is not ready for a Writer operation.",
+      ),
+      readerLease: request.readerLease,
+    });
   }
   if (
     resumed.binding.phase !== "implement" ||
     resumed.binding.agentRole !== "implementation"
   ) {
-    return phaseExecutionResultInvalid(
-      "Bound Writer requires the active Implementation Agent dispatch.",
-    );
+    return Object.freeze({
+      ...phaseExecutionResultInvalid(
+        "Bound Writer requires the active Implementation Agent dispatch.",
+      ),
+      readerLease: request.readerLease,
+    });
   }
   const authorized = authorizePhaseExecution({
     contractVersion: 1,
@@ -1312,14 +1461,93 @@ export async function withBoundDurableTaskWriter<Value>(
     capability: { kind: "repository", access: "write" },
   });
   if (!authorized.ok) {
-    return phaseExecutionFailure(authorized.diagnostics);
+    return Object.freeze({
+      ...phaseExecutionFailure(authorized.diagnostics),
+      readerLease: request.readerLease,
+    });
   }
-  return withDurableTaskWriter({
-    fileSystem: request.fileSystem,
-    taskId: request.taskId,
-    expectedVersion: resumed.state.projection.version,
-    operation: request.operation,
-  });
+  const paths = taskPaths(request.taskId);
+  if (!paths.ok) {
+    return Object.freeze({ ...paths, readerLease: request.readerLease });
+  }
+  let readerRestored = false;
+  const restoreReader = async (fromWriter: boolean): Promise<void> => {
+    if (readerRestored) {
+      return;
+    }
+    if (fromWriter) {
+      await request.fileSystem.acquireSharedCheckoutReaderLeaseFromWriter(
+        request.readerLease,
+      );
+    } else {
+      await request.fileSystem.acquireSharedCheckoutReaderLease(request.readerLease);
+    }
+    readerRestored = true;
+  };
+  try {
+    await request.fileSystem.releaseSharedCheckoutReaderLease(request.readerLease);
+    return await request.fileSystem.withWriterMutationLock(async (writer) => {
+      try {
+        const written = await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+          withDurableTaskWriterLocked(
+            {
+              fileSystem: request.fileSystem,
+              taskId: request.taskId,
+              expectedVersion: resumed.state.projection.version,
+              operation: request.operation,
+            },
+            paths,
+            writer,
+          ),
+        );
+        const current = await readDurableTask({
+          fileSystem: request.fileSystem,
+          taskId: request.taskId,
+        });
+        if (!current.ok) {
+          await restoreReader(true);
+          return Object.freeze({ ...current, readerLease: request.readerLease });
+        }
+        const dispatch = latestPhaseExecutionDispatch(
+          current.state.events,
+          current.state.projection.phase,
+        );
+        if (
+          current.state.projection.lifecycle === "active" &&
+          current.state.projection.phase === resumed.binding.phase &&
+          dispatch !== undefined &&
+          parsePhaseExecutionBinding(dispatch.binding)?.dispatchId ===
+            request.readerLease.dispatchId &&
+          latestPhaseExecutionResult(
+            current.state.events,
+            request.readerLease.dispatchId,
+            current.state.projection.phase,
+          ) === undefined
+        ) {
+          await restoreReader(true);
+        }
+        return written.ok
+          ? written
+          : Object.freeze({ ...written, readerLease: request.readerLease });
+      } catch {
+        await restoreReader(true);
+        throw new Error("Bound Writer operation failed.");
+      }
+    });
+  } catch {
+    try {
+      await restoreReader(false);
+    } catch {
+      return Object.freeze({
+        ...writerUnavailable(),
+        readerLease: request.readerLease,
+      });
+    }
+    return Object.freeze({
+      ...writerUnavailable(),
+      readerLease: request.readerLease,
+    });
+  }
 }
 export async function recordDurableQuickResult(
   request: RecordDurableQuickResultRequest,
@@ -1656,8 +1884,10 @@ export async function addDurableContextManifestEntry(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      addDurableContextManifestEntryLocked(request, paths),
+    return await runWithContextManifestMutationLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => addDurableContextManifestEntryLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1671,8 +1901,10 @@ export async function refreshDurableContextManifest(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      refreshDurableContextManifestLocked(request, paths),
+    return await runWithContextManifestMutationLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => refreshDurableContextManifestLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1686,8 +1918,10 @@ export async function freezeDurableContextManifest(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      freezeDurableContextManifestLocked(request, paths),
+    return await runWithContextManifestMutationLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => freezeDurableContextManifestLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1701,8 +1935,10 @@ export async function recordDurableBuildPlan(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      recordDurableBuildPlanLocked(request, paths),
+    return await runWithInitiativeGraphLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => recordDurableBuildPlanLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1716,8 +1952,10 @@ export async function decideDurableBuildPlan(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      decideDurableBuildPlanLocked(request, paths),
+    return await runWithInitiativeGraphLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => decideDurableBuildPlanLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1731,11 +1969,52 @@ export async function dispatchDurablePhaseExecution(
   if (!paths.ok) {
     return paths;
   }
+  const readerLease = Object.freeze({
+    dispatchId: request.execution.dispatch.dispatchId,
+    token: randomUUID(),
+  });
+  let acquired = false;
+  const retainsDurableDispatch = async (): Promise<boolean> => {
+    try {
+      const current = await readDurableTask({
+        fileSystem: request.fileSystem,
+        taskId: request.execution.dispatch.taskId,
+      });
+      if (!current.ok) {
+        return true;
+      }
+      const dispatch = latestPhaseExecutionDispatch(
+        current.state.events,
+        current.state.projection.phase,
+      );
+      return parsePhaseExecutionBinding(dispatch?.binding)?.dispatchId === readerLease.dispatchId;
+    } catch {
+      return true;
+    }
+  };
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      dispatchDurablePhaseExecutionLocked(request, paths),
+    await request.fileSystem.acquireSharedCheckoutReaderLease(readerLease);
+    acquired = true;
+    const dispatched = await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+      dispatchDurablePhaseExecutionLocked(request, paths, readerLease),
     );
+    if (!dispatched.ok) {
+      if (await retainsDurableDispatch()) {
+        return Object.freeze({ ...dispatched, readerLease });
+      }
+      await request.fileSystem.releaseSharedCheckoutReaderLease(readerLease);
+      return dispatched;
+    }
+    return dispatched;
   } catch {
+    if (acquired) {
+      if (await retainsDurableDispatch()) {
+        return Object.freeze({ ...ioFailure(paths.taskDirectory), readerLease });
+      }
+      await request.fileSystem.releaseSharedCheckoutReaderLease(readerLease).catch(
+        () => undefined,
+      );
+    }
     return ioFailure(paths.taskDirectory);
   }
 }
@@ -1747,12 +2026,72 @@ export async function resumeDurablePhaseExecution(
   if (!paths.ok) {
     return paths;
   }
+  const current = await readDurableTask({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+  });
+  if (!current.ok) {
+    return current;
+  }
+  const dispatched = latestPhaseExecutionDispatch(
+    current.state.events,
+    current.state.projection.phase,
+  );
+  if (dispatched === undefined) {
+    return phaseExecutionMissing(current.state.projection.phase);
+  }
+  const binding = parsePhaseExecutionBinding(dispatched.binding);
+  if (binding === null || request.readerLease.dispatchId !== binding.dispatchId) {
+    return phaseExecutionResultInvalid(
+      "Resume requires the fenced Reader Lease for its current Phase dispatch.",
+    );
+  }
+  const accepted = latestPhaseExecutionResult(
+    current.state.events,
+    binding.dispatchId,
+    current.state.projection.phase,
+  );
+  if (accepted !== undefined) {
+    try {
+      await request.fileSystem.releaseSharedCheckoutReaderLeaseIfPresent(
+        request.readerLease,
+      );
+    } catch {
+      return Object.freeze({
+        ...ioFailure(paths.taskDirectory),
+        readerLease: request.readerLease,
+      });
+    }
+  }
+  const leaseHeld = accepted === undefined;
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    if (leaseHeld) {
+      await request.fileSystem.assertSharedCheckoutReaderLease(request.readerLease);
+    }
+    const resumed = await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
       resumeDurablePhaseExecutionLocked(request, paths),
     );
+    if (!resumed.ok) {
+      return leaseHeld
+        ? Object.freeze({ ...resumed, readerLease: request.readerLease })
+        : resumed;
+    }
+    if (resumed.status === "completed") {
+      if (leaseHeld) {
+        await request.fileSystem.releaseSharedCheckoutReaderLease(request.readerLease);
+      }
+      return resumed;
+    }
+    if (resumed.status === "blocked") {
+      return leaseHeld
+        ? Object.freeze({ ...resumed, readerLease: request.readerLease })
+        : resumed;
+    }
+    return Object.freeze({ ...resumed, readerLease: request.readerLease });
   } catch {
-    return ioFailure(paths.taskDirectory);
+    return leaseHeld
+      ? Object.freeze({ ...ioFailure(paths.taskDirectory), readerLease: request.readerLease })
+      : ioFailure(paths.taskDirectory);
   }
 }
 
@@ -1764,11 +2103,17 @@ export async function recordDurablePhaseExecutionResult(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
+    const recorded = await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
       recordDurablePhaseExecutionResultLocked(request, paths),
     );
+    return recorded.ok
+      ? recorded
+      : Object.freeze({ ...recorded, readerLease: request.readerLease });
   } catch {
-    return ioFailure(paths.taskDirectory);
+    return Object.freeze({
+      ...ioFailure(paths.taskDirectory),
+      readerLease: request.readerLease,
+    });
   }
 }
 
@@ -1780,8 +2125,10 @@ export async function removeDurableContextManifestEntry(
     return paths;
   }
   try {
-    return await runWithTaskLock(request.fileSystem, paths.lockPath, () =>
-      removeDurableContextManifestEntryLocked(request, paths),
+    return await runWithContextManifestMutationLease(
+      request.fileSystem,
+      paths.lockPath,
+      () => removeDurableContextManifestEntryLocked(request, paths),
     );
   } catch {
     return ioFailure(paths.taskDirectory);
@@ -1819,13 +2166,6 @@ export async function inspectDurableContextManifest(
     if (!parsed.ok) {
       return invalidContextManifest(parsed.diagnostics);
     }
-    const approvalDiagnostics = await approvedSpecBindingDiagnostics(
-      request.fileSystem,
-      parsed.entries,
-    );
-    if (approvalDiagnostics.length > 0) {
-      return invalidContextManifest(approvalDiagnostics);
-    }
     const diagnostics: ContextManifestDiagnostic[] = [];
     for (const entry of parsed.entries) {
       if (entry.source.type !== "project-path") {
@@ -1852,10 +2192,26 @@ export async function inspectDurableContextManifest(
         );
       }
     }
+    if (diagnostics.length > 0) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        state: "stale",
+        entries: parsed.entries,
+        diagnostics: Object.freeze(diagnostics),
+      });
+    }
+    const approvalDiagnostics = await approvedSpecBindingDiagnostics(
+      request.fileSystem,
+      parsed.entries,
+    );
+    if (approvalDiagnostics.length > 0) {
+      return invalidContextManifest(approvalDiagnostics);
+    }
     return Object.freeze({
       ok: true,
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
-      state: diagnostics.length === 0 ? "valid" : "stale",
+      state: "valid",
       entries: parsed.entries,
       diagnostics: Object.freeze(diagnostics),
     });
@@ -2243,9 +2599,18 @@ async function addDurableContextManifestEntryLocked(
       "Use a normalized path without absolute roots, backslashes, or '..' traversal.",
     );
   }
+  const source = canonicalRepositoryRelativePath(request.source);
+  if (source.length === 0) {
+    return contextLifecycleFailure(
+      "context_manifest.source.unreadable",
+      request.source,
+      "Context source must identify a repository file.",
+      "Use a normalized non-directory repository path.",
+    );
+  }
   let content: string;
   try {
-    content = await request.fileSystem.readRepositoryFile(request.source);
+    content = await request.fileSystem.readRepositoryFile(source);
   } catch {
     return contextLifecycleFailure(
       "context_manifest.source.unreadable",
@@ -2254,17 +2619,17 @@ async function addDurableContextManifestEntryLocked(
       "Restore a regular repository file at the requested source path.",
     );
   }
-  if (entries.some((entry) => entry.source.value === request.source)) {
+  if (entries.some((entry) => entry.source.value === source)) {
     return contextLifecycleFailure(
       "context_manifest.source.duplicate",
-      request.source,
+      source,
       "Context source is already bound to this Manifest.",
       "Use context refresh for the existing entry or choose a different source.",
     );
   }
   const identity = hashTextContent(content);
   let approvedSpec = false;
-  if (request.source.startsWith(".sayhi/spec/")) {
+  if (source.startsWith(".sayhi/spec/")) {
     const approvals = await readApprovedSpecs(request.fileSystem);
     if (approvals.ok === false) {
       const diagnostic = approvals.diagnostics[0]!;
@@ -2275,17 +2640,17 @@ async function addDurableContextManifestEntryLocked(
         diagnostic.remediation,
       );
     }
-    approvedSpec = isApprovedSpec(approvals.approvals, request.source, identity);
+    approvedSpec = isApprovedSpec(approvals.approvals, source, identity);
   }
   const trust: ContextTrustTier = approvedSpec
     ? "approved-spec"
-    : request.source.startsWith(`${paths.taskDirectory}/`)
+    : source.startsWith(`${paths.taskDirectory}/`)
       ? "task-context"
       : "untrusted-reference";
   const entry = Object.freeze({
     schemaVersion: 1 as const,
-    id: `CTX-${request.phase}-${hashCanonicalJson({ phase: request.phase, source: request.source }).slice(7, 19)}`,
-    source: Object.freeze({ type: "project-path", value: request.source }),
+    id: `CTX-${request.phase}-${hashCanonicalJson({ phase: request.phase, source }).slice(7, 19)}`,
+    source: Object.freeze({ type: "project-path", value: source }),
     kind: trust === "approved-spec" ? "spec" : "reference",
     reason: "Selected through the SayHi CLI.",
     required: true,
@@ -2833,6 +3198,7 @@ async function persistContextManifestChange(
 async function dispatchDurablePhaseExecutionLocked(
   request: DispatchDurablePhaseExecutionRequest,
   paths: TaskPaths,
+  readerLease: SharedCheckoutReaderLease,
 ): Promise<DispatchDurablePhaseExecutionResult> {
   const dispatch = request.execution.dispatch;
   const loaded = await loadTask(request.fileSystem, dispatch.taskId);
@@ -2861,6 +3227,18 @@ async function dispatchDurablePhaseExecutionLocked(
   }
   if (bound.binding.phase !== loaded.state.projection.phase) {
     return phaseExecutionPhaseInvalid(loaded.state.projection.phase);
+  }
+  const context = await inspectDurableContextManifest({
+    fileSystem: request.fileSystem,
+    taskId: dispatch.taskId,
+    phase: boundContextManifestPhase(loaded.state, bound.binding.phase),
+  });
+  if (
+    !context.ok ||
+    context.state !== "valid" ||
+    hashCanonicalJson(context.entries) !== bound.binding.contextManifestIdentity
+  ) {
+    return buildPlanContextFailure(context);
   }
   const recorded = recordPhaseExecutionDispatch(loaded.state, {
     contractVersion: 1,
@@ -2893,7 +3271,15 @@ async function dispatchDurablePhaseExecutionLocked(
     binding: bound.binding,
     event: recorded.event,
     appended,
+    readerLease,
   });
+}
+
+function boundContextManifestPhase(
+  state: WorkflowState,
+  phase: WorkflowPhase,
+): WorkflowPhase {
+  return state.projection.contexts[phase] === undefined ? "implement" : phase;
 }
 
 async function resumeDurablePhaseExecutionLocked(
@@ -2926,6 +3312,22 @@ async function resumeDurablePhaseExecutionLocked(
   );
   if (!plan.ok) {
     return blockResumedPhaseExecution(request, loaded, plan);
+  }
+  const context = await inspectDurableContextManifest({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+    phase: boundContextManifestPhase(loaded.state, binding.phase),
+  });
+  if (
+    !context.ok ||
+    context.state !== "valid" ||
+    hashCanonicalJson(context.entries) !== binding.contextManifestIdentity
+  ) {
+    return blockResumedPhaseExecution(
+      request,
+      loaded,
+      buildPlanContextFailure(context),
+    );
   }
   const authorized = authorizePhaseExecution({
     contractVersion: 1,
@@ -2970,6 +3372,7 @@ async function resumeDurablePhaseExecutionLocked(
     state: loaded.state,
     plan: plan.plan,
     binding,
+    readerLease: request.readerLease,
   });
 }
 
@@ -2995,6 +3398,11 @@ async function recordDurablePhaseExecutionResultLocked(
       "Phase execution result has no durable dispatch binding.",
     );
   }
+  if (request.readerLease.dispatchId !== dispatchId) {
+    return phaseExecutionResultInvalid(
+      "Phase execution result does not own its dispatched Reader Lease.",
+    );
+  }
   const validated = validatePhaseExecutionResult(
     request.result,
     dispatched.binding,
@@ -3009,13 +3417,39 @@ async function recordDurablePhaseExecutionResultLocked(
     result.dispatchId,
     loaded.state.projection.phase,
   );
-  if (
-    existingResult !== undefined &&
-    existingResult.idempotencyKey !== request.event.idempotencyKey
-  ) {
-    return phaseExecutionResultInvalid(
-      "Phase execution result was already accepted for this dispatch.",
-    );
+  if (existingResult !== undefined) {
+    try {
+      await request.fileSystem.releaseSharedCheckoutReaderLeaseIfPresent(
+        request.readerLease,
+      );
+    } catch {
+      return ioFailure(paths.taskDirectory);
+    }
+    if (
+      existingResult.idempotencyKey !== request.event.idempotencyKey ||
+      existingResult.eventId !== request.event.eventId ||
+      existingResult.occurredAt !== request.event.occurredAt ||
+      existingResult.reason !== request.event.reason ||
+      stableJson(existingResult.actor) !== stableJson(request.event.actor) ||
+      stableJson(existingResult.result) !== stableJson(result)
+    ) {
+      return phaseExecutionResultInvalid(
+        "Idempotency key was already accepted for different Phase execution result material.",
+      );
+    }
+    return Object.freeze({
+      ok: true,
+      contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+      state: loaded.state,
+      event: existingResult,
+      result,
+      appended: false,
+    });
+  }
+  try {
+    await request.fileSystem.assertSharedCheckoutReaderLease(request.readerLease);
+  } catch {
+    return ioFailure(paths.taskDirectory);
   }
   const recorded = recordPhaseExecutionResult(loaded.state, {
     contractVersion: 1,
@@ -3038,6 +3472,11 @@ async function recordDurablePhaseExecutionResultLocked(
   );
   if (persisted !== null) {
     return persisted;
+  }
+  try {
+    await request.fileSystem.releaseSharedCheckoutReaderLease(request.readerLease);
+  } catch {
+    return ioFailure(paths.taskDirectory);
   }
   return Object.freeze({
     ok: true,
@@ -3763,6 +4202,65 @@ async function resealBuildImplementationAfterContextDrift(
   paths: TaskPaths,
   state: WorkflowState,
 ): Promise<TaskLifecycleFailure | null> {
+  if (
+    state.projection.route === "build" &&
+    state.projection.lifecycle === "blocked" &&
+    state.projection.phase === "implement" &&
+    state.projection.blockers.some((blocker) =>
+      blocker.startsWith("build_plan.context_stale:"),
+    )
+  ) {
+    const resumed = transitionWorkflow(state, {
+      contractVersion: 1,
+      taskId: state.projection.id,
+      expectedVersion: state.projection.version,
+      to: {
+        lifecycle: "active",
+        phase: "implement",
+        step: state.projection.step,
+      },
+      gates: [
+        {
+          gate: "resume",
+          evidence: [
+            {
+              kind: "workflow",
+              reference: `events/EVENT-${state.projection.id}-CONTEXT-RESUME-${state.projection.version + 1}`,
+            },
+          ],
+        },
+      ],
+      event: {
+        eventId: `EVENT-${state.projection.id}-CONTEXT-RESUME-${state.projection.version + 1}`,
+        actor: {
+          kind: "system",
+          id: "sayhi-core",
+          sessionRef: "context-drift",
+        },
+        reason: "Resume Context-stale Build only to record required replanning.",
+        idempotencyKey: `CONTEXT-RESUME-${state.projection.id}-${state.projection.version}`,
+        occurredAt: new Date().toISOString(),
+      },
+    });
+    if (!resumed.ok) {
+      return failure(resumed.diagnostics);
+    }
+    try {
+      await fileSystem.appendFile(paths.eventsPath, serializeEvent(resumed.event));
+      await writeProjectionIfChanged(
+        fileSystem,
+        paths.projectionPath,
+        resumed.state.projection,
+      );
+    } catch {
+      return ioFailure(paths.eventsPath);
+    }
+    return resealBuildImplementationAfterContextDrift(
+      fileSystem,
+      paths,
+      resumed.state,
+    );
+  }
   if (
     state.projection.route !== "build" ||
     state.projection.lifecycle !== "active" ||
@@ -4643,9 +5141,33 @@ async function recoverDurableTaskLocked(
   paths: TaskPaths,
   recoverRepairTasks = true,
 ): Promise<RecoverDurableTaskResult> {
-  const loaded = await loadTask(request.fileSystem, request.taskId);
+  let loaded = await loadTask(request.fileSystem, request.taskId);
   if (!loaded.ok) {
     return loaded;
+  }
+  if (
+    loaded.state.projection.route === "build" &&
+    loaded.state.projection.lifecycle === "blocked" &&
+    loaded.state.projection.phase === "implement" &&
+    loaded.state.projection.blockers.some((blocker) =>
+      blocker.startsWith("build_plan.context_stale:"),
+    )
+  ) {
+    const resealed = await resealBuildImplementationAfterContextDrift(
+      request.fileSystem,
+      paths,
+      loaded.state,
+    );
+    if (resealed !== null) {
+      const recovered = await loadTask(request.fileSystem, request.taskId);
+      if (!recovered.ok) {
+        return recovered;
+      }
+      if (recovered.state.projection.version === loaded.state.projection.version) {
+        return resealed;
+      }
+      loaded = recovered;
+    }
   }
   let activePath = loaded.projectionPath;
   try {
@@ -6164,6 +6686,23 @@ async function runWithTaskLock<Result>(
   }
 }
 
+async function runWithContextManifestMutationLease<Result>(
+  fileSystem: TaskLifecycleFileSystem,
+  lockPath: string,
+  operation: () => Promise<Result>,
+): Promise<Result | TaskLifecycleFailure> {
+  if (!isInitiativeGraphFileSystem(fileSystem)) {
+    return runWithTaskLock(fileSystem, lockPath, operation);
+  }
+  try {
+    return await fileSystem.withWriterMutationLock(() =>
+      runWithTaskLock(fileSystem, lockPath, operation),
+    );
+  } catch {
+    return ioFailure(lockPath);
+  }
+}
+
 function isInitiativeGraphFileSystem(
   fileSystem: TaskLifecycleFileSystem,
 ): fileSystem is InitiativeGraphFileSystem {
@@ -6193,6 +6732,20 @@ async function runWithInitiativeGraphLease<Result>(
   } catch {
     return ioFailure(lockPath);
   }
+}
+
+function isSharedCheckoutReaderFileSystem(
+  fileSystem: TaskLifecycleFileSystem,
+): fileSystem is SharedCheckoutReaderFileSystem {
+  return (
+    isInitiativeGraphFileSystem(fileSystem) &&
+    "acquireSharedCheckoutReaderLease" in fileSystem &&
+    typeof fileSystem.acquireSharedCheckoutReaderLease === "function" &&
+    "assertSharedCheckoutReaderLease" in fileSystem &&
+    typeof fileSystem.assertSharedCheckoutReaderLease === "function" &&
+    "releaseSharedCheckoutReaderLease" in fileSystem &&
+    typeof fileSystem.releaseSharedCheckoutReaderLease === "function"
+  );
 }
 
 function diagnosisFailure(

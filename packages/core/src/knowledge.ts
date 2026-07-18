@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { hashTextContent } from "./context-manifest.js";
 import { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
+import type { ManagedProjectPathKind } from "./managed-project.js";
 import {
   RECORD_CONTRACT_VERSION,
   isKnowledgeCandidateStatus,
@@ -12,7 +13,10 @@ import {
   type KnowledgeConfidence,
   type KnowledgeReviewDisposition,
 } from "./record-contracts.js";
-import { isRepositoryRelativePath } from "./repository-path.js";
+import {
+  canonicalRepositoryRelativePath,
+  isRepositoryRelativePath,
+} from "./repository-path.js";
 import {
   readDurableTask,
   readAcceptedTaskEvidenceReferences,
@@ -30,7 +34,10 @@ const KNOWLEDGE_DIRECTORY = ".sayhi/knowledge";
 const CANDIDATES_DIRECTORY = `${KNOWLEDGE_DIRECTORY}/candidates`;
 const KNOWLEDGE_LOCK_DIRECTORY = ".sayhi/.runtime";
 
-export interface KnowledgeCandidateFileSystem extends TaskLifecycleFileSystem {}
+export interface KnowledgeCandidateFileSystem extends TaskLifecycleFileSystem {
+  inspectRepositoryPath(path: string): Promise<Readonly<{ kind: ManagedProjectPathKind }>>;
+  readRepositoryFile(path: string): Promise<string>;
+}
 
 export interface KnowledgeCandidateDraft {
   readonly id: string;
@@ -160,6 +167,19 @@ export async function createKnowledgeCandidate(
   if (inputFailure !== null) {
     return inputFailure;
   }
+  const target = canonicalRepositoryRelativePath(request.candidate.target);
+  if (target.length === 0) {
+    return failure(
+      "knowledge.candidate.input.invalid",
+      "$.candidate.target",
+      "Knowledge Candidate target must identify a repository file.",
+      "Provide a normalized non-directory target path.",
+    );
+  }
+  const normalizedRequest = Object.freeze({
+    ...request,
+    candidate: Object.freeze({ ...request.candidate, target }),
+  });
   const candidatePath = candidateFilePath(request.candidate.id);
   try {
     return await request.fileSystem.withTaskMutationLock(
@@ -203,14 +223,11 @@ export async function createKnowledgeCandidate(
           );
         }
 
-        const targetIdentity = await readTargetIdentity(
-          request.fileSystem,
-          request.candidate.target,
-        );
+        const targetIdentity = await readTargetIdentity(request.fileSystem, target);
         if (!targetIdentity.ok) {
           return targetIdentity;
         }
-        const candidate = candidateRecord(request, targetIdentity.identity);
+        const candidate = candidateRecord(normalizedRequest, targetIdentity.identity);
         const validation = validateCandidate(candidate, candidatePath);
         if (!validation.ok) {
           return validation;
@@ -648,7 +665,7 @@ async function readTargetIdentity(
   fileSystem: KnowledgeCandidateFileSystem,
   target: string,
 ): Promise<Readonly<{ ok: true; identity: ContentHash | null }> | KnowledgeCandidateFailure> {
-  const entry = await fileSystem.inspect(target);
+  const entry = await fileSystem.inspectRepositoryPath(target);
   if (entry.kind === "missing") {
     return Object.freeze({ ok: true, identity: null });
   }
@@ -660,7 +677,7 @@ async function readTargetIdentity(
       "Choose a new target or repair the existing target path.",
     );
   }
-  return Object.freeze({ ok: true, identity: hashTextContent(await fileSystem.readFile(target)) });
+  return Object.freeze({ ok: true, identity: hashTextContent(await fileSystem.readRepositoryFile(target)) });
 }
 
 async function candidateDisposition(
@@ -700,7 +717,7 @@ async function staleReason(
   fileSystem: KnowledgeCandidateFileSystem,
   candidate: KnowledgeCandidateRecord,
 ): Promise<string | null> {
-  const entry = await fileSystem.inspect(candidate.target);
+  const entry = await fileSystem.inspectRepositoryPath(candidate.target);
   if (candidate.targetIdentity === null) {
     return entry.kind === "missing"
       ? null
@@ -709,7 +726,7 @@ async function staleReason(
   if (entry.kind !== "file") {
     return "The candidate target changed after candidate generation.";
   }
-  const current = hashTextContent(await fileSystem.readFile(candidate.target));
+  const current = hashTextContent(await fileSystem.readRepositoryFile(candidate.target));
   return sameContentHash(current, candidate.targetIdentity)
     ? null
     : "The candidate target changed after candidate generation.";

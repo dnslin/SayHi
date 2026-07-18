@@ -1,13 +1,20 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import {
+  addDurableContextManifestEntry,
   createKnowledgeCandidate,
   createDurableTask,
+  createSpec,
+  inspectDurableContextManifest,
   listKnowledgeCandidates,
+  hashKnowledgeCandidateContent,
+  promoteKnowledgeCandidate,
+  readKnowledgeCandidate,
   reviewKnowledgeCandidate,
 } from "@dnslin/sayhi-core";
 import {
@@ -19,6 +26,7 @@ import {
 import {
   createCompletedDurableTask,
   completeDurableTask,
+  taskLifecycleEventMetadata,
   type TaskLifecycleFixture,
   taskLifecycleStartRequest,
 } from "./task-lifecycle-test-support.js";
@@ -31,6 +39,16 @@ const KNOWLEDGE_TASK = Object.freeze({
   files: Object.freeze(["packages/core/**", "packages/cli/**"]),
   eventNamespace: "29-KNOWLEDGE",
   sessionRef: "session-29-knowledge",
+}) satisfies TaskLifecycleFixture;
+
+const PROMOTION_CONTEXT_TASK = Object.freeze({
+  taskId: "TASK-30-PROMOTION-CONTEXT",
+  title: "Consume promoted Knowledge",
+  goal: "Use an Approved Spec as active Task Context.",
+  acceptanceCriterion: "Promotion makes the bound Context Manifest stale.",
+  files: Object.freeze(["packages/core/**", "packages/cli/**"]),
+  eventNamespace: "30-PROMOTION-CONTEXT",
+  sessionRef: "session-30-promotion-context",
 }) satisfies TaskLifecycleFixture;
 
 const TARGET_PATH = ".sayhi/spec/conventions.md";
@@ -316,6 +334,503 @@ test("the CLI lists, shows, and records a human Knowledge review without promoti
     targetBefore,
   );
 });
+
+test("human promotion binds exact Candidate provenance and visibly stales every affected Context Manifest", async (t) => {
+  const repository = await createKnowledgeRepository(t);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  await mkdir(join(repository, "docs"));
+  await writeFile(join(repository, "docs", "conventions-source.md"), TARGET_CONTENT, "utf8");
+  const approvedSpec = await createSpec({
+    fileSystem,
+    path: "conventions.md",
+    source: "docs/conventions-source.md",
+  });
+  assert.equal(approvedSpec.ok, true);
+
+  const contextTask = await createDurableTask({
+    fileSystem,
+    start: taskLifecycleStartRequest(
+      PROMOTION_CONTEXT_TASK,
+      "2026-07-18T10:25:00Z",
+    ),
+  });
+  assert.equal(contextTask.ok, true);
+  if (!contextTask.ok) {
+    return;
+  }
+  const boundContext = await addDurableContextManifestEntry({
+    fileSystem,
+    taskId: PROMOTION_CONTEXT_TASK.taskId,
+    expectedVersion: contextTask.state.projection.version,
+    phase: "triage",
+    source: `./${TARGET_PATH}`, 
+    event: taskLifecycleEventMetadata(
+      PROMOTION_CONTEXT_TASK,
+      "CONTEXT-ADD",
+      "2026-07-18T10:26:00Z",
+    ),
+  });
+  assert.equal(boundContext.ok, true);
+  if (!boundContext.ok) {
+    return;
+  }
+  const normalizedContext = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: PROMOTION_CONTEXT_TASK.taskId,
+    phase: "triage",
+  });
+  assert.equal(normalizedContext.ok, true);
+  if (!normalizedContext.ok) {
+    return;
+  }
+  assert.equal(normalizedContext.entries[0]?.source.value, TARGET_PATH);
+  assert.equal(normalizedContext.entries[0]?.trust, "approved-spec");
+
+  const candidateId = "KNOWLEDGE-30-PROMOTION";
+  const created = await createKnowledgeCandidate({
+    fileSystem,
+    taskId: KNOWLEDGE_TASK.taskId,
+    createdAt: "2026-07-18T10:27:00Z",
+    candidate: candidateDraft(candidateId, "promotion", `./${TARGET_PATH}`),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const legacyTarget = ".sayhi/spec//conventions.md";
+  await writeFile(
+    join(
+      repository,
+      ".sayhi",
+      "knowledge",
+      "candidates",
+      `${createHash("sha256").update(candidateId).digest("hex")}.json`,
+    ),
+    `${JSON.stringify({
+      ...created.candidate,
+      target: legacyTarget,
+      contentHash: hashKnowledgeCandidateContent({
+        ...created.candidate,
+        target: legacyTarget,
+      }),
+    })}\n`,
+    "utf8",
+  );
+  const reviewed = await reviewKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    disposition: "approved",
+    reviewer: "maintainer-30",
+    reason: "The candidate is ready for deliberate promotion.",
+    reviewedAt: "2026-07-18T10:28:00Z",
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+
+  const newContent = "# Conventions\n\nUse structured diagnostics and immutable promotion records.\n";
+  const deniedHash = await promoteKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    candidateHash: `sha256:${"a".repeat(64)}`,
+    content: newContent,
+    event: {
+      eventId: "EVENT-30-PROMOTION-HASH-MISMATCH",
+      actor: { kind: "user", id: "maintainer-30", sessionRef: "session-30" },
+      reason: "Approve the reviewed candidate.",
+      idempotencyKey: "promotion-30-hash-mismatch",
+      occurredAt: "2026-07-18T10:29:00Z",
+    },
+  });
+  assert.equal(deniedHash.ok, false);
+  if (!deniedHash.ok) {
+    assert.equal(
+      deniedHash.diagnostics[0]?.code,
+      "knowledge.promotion.candidate_hash_mismatch",
+    );
+  }
+
+  const deniedActor = await promoteKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    candidateHash: reviewed.candidate.contentHash,
+    content: newContent,
+    event: {
+      eventId: "EVENT-30-PROMOTION-AGENT",
+      actor: { kind: "agent", id: "knowledge-agent", sessionRef: "session-30" },
+      reason: "An Agent cannot approve promotion.",
+      idempotencyKey: "promotion-30-agent",
+      occurredAt: "2026-07-18T10:29:30Z",
+    },
+  });
+  assert.equal(deniedActor.ok, false);
+  if (!deniedActor.ok) {
+    assert.equal(
+      deniedActor.diagnostics[0]?.code,
+      "knowledge.promotion.approval.invalid",
+    );
+  }
+
+  const promoted = await promoteKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    candidateHash: reviewed.candidate.contentHash,
+    content: newContent,
+    event: {
+      eventId: "EVENT-30-PROMOTION-APPROVED",
+      actor: { kind: "user", id: "maintainer-30", sessionRef: "session-30" },
+      reason: "Approve the exact reviewed candidate for shared use.",
+      idempotencyKey: "promotion-30-approved",
+      occurredAt: "2026-07-18T10:30:00Z",
+    },
+  });
+  assert.equal(promoted.ok, true);
+  if (!promoted.ok) {
+    return;
+  }
+  assert.equal(promoted.promotion.candidateHash, reviewed.candidate.contentHash);
+  assert.deepEqual(promoted.promotion.candidate.evidence, [SOURCE_EVIDENCE]);
+  assert.deepEqual(promoted.promotion.candidate.review, reviewed.candidate.review);
+  assert.equal(promoted.promotion.candidate.target, ".sayhi/spec//conventions.md");
+  assert.equal(promoted.promotion.target.path, TARGET_PATH);
+  assert.deepEqual(
+    promoted.promotion.invalidatedContexts.map(({ taskId, phase }) => ({ taskId, phase })),
+    [{ taskId: PROMOTION_CONTEXT_TASK.taskId, phase: "triage" }],
+  );
+  assert.match(
+    promoted.promotion.invalidatedContexts[0]?.manifestIdentity ?? "",
+    /^sha256:[0-9a-f]{64}$/u,
+  );
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    newContent,
+  );
+
+  const candidateAfterPromotion = await readKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+  });
+  assert.equal(candidateAfterPromotion.ok, true);
+  if (candidateAfterPromotion.ok) {
+    assert.deepEqual(candidateAfterPromotion.candidate, reviewed.candidate);
+  }
+  const stale = await inspectDurableContextManifest({
+    fileSystem,
+    taskId: PROMOTION_CONTEXT_TASK.taskId,
+    phase: "triage",
+  });
+  assert.equal(stale.ok, true);
+  if (stale.ok) {
+    assert.equal(stale.state, "stale");
+  }
+});
+test("the CLI promotes a reviewed Candidate with an exact user approval Event", async (t) => {
+  const repository = await createKnowledgeRepository(t);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const candidateId = "KNOWLEDGE-30-CLI";
+  const generated = await createKnowledgeCandidate({
+    fileSystem,
+    taskId: KNOWLEDGE_TASK.taskId,
+    createdAt: "2026-07-18T10:35:00Z",
+    candidate: candidateDraft(candidateId, "CLI promotion"),
+  });
+  assert.equal(generated.ok, true);
+  if (!generated.ok) {
+    return;
+  }
+  const reviewed = await reviewKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    disposition: "approved",
+    reviewer: "maintainer-30",
+    reason: "The candidate is ready for CLI promotion.",
+    reviewedAt: "2026-07-18T10:36:00Z",
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const content = "# Conventions\n\nUse Core-mediated human knowledge promotion.\n";
+  await writeFile(
+    join(repository, "promotion-request.json"),
+    `${JSON.stringify({
+      candidateHash: reviewed.candidate.contentHash,
+      content,
+      event: {
+        eventId: "EVENT-30-CLI-PROMOTION",
+        actor: { kind: "user", id: "maintainer-30", sessionRef: "session-30-cli" },
+        reason: "Approve the exact reviewed Candidate through the CLI.",
+        idempotencyKey: "promotion-30-cli",
+        occurredAt: "2026-07-18T10:37:00Z",
+      },
+    })}\n`,
+    "utf8",
+  );
+  const planned = await runCli([
+    "knowledge",
+    "promote",
+    candidateId,
+    "--from",
+    "promotion-request.json",
+    "--plan",
+    "--cwd",
+    repository,
+    "--json",
+  ]);
+  assert.equal(planned.exitCode, 0);
+  const plannedEnvelope = JSON.parse(planned.stdout) as CliJsonEnvelope;
+  assert.equal(requireRecord(plannedEnvelope.result).planned, true);
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    TARGET_CONTENT,
+  );
+  await assert.rejects(
+    lstat(join(repository, ".sayhi", "knowledge", "promotions")),
+    { code: "ENOENT" },
+  );
+
+
+  const promoted = await runCli([
+    "knowledge",
+    "promote",
+    candidateId,
+    "--from",
+    "promotion-request.json",
+    "--cwd",
+    repository,
+    "--apply",
+    "--json",
+  ]);
+  assert.equal(promoted.exitCode, 0);
+  const envelope = JSON.parse(promoted.stdout) as CliJsonEnvelope;
+  assert.equal(envelope.operation, "knowledge.promote");
+  const promotion = requireRecord(requireRecord(envelope.result).promotion);
+  assert.equal(promotion.candidateHash, reviewed.candidate.contentHash);
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    content,
+  );
+});
+
+test("promotion recovery completes the exact staged operation after final Event persistence fails", async (t) => {
+  const repository = await createKnowledgeRepository(t);
+  const fileSystem = new FailOncePromotionFileSystem(repository);
+  const candidateId = "KNOWLEDGE-30-RECOVERY";
+  const created = await createKnowledgeCandidate({
+    fileSystem,
+    taskId: KNOWLEDGE_TASK.taskId,
+    createdAt: "2026-07-18T10:40:00Z",
+    candidate: candidateDraft(candidateId, "recovery"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const reviewed = await reviewKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    disposition: "approved",
+    reviewer: "maintainer-30",
+    reason: "The candidate is ready for recoverable promotion.",
+    reviewedAt: "2026-07-18T10:41:00Z",
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const request = {
+    fileSystem,
+    candidateId,
+    candidateHash: reviewed.candidate.contentHash,
+    content: "# Conventions\n\nRecover interrupted knowledge promotion.\n",
+    event: {
+      eventId: "EVENT-30-PROMOTION-RECOVERY",
+      actor: { kind: "user" as const, id: "maintainer-30", sessionRef: "session-30" },
+      reason: "Approve the exact candidate through a recoverable operation.",
+      idempotencyKey: "promotion-30-recovery",
+      occurredAt: "2026-07-18T10:42:00Z",
+    },
+  };
+  const interrupted = await promoteKnowledgeCandidate(request);
+  assert.equal(interrupted.ok, false);
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    request.content,
+  );
+
+  const recovered = await promoteKnowledgeCandidate(request);
+  assert.equal(recovered.ok, true);
+  if (recovered.ok) {
+    assert.equal(recovered.appended, true);
+  }
+});
+
+test("promotion adapters update reviewed ADR, domain, and runbook Candidates", async (t) => {
+  const repository = await createKnowledgeRepository(t);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  await mkdir(join(repository, "docs", "adr"), { recursive: true });
+  await mkdir(join(repository, "docs", "runbooks"), { recursive: true });
+  const cases = [
+    {
+      action: "update-adr",
+      target: "docs/adr/0001-knowledge.md",
+      original: "# Knowledge ADR\n",
+      content: "# Knowledge ADR\n\nPromotions are human-authorized.\n",
+    },
+    {
+      action: "update-domain",
+      target: "CONTEXT.md",
+      original: "# Domain Context\n",
+      content: "# Domain Context\n\nKnowledge Promotion is deliberate.\n",
+    },
+    {
+      action: "update-runbook",
+      target: "docs/runbooks/promotion.md",
+      original: "# Promotion Runbook\n",
+      content: "# Promotion Runbook\n\nRecover the staged operation first.\n",
+    },
+  ] as const;
+
+  for (const [index, adapter] of cases.entries()) {
+    await writeFile(join(repository, ...adapter.target.split("/")), adapter.original, "utf8");
+    const candidateId = `KNOWLEDGE-30-${adapter.action}`;
+    const created = await createKnowledgeCandidate({
+      fileSystem,
+      taskId: KNOWLEDGE_TASK.taskId,
+      createdAt: `2026-07-18T10:4${index}:00Z`,
+      candidate: Object.freeze({
+        ...candidateDraft(candidateId, adapter.action, adapter.target),
+        proposedAction: adapter.action,
+      }),
+    });
+    assert.equal(created.ok, true);
+    if (!created.ok) {
+      return;
+    }
+    const reviewed = await reviewKnowledgeCandidate({
+      fileSystem,
+      candidateId,
+      disposition: "approved",
+      reviewer: "maintainer-30",
+      reason: `Approve ${adapter.action}.`,
+      reviewedAt: `2026-07-18T10:5${index}:00Z`,
+    });
+    assert.equal(reviewed.ok, true);
+    if (!reviewed.ok) {
+      return;
+    }
+    const promoted = await promoteKnowledgeCandidate({
+      fileSystem,
+      candidateId,
+      candidateHash: reviewed.candidate.contentHash,
+      content: adapter.content,
+      event: {
+        eventId: `EVENT-30-${adapter.action}`,
+        actor: { kind: "user", id: "maintainer-30", sessionRef: "session-30" },
+        reason: `Approve the exact ${adapter.action} Candidate.`,
+        idempotencyKey: `promotion-30-${adapter.action}`,
+        occurredAt: `2026-07-18T10:5${index}:30Z`,
+      },
+    });
+    if (!promoted.ok) {
+      assert.fail(promoted.diagnostics[0]?.message ?? "Promotion was rejected.");
+    }
+    assert.equal(promoted.ok, true);
+    assert.equal(
+      await readFile(join(repository, ...adapter.target.split("/")), "utf8"),
+      adapter.content,
+    );
+  }
+});
+
+test("promotion rejects corrupt staged journals and durable Event records without changing targets", async (t) => {
+  const repository = await createKnowledgeRepository(t);
+  const fileSystem = new NodeManagedProjectFileSystem(repository);
+  const candidateId = "KNOWLEDGE-30-CORRUPTION";
+  const created = await createKnowledgeCandidate({
+    fileSystem,
+    taskId: KNOWLEDGE_TASK.taskId,
+    createdAt: "2026-07-18T10:55:00Z",
+    candidate: candidateDraft(candidateId, "corruption"),
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  const reviewed = await reviewKnowledgeCandidate({
+    fileSystem,
+    candidateId,
+    disposition: "approved",
+    reviewer: "maintainer-30",
+    reason: "The candidate is ready for corruption checks.",
+    reviewedAt: "2026-07-18T10:56:00Z",
+  });
+  assert.equal(reviewed.ok, true);
+  if (!reviewed.ok) {
+    return;
+  }
+  const request = {
+    fileSystem,
+    candidateId,
+    candidateHash: reviewed.candidate.contentHash,
+    content: "# Conventions\n\nCorrupt promotion state must fail closed.\n",
+    event: {
+      eventId: "EVENT-30-PROMOTION-CORRUPTION",
+      actor: { kind: "user" as const, id: "maintainer-30", sessionRef: "session-30" },
+      reason: "Approve the exact candidate after integrity checks.",
+      idempotencyKey: "promotion-30-corruption",
+      occurredAt: "2026-07-18T10:57:00Z",
+    },
+  };
+  await writeFile(
+    join(repository, ".sayhi", ".runtime", "knowledge-promotion.json"),
+    "{malformed\n",
+    "utf8",
+  );
+  const malformedJournal = await promoteKnowledgeCandidate(request);
+  assert.equal(malformedJournal.ok, false);
+  if (!malformedJournal.ok) {
+    assert.equal(malformedJournal.diagnostics[0]?.code, "knowledge.promotion.store.invalid");
+  }
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    TARGET_CONTENT,
+  );
+
+  await rm(join(repository, ".sayhi", ".runtime", "knowledge-promotion.json"));
+  await mkdir(join(repository, ".sayhi", "knowledge", "promotions"));
+  await writeFile(
+    join(repository, ".sayhi", "knowledge", "promotions", "corrupt.json"),
+    "{malformed\n",
+    "utf8",
+  );
+  const malformedRecord = await promoteKnowledgeCandidate(request);
+  assert.equal(malformedRecord.ok, false);
+  if (!malformedRecord.ok) {
+    assert.equal(malformedRecord.diagnostics[0]?.code, "knowledge.promotion.store.invalid");
+  }
+  assert.equal(
+    await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
+    TARGET_CONTENT,
+  );
+});
+
+class FailOncePromotionFileSystem extends NodeManagedProjectFileSystem {
+  #failPromotionRecordWrite = true;
+
+  override async writeFile(path: string, content: string): Promise<void> {
+    if (
+      this.#failPromotionRecordWrite &&
+      path.startsWith(".sayhi/knowledge/promotions/")
+    ) {
+      this.#failPromotionRecordWrite = false;
+      throw new Error("Injected Promotion Event persistence failure.");
+    }
+    await super.writeFile(path, content);
+  }
+}
+
 
 function candidateDraft(id: string, suffix = "", target = TARGET_PATH): {
   readonly id: string;

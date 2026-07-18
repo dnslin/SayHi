@@ -66,6 +66,31 @@ export class NodeManagedProjectFileSystem
     }
   }
 
+  async inspectRepositoryPath(
+    path: string,
+  ): Promise<Readonly<{ kind: ManagedProjectPathKind }>> {
+    const target = this.#resolveRepositoryPath(path);
+    try {
+      const entry = await lstat(target);
+      if (entry.isSymbolicLink()) {
+        return { kind: "symlink" };
+      }
+      if (entry.isFile()) {
+        await this.#resolveReadableRepositoryPath(path);
+        return { kind: "file" };
+      }
+      if (entry.isDirectory()) {
+        return { kind: "directory" };
+      }
+      return { kind: "other" };
+    } catch (error) {
+      if (isNotFound(error)) {
+        return { kind: "missing" };
+      }
+      throw error;
+    }
+  }
+
   async listDirectory(path: string) {
     const entries = await readdir(this.#resolveManagedPath(path), {
       withFileTypes: true,
@@ -393,7 +418,10 @@ export class NodeManagedProjectFileSystem
     return runWithExclusiveLock(
       this.#resolveManagedPath(".sayhi/.runtime/writer.lock"),
       "shared-checkout Writer lock",
-      () => operation(writer),
+      async () => {
+        await waitForReaderLeases(this.#readerLeasesDirectory());
+        return operation(writer);
+      },
     );
   }
 
@@ -402,6 +430,95 @@ export class NodeManagedProjectFileSystem
   ): Promise<Result> {
     return this.withWriterMutationLock(async () => operation());
   }
+  async acquireSharedCheckoutReaderLease(
+    lease: Readonly<{ dispatchId: string; token: string }>,
+  ): Promise<void> {
+    const directory = this.#readerLeasesDirectory();
+    const marker = join(directory, readerLeaseFileName(lease.dispatchId));
+    const writerLock = this.#resolveManagedPath(".sayhi/.runtime/writer.lock");
+    const deadline = Date.now() + 5_000;
+    await mkdir(directory, { recursive: true });
+    for (;;) {
+      if (await pathExists(writerLock)) {
+        if (Date.now() >= deadline) {
+          throw new Error("Timed out waiting for the shared-checkout Writer.");
+        }
+        await delay(10);
+        continue;
+      }
+      await claimReaderLease(marker, lease.token);
+      if (!(await pathExists(writerLock))) {
+        return;
+      }
+      await this.releaseSharedCheckoutReaderLease(lease);
+      if (Date.now() >= deadline) {
+        throw new Error("Timed out waiting for the shared-checkout Writer.");
+      }
+      await delay(10);
+    }
+  }
+  async acquireSharedCheckoutReaderLeaseFromWriter(
+    lease: Readonly<{ dispatchId: string; token: string }>,
+  ): Promise<void> {
+    const directory = this.#readerLeasesDirectory();
+    await mkdir(directory, { recursive: true });
+    await claimReaderLease(
+      join(directory, readerLeaseFileName(lease.dispatchId)),
+      lease.token,
+    );
+  }
+
+  async assertSharedCheckoutReaderLease(
+    lease: Readonly<{ dispatchId: string; token: string }>,
+  ): Promise<void> {
+    const marker = join(this.#readerLeasesDirectory(), readerLeaseFileName(lease.dispatchId));
+    let token: string;
+    try {
+      token = await readFile(marker, "utf8");
+    } catch (error) {
+      if (isNotFound(error)) {
+        throw new Error("Shared-checkout Reader Lease is missing.");
+      }
+      throw error;
+    }
+    if (token !== lease.token) {
+      throw new Error("Shared-checkout Reader Lease ownership changed.");
+    }
+  }
+
+
+  async releaseSharedCheckoutReaderLease(
+    lease: Readonly<{ dispatchId: string; token: string }>,
+  ): Promise<void> {
+    if (!(await this.releaseSharedCheckoutReaderLeaseIfPresent(lease))) {
+      throw new Error("Shared-checkout Reader Lease is missing.");
+    }
+  }
+
+  async releaseSharedCheckoutReaderLeaseIfPresent(
+    lease: Readonly<{ dispatchId: string; token: string }>,
+  ): Promise<boolean> {
+    const marker = join(this.#readerLeasesDirectory(), readerLeaseFileName(lease.dispatchId));
+    let token: string;
+    try {
+      token = await readFile(marker, "utf8");
+    } catch (error) {
+      if (isNotFound(error)) {
+        return false;
+      }
+      throw error;
+    }
+    if (token !== lease.token) {
+      throw new Error("Shared-checkout Reader Lease ownership changed.");
+    }
+    await rm(marker);
+    return true;
+  }
+
+  #readerLeasesDirectory(): string {
+    return this.#resolveManagedPath(".sayhi/.runtime/readers");
+  }
+
 
   async #writeRepositoryFile(path: string, content: string): Promise<void> {
     await writeAtomically(
@@ -686,6 +803,67 @@ function digestNamedBuffers(
     hash.update("\0");
   }
   return `sha256:${hash.digest("hex")}`;
+}
+
+function readerLeaseFileName(dispatchId: string): string {
+  return createHash("sha256").update(dispatchId).digest("hex");
+}
+
+async function claimReaderLease(marker: string, token: string): Promise<void> {
+  const temporary = `${marker}.${randomUUID()}.tmp`;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(temporary, "wx");
+    await handle.writeFile(token, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    try {
+      await link(temporary, marker);
+    } catch (error) {
+      if (!hasErrorCode(error, "EEXIST")) {
+        throw error;
+      }
+      if ((await readFile(marker, "utf8")) !== token) {
+        throw new Error("Shared-checkout Reader Lease ownership changed.");
+      }
+    }
+  } finally {
+    await handle?.close();
+    await rm(temporary, { force: true });
+  }
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (isNotFound(error)) {
+      return false;
+    }
+    throw error;
+  }
+}
+
+async function waitForReaderLeases(directory: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    try {
+      if ((await readdir(directory)).length === 0) {
+        return;
+      }
+    } catch (error) {
+      if (isNotFound(error)) {
+        return;
+      }
+      throw error;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error("Timed out waiting for shared-checkout Readers.");
+    }
+    await delay(10);
+  }
 }
 
 async function runWithExclusiveLock<Result>(

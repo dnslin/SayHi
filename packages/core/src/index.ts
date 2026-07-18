@@ -26,6 +26,7 @@ import {
   readKnowledgeCandidate,
   reviewKnowledgeCandidate,
 } from "./knowledge.js";
+import { promoteKnowledgeCandidate } from "./knowledge-promotion.js";
 import {
   readRouteDefinition,
   readGateEvidenceKinds,
@@ -142,6 +143,21 @@ export type {
   ReviewKnowledgeCandidateRequest,
   ReviewKnowledgeCandidateResult,
 } from "./knowledge.js";
+export {
+  KNOWLEDGE_PROMOTION_CONTRACT_VERSION,
+  promoteKnowledgeCandidate,
+} from "./knowledge-promotion.js";
+export type {
+  InvalidatedKnowledgeContext,
+  KnowledgePromotionDiagnostic,
+  KnowledgePromotionDiagnosticCode,
+  KnowledgePromotionFileSystem,
+  KnowledgePromotionRecord,
+  KnowledgePromotionTarget,
+  KnowledgePromotionTargetKind,
+  PromoteKnowledgeCandidateRequest,
+  PromoteKnowledgeCandidateResult,
+} from "./knowledge-promotion.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -440,6 +456,9 @@ export type {
   InitiativeGraphFileSystem,
   InitiativeReadinessFileSystem,
   ContextManifestFileSystem,
+  PhaseExecutionFileSystem,
+  SharedCheckoutReaderFileSystem,
+  SharedCheckoutReaderLease,
   CreateDurableInitiativeRepairsRequest,
   CreateDurableInitiativeRepairsResult,
   InspectDurableContextManifestRequest,
@@ -540,6 +559,7 @@ export interface CoreContract {
   readonly listKnowledgeCandidates: typeof listKnowledgeCandidates;
   readonly readKnowledgeCandidate: typeof readKnowledgeCandidate;
   readonly reviewKnowledgeCandidate: typeof reviewKnowledgeCandidate;
+  readonly promoteKnowledgeCandidate: typeof promoteKnowledgeCandidate;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -607,6 +627,7 @@ export const coreContract: CoreContract = Object.freeze({
   listKnowledgeCandidates,
   readKnowledgeCandidate,
   reviewKnowledgeCandidate,
+  promoteKnowledgeCandidate,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
