@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import { NodeManagedProjectFileSystem, runCli, type CliJsonEnvelope } from "@dnslin/sayhi-cli";
 import {
@@ -27,12 +29,14 @@ import {
 import {
   completeDurableTask,
   createCompletedDurableTask,
+  type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
 
 const INITIATIVE_ID = "TASK-14-INITIATIVE";
 const GRAPH_ID = "GRAPH-14";
 const RECORDED_NODE_ID = "TASK-14-NODE-RECORDED";
 const MISSING_NODE_ID = "TASK-14-NODE-MISSING";
+const executeFile = promisify(execFile);
 
 test("Core stores an Initiative graph and CLI inspection reports its dependencies and node status", async (t) => {
   const fixture = await createInitiativeGraphFixture(t);
@@ -936,23 +940,8 @@ test("Integration creates a durable Repair node behind the Writer barrier and re
       "The parent integration validation passes with the repaired Build output.",
     ],
   });
+  await writeTriageContext(fixture.repository, repairFixture.taskId);
 
-  await mkdir(
-    join(fixture.repository, ".sayhi", "tasks", repairFixture.taskId, "context"),
-    { recursive: true },
-  );
-  await writeFile(
-    join(
-      fixture.repository,
-      ".sayhi",
-      "tasks",
-      repairFixture.taskId,
-      "context",
-      "triage.jsonl",
-    ),
-    "",
-    "utf8",
-  );
   const ready = await coreContract.inspectDurableInitiativeReadiness({
     fileSystem: fixture.fileSystem,
     initiativeTaskId: INITIATIVE_ID,
@@ -1283,6 +1272,812 @@ test("Integration rejects an unrelated child Build at a Repair task identity", a
 });
 
 
+test(
+  "Initiative demo recovers its writer frontier, completes a Repair, and reaches terminal completion",
+  async (t) => {
+    const fixture = await createInitiativeGraphFixture(t);
+    await initializeGitRepository(fixture.repository);
+    const scheduler = new InitiativeExecutionScheduler();
+    const readerTwoTaskId = "TASK-14-DEMO-READER-TWO";
+    const writerOneTaskId = "TASK-14-DEMO-WRITER-ONE";
+    const writerTwoTaskId = "TASK-14-DEMO-WRITER-TWO";
+    type InitiativeDemoNode = TaskLifecycleFixture & Readonly<{ priority: number }>;
+    const nodeFixtures = [
+      {
+        taskId: RECORDED_NODE_ID,
+        title: `Exercise ${RECORDED_NODE_ID}`,
+        goal: `Complete ${RECORDED_NODE_ID}`,
+        acceptanceCriterion: `${RECORDED_NODE_ID} persists correctly`,
+        files: ["packages/core/**"],
+        eventNamespace: "14-DEMO-READER-ONE",
+        sessionRef: "session-14-demo",
+        priority: 50,
+      },
+      {
+        taskId: readerTwoTaskId,
+        title: `Exercise ${readerTwoTaskId}`,
+        goal: `Complete ${readerTwoTaskId}`,
+        acceptanceCriterion: `${readerTwoTaskId} persists correctly`,
+        files: ["packages/testing/**"],
+        eventNamespace: "14-DEMO-READER-TWO",
+        sessionRef: "session-14-demo",
+        priority: 40,
+      },
+      {
+        taskId: writerOneTaskId,
+        title: `Exercise ${writerOneTaskId}`,
+        goal: `Complete ${writerOneTaskId}`,
+        acceptanceCriterion: `${writerOneTaskId} persists correctly`,
+        files: ["packages/core/**"],
+        eventNamespace: "14-DEMO-WRITER-ONE",
+        sessionRef: "session-14-demo",
+        priority: 30,
+      },
+      {
+        taskId: writerTwoTaskId,
+        title: `Exercise ${writerTwoTaskId}`,
+        goal: `Complete ${writerTwoTaskId}`,
+        acceptanceCriterion: `${writerTwoTaskId} persists correctly`,
+        files: ["packages/cli/**"],
+        eventNamespace: "14-DEMO-WRITER-TWO",
+        sessionRef: "session-14-demo",
+        priority: 20,
+      },
+      {
+        taskId: MISSING_NODE_ID,
+        title: `Exercise ${MISSING_NODE_ID}`,
+        goal: `Complete ${MISSING_NODE_ID}`,
+        acceptanceCriterion: `${MISSING_NODE_ID} persists correctly`,
+        files: ["packages/omp-plugin/**"],
+        eventNamespace: "14-DEMO-BLOCKED",
+        sessionRef: "session-14-demo",
+        priority: 10,
+      },
+    ] as const satisfies readonly InitiativeDemoNode[];
+    const fixturesByTaskId = new Map<string, TaskLifecycleFixture>(
+      nodeFixtures.map((node) => [node.taskId, node] as const),
+    );
+    const activeStates = new Map<string, WorkflowState>();
+    const nodeCommits = new Map<string, string>();
+    const recorded = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: RECORDED_NODE_ID,
+    });
+    assert.equal(recorded.ok, true);
+    if (!recorded.ok) {
+      return;
+    }
+    activeStates.set(RECORDED_NODE_ID, recorded.state);
+
+    for (const node of nodeFixtures.slice(1)) {
+      const created = await createDurableTask({
+        fileSystem: fixture.fileSystem,
+        start: startRequest(node.taskId, "build", null, `${node.eventNamespace}-CREATED`),
+      });
+      assert.equal(created.ok, true);
+      if (!created.ok) {
+        return;
+      }
+      activeStates.set(node.taskId, created.state);
+      if (node.taskId === MISSING_NODE_ID) {
+        continue;
+      }
+      await writeTriageContext(fixture.repository, node.taskId);
+    }
+
+    const parentBeforeRevision = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentBeforeRevision.ok, true);
+    if (!parentBeforeRevision.ok) {
+      return;
+    }
+    const revisionEventMetadata = revisionEvent("DEMO-GRAPH");
+    const graph = {
+      ...fixture.graph,
+      version: fixture.graph.version + 1,
+      nodes: nodeFixtures.map((node) => ({
+        taskId: node.taskId,
+        priority: node.priority,
+        resources: { files: node.files, apis: [], schemas: [], locks: [] },
+      })),
+      edges: [
+        {
+          from: RECORDED_NODE_ID,
+          to: writerOneTaskId,
+          type: "blocks" as const,
+          reason: "Both research candidates must complete before the first code change.",
+        },
+        {
+          from: readerTwoTaskId,
+          to: writerOneTaskId,
+          type: "blocks" as const,
+          reason: "Both research candidates must complete before the first code change.",
+        },
+        {
+          from: RECORDED_NODE_ID,
+          to: writerTwoTaskId,
+          type: "blocks" as const,
+          reason: "Both research candidates must complete before the second code change.",
+        },
+        {
+          from: readerTwoTaskId,
+          to: writerTwoTaskId,
+          type: "blocks" as const,
+          reason: "Both research candidates must complete before the second code change.",
+        },
+      ],
+      updatedByEvent: revisionEventMetadata.eventId,
+    } as const satisfies DependencyGraph;
+    const revised = await reviseDurableInitiativeGraph({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+      expectedVersion: parentBeforeRevision.state.projection.version,
+      expectedGraphVersion: fixture.graph.version,
+      graph,
+      event: revisionEventMetadata,
+    });
+    assert.equal(revised.ok, true);
+    if (!revised.ok) {
+      return;
+    }
+
+    const initialReadiness = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graph.version,
+    });
+    assert.equal(initialReadiness.ok, true);
+    if (!initialReadiness.ok) {
+      return;
+    }
+    assert.deepEqual(initialReadiness.frontier, [RECORDED_NODE_ID, readerTwoTaskId]);
+
+    const completeNode = async (
+      taskId: string,
+      occurredAt: string,
+      recordCommit = false,
+    ) => {
+      const node = fixturesByTaskId.get(taskId);
+      const state = activeStates.get(taskId);
+      assert.ok(node, `Missing fixture for ${taskId}.`);
+      assert.ok(state, `Missing durable state for ${taskId}.`);
+      activeStates.set(
+        taskId,
+        await completeDurableTask(fixture.fileSystem, node, state, occurredAt),
+      );
+      if (recordCommit) {
+        const directory =
+          taskId === writerTwoTaskId
+            ? "packages/cli"
+            : taskId === MISSING_NODE_ID
+              ? "packages/omp-plugin"
+              : "packages/core";
+        nodeCommits.set(
+          taskId,
+          await recordNodeCommit(fixture.repository, taskId, directory),
+        );
+      }
+    };
+    const exclusiveWriteExecution = (
+      taskId: string,
+      occurredAt: string,
+      run: () => Promise<Readonly<{ kind: "succeeded"; value: undefined }>> = async () =>
+        Object.freeze({ kind: "succeeded" as const, value: undefined }),
+    ) => ({
+      taskId,
+      repositoryAccess: "exclusive-write" as const,
+      run,
+      persist: async (outcome: { readonly kind: string }) => {
+        assert.equal(outcome.kind, "succeeded");
+        await completeNode(taskId, occurredAt, true);
+      },
+    });
+    const repositoryFingerprint = await runGit(fixture.repository, "rev-parse", "HEAD");
+    let activeReaders = 0;
+    let completedReaders = 0;
+    let signalReadersStarted!: () => void;
+    const readersStarted = new Promise<void>((resolve) => {
+      signalReadersStarted = resolve;
+    });
+    let releaseReaders!: () => void;
+    const readersReleased = new Promise<void>((resolve) => {
+      releaseReaders = resolve;
+    });
+    let signalReadPersistenceStarted!: () => void;
+    const readPersistenceStarted = new Promise<void>((resolve) => {
+      signalReadPersistenceStarted = resolve;
+    });
+    let releaseReadPersistence!: () => void;
+    const readPersistenceReleased = new Promise<void>((resolve) => {
+      releaseReadPersistence = resolve;
+    });
+    let persistedReadOutcomes = 0;
+    const readExecution = (taskId: string) => ({
+      taskId,
+      repositoryAccess: "read-only" as const,
+      run: async () => {
+        activeReaders += 1;
+        if (activeReaders === 2) {
+          signalReadersStarted();
+        }
+        await readersReleased;
+        activeReaders -= 1;
+        completedReaders += 1;
+        return {
+          kind: "succeeded" as const,
+          value: await runGit(fixture.repository, "rev-parse", "HEAD"),
+        };
+      },
+      persist: async (outcome: { readonly kind: string }) => {
+        assert.equal(outcome.kind, "succeeded");
+        if (persistedReadOutcomes === 0) {
+          signalReadPersistenceStarted();
+          await readPersistenceReleased;
+        }
+        persistedReadOutcomes += 1;
+        await completeNode(taskId, "2026-07-15T10:20:00Z");
+      },
+    });
+    const scheduledReads = scheduler.run({
+      readiness: initialReadiness,
+      executions: [readExecution(RECORDED_NODE_ID), readExecution(readerTwoTaskId)],
+    });
+    await readersStarted;
+    assert.equal(activeReaders, 2);
+    assert.equal(scheduler.barrier.activeReadWaves, 1);
+    assert.equal(scheduler.barrier.activeWriterOwner, null);
+    let queuedWriterAcquired = false;
+    const queuedWriter = scheduler.barrier.runWriter(
+      { kind: "node", taskId: "TASK-14-DEMO-QUEUED-WRITER" },
+      async () => {
+        queuedWriterAcquired = true;
+      },
+    );
+    await Promise.resolve();
+    assert.equal(queuedWriterAcquired, false);
+    releaseReaders();
+    await readPersistenceStarted;
+    await Promise.resolve();
+    assert.equal(queuedWriterAcquired, false);
+    releaseReadPersistence();
+    const readResults = await scheduledReads;
+    await queuedWriter;
+    assert.equal(queuedWriterAcquired, true);
+    assert.equal(readResults.status, "completed");
+    if (readResults.status !== "completed") {
+      return;
+    }
+    assert.deepEqual(
+      readResults.results.map((result) => ({
+        taskId: result.taskId,
+        outcome: result.outcome,
+      })),
+      [
+        {
+          taskId: RECORDED_NODE_ID,
+          outcome: { kind: "succeeded", value: repositoryFingerprint },
+        },
+        {
+          taskId: readerTwoTaskId,
+          outcome: { kind: "succeeded", value: repositoryFingerprint },
+        },
+      ],
+    );
+    assert.equal(completedReaders, 2);
+
+    const writerFrontierBeforeRestart = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graph.version,
+    });
+    assert.equal(writerFrontierBeforeRestart.ok, true);
+    if (!writerFrontierBeforeRestart.ok) {
+      return;
+    }
+    assert.deepEqual(writerFrontierBeforeRestart.frontier, [writerOneTaskId, writerTwoTaskId]);
+    await rm(fixture.graphPath);
+    const recovered = await recoverDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(recovered.ok, true);
+    const restartedScheduler = new InitiativeExecutionScheduler();
+    assert.notEqual(restartedScheduler, scheduler);
+    const writerFrontierAfterRestart = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graph.version,
+    });
+    assert.equal(writerFrontierAfterRestart.ok, true);
+    if (!writerFrontierAfterRestart.ok) {
+      return;
+    }
+    assert.deepEqual(writerFrontierAfterRestart.frontier, writerFrontierBeforeRestart.frontier);
+    const writerTwoSource = join(
+      fixture.repository,
+      "packages",
+      "cli",
+      `${writerTwoTaskId.toLowerCase()}.txt`,
+    );
+    await assert.rejects(readFile(writerTwoSource, "utf8"), { code: "ENOENT" });
+
+    let activeWriters = 0;
+    let maximumActiveWriters = 0;
+    const writerOrder: string[] = [];
+    let signalFirstWriterStarted!: () => void;
+    const firstWriterStarted = new Promise<void>((resolve) => {
+      signalFirstWriterStarted = resolve;
+    });
+    let releaseFirstWriter!: () => void;
+    const firstWriterReleased = new Promise<void>((resolve) => {
+      releaseFirstWriter = resolve;
+    });
+    const writeExecution = (taskId: string) =>
+      exclusiveWriteExecution(taskId, "2026-07-15T10:30:00Z", async () => {
+        assert.equal(completedReaders, 2);
+        assert.deepEqual(restartedScheduler.barrier.activeWriterOwner, {
+          kind: "node",
+          taskId,
+        });
+        activeWriters += 1;
+        maximumActiveWriters = Math.max(maximumActiveWriters, activeWriters);
+        writerOrder.push(taskId);
+        if (writerOrder.length === 1) {
+          signalFirstWriterStarted();
+          await firstWriterReleased;
+        }
+        activeWriters -= 1;
+        return { kind: "succeeded" as const, value: undefined };
+      });
+    const scheduledWrites = restartedScheduler.run({
+      readiness: writerFrontierAfterRestart,
+      executions: [writeExecution(writerOneTaskId), writeExecution(writerTwoTaskId)],
+    });
+    await firstWriterStarted;
+    await Promise.resolve();
+    assert.deepEqual(writerOrder, [writerOneTaskId]);
+    assert.deepEqual(restartedScheduler.barrier.activeWriterOwner, {
+      kind: "node",
+      taskId: writerOneTaskId,
+    });
+    assert.equal(nodeCommits.has(writerTwoTaskId), false);
+    await assert.rejects(readFile(writerTwoSource, "utf8"), { code: "ENOENT" });
+    let contendingWriterAcquired = false;
+    const contendingWriter = restartedScheduler.barrier.runWriter(
+      { kind: "node", taskId: writerTwoTaskId },
+      async () => {
+        contendingWriterAcquired = true;
+        await assert.rejects(readFile(writerTwoSource, "utf8"), { code: "ENOENT" });
+      },
+    );
+    await Promise.resolve();
+    assert.equal(contendingWriterAcquired, false);
+    let blockedReaderStarted = false;
+    const blockedReader = restartedScheduler.barrier.runReadWave(
+      async () => {
+        blockedReaderStarted = true;
+      },
+      { kind: "read-wave-results", taskIds: ["TASK-14-DEMO-BLOCKED-READER"] },
+      async () => undefined,
+    );
+    await Promise.resolve();
+    assert.equal(blockedReaderStarted, false);
+    releaseFirstWriter();
+    await contendingWriter;
+    assert.equal(contendingWriterAcquired, true);
+    await blockedReader;
+    assert.equal(blockedReaderStarted, true);
+    const completedWrites = await scheduledWrites;
+    assert.equal(completedWrites.status, "completed");
+    assert.equal(maximumActiveWriters, 1);
+    assert.deepEqual(writerOrder, [writerOneTaskId, writerTwoTaskId]);
+    assert.equal(await readFile(writerTwoSource, "utf8"), `${writerTwoTaskId}\n`);
+
+    await writeTriageContext(fixture.repository, MISSING_NODE_ID);
+    const releasedBranch = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graph.version,
+    });
+    assert.equal(releasedBranch.ok, true);
+    if (!releasedBranch.ok) {
+      return;
+    }
+    assert.deepEqual(releasedBranch.frontier, [MISSING_NODE_ID]);
+    const branchResult = await restartedScheduler.run({
+      readiness: releasedBranch,
+      executions: [
+        exclusiveWriteExecution(MISSING_NODE_ID, "2026-07-15T10:40:00Z"),
+      ],
+    });
+    assert.equal(branchResult.status, "completed");
+    const completedNodeEvents = new Map<string, WorkflowState["events"]>();
+    for (const node of nodeFixtures) {
+      const completedNode = await readDurableTask({
+        fileSystem: fixture.fileSystem,
+        taskId: node.taskId,
+      });
+      assert.equal(completedNode.ok, true);
+      if (!completedNode.ok) {
+        return;
+      }
+      completedNodeEvents.set(node.taskId, completedNode.state.events);
+    }
+
+    const parentBeforeIntegration = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentBeforeIntegration.ok, true);
+    if (!parentBeforeIntegration.ok) {
+      return;
+    }
+    const repairTaskId = "TASK-14-DEMO-REPAIR";
+    const repairFixture = {
+      taskId: repairTaskId,
+      title: `Exercise ${repairTaskId}`,
+      goal: "Repair the parent integration failure.",
+      acceptanceCriterion: "The parent integration validation passes.",
+      files: ["packages/core/**"],
+      eventNamespace: "14-DEMO-REPAIR",
+      sessionRef: "session-14-demo",
+    } as const satisfies TaskLifecycleFixture;
+    const integrationEvent = revisionEvent("DEMO-REPAIR");
+    const failedIntegration = await restartedScheduler.integrate({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedVersion: parentBeforeIntegration.state.projection.version,
+      expectedGraphVersion: graph.version,
+      event: integrationEvent,
+      run: async () => ({
+        kind: "repair-required" as const,
+        repairs: [
+          {
+            taskId: repairTaskId,
+            priority: 70,
+            resources: {
+              files: ["packages/core/**"],
+              apis: ["InitiativeExecutionScheduler.integrate"],
+              schemas: ["graph.json"],
+              locks: [],
+            },
+            blockers: nodeFixtures.map((node) => node.taskId),
+            context: {
+              failureKind: "acceptance-failed" as const,
+              summary: "Parent integration validation failed.",
+              evidence: [
+                { kind: "validation" as const, reference: "evidence/demo-integration.json" },
+              ],
+            },
+            intent: {
+              goals: ["Repair the parent integration failure."],
+              nonGoals: [],
+              acceptanceCriteria: ["The parent integration validation passes."],
+            },
+          },
+        ],
+      }),
+    });
+    assert.equal(failedIntegration.status, "repair-required");
+    if (failedIntegration.status !== "repair-required") {
+      return;
+    }
+    assert.deepEqual(failedIntegration.repairTaskIds, [repairTaskId]);
+    assert.deepEqual(
+      failedIntegration.graph.edges.filter((edge) => edge.to === repairTaskId),
+      nodeFixtures.map((node) => ({
+        from: node.taskId,
+        to: repairTaskId,
+        type: "blocks" as const,
+        reason: "Parent integration validation failed.",
+      })),
+    );
+    for (const [taskId, events] of completedNodeEvents) {
+      const completedNode = await readDurableTask({
+        fileSystem: fixture.fileSystem,
+        taskId,
+      });
+      assert.equal(completedNode.ok, true);
+      if (!completedNode.ok) {
+        return;
+      }
+      assert.deepEqual(completedNode.state.events, events);
+    }
+    const repair = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: repairTaskId,
+    });
+    assert.equal(repair.ok, true);
+    if (!repair.ok) {
+      return;
+    }
+    fixturesByTaskId.set(repairTaskId, repairFixture);
+    activeStates.set(repairTaskId, repair.state);
+    await writeTriageContext(fixture.repository, repairTaskId);
+    const dependentTaskId = "TASK-14-DEMO-REPAIR-DEPENDENT";
+    const dependentFixture = {
+      taskId: dependentTaskId,
+      title: `Exercise ${dependentTaskId}`,
+      goal: "Verify the Repair output in a dependent Build.",
+      acceptanceCriterion: "The Repair-dependent Build completes after the Repair.",
+      files: ["packages/core/**"],
+      eventNamespace: "14-DEMO-REPAIR-DEPENDENT",
+      sessionRef: "session-14-demo",
+    } as const satisfies TaskLifecycleFixture;
+    const dependent = await createDurableTask({
+      fileSystem: fixture.fileSystem,
+      start: startRequest(dependentTaskId, "build", null, "DEMO-DEPENDENT-CREATED"),
+    });
+    assert.equal(dependent.ok, true);
+    if (!dependent.ok) {
+      return;
+    }
+    fixturesByTaskId.set(dependentTaskId, dependentFixture);
+    activeStates.set(dependentTaskId, dependent.state);
+    await writeTriageContext(fixture.repository, dependentTaskId);
+    const parentBeforeDependentRevision = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentBeforeDependentRevision.ok, true);
+    if (!parentBeforeDependentRevision.ok) {
+      return;
+    }
+    const dependentRevisionEvent = revisionEvent("DEMO-REPAIR-DEPENDENT");
+    const graphWithDependent = {
+      ...failedIntegration.graph,
+      version: failedIntegration.graph.version + 1,
+      nodes: [
+        ...failedIntegration.graph.nodes,
+        {
+          taskId: dependentTaskId,
+          priority: 60,
+          resources: { files: ["packages/core/**"], apis: [], schemas: [], locks: [] },
+        },
+      ],
+      edges: [
+        ...failedIntegration.graph.edges,
+        {
+          from: repairTaskId,
+          to: dependentTaskId,
+          type: "blocks" as const,
+          reason: "The dependent Build must wait for the Repair output.",
+        },
+      ],
+      updatedByEvent: dependentRevisionEvent.eventId,
+    } as const satisfies DependencyGraph;
+    const dependentRevision = await reviseDurableInitiativeGraph({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+      expectedVersion: parentBeforeDependentRevision.state.projection.version,
+      expectedGraphVersion: failedIntegration.graph.version,
+      graph: graphWithDependent,
+      event: dependentRevisionEvent,
+    });
+    assert.equal(dependentRevision.ok, true);
+    if (!dependentRevision.ok) {
+      return;
+    }
+    const repairReadiness = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graphWithDependent.version,
+    });
+    assert.equal(repairReadiness.ok, true);
+    if (!repairReadiness.ok) {
+      return;
+    }
+    assert.deepEqual(repairReadiness.frontier, [repairTaskId]);
+    const parentDuringRepair = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentDuringRepair.ok, true);
+    if (!parentDuringRepair.ok) {
+      return;
+    }
+    const integrationWhileRepairPending = await restartedScheduler.integrate({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedVersion: parentDuringRepair.state.projection.version,
+      expectedGraphVersion: graphWithDependent.version,
+      event: revisionEvent("DEMO-REPAIR-PENDING"),
+      run: async () => {
+        assert.fail("Integration must wait until the Repair completes.");
+      },
+    });
+    assert.equal(integrationWhileRepairPending.status, "waiting");
+    if (integrationWhileRepairPending.status === "waiting") {
+      assert.deepEqual(integrationWhileRepairPending.pendingTaskIds, [
+        repairTaskId,
+        dependentTaskId,
+      ]);
+    }
+    const repairResult = await restartedScheduler.run({
+      readiness: repairReadiness,
+      executions: [
+        exclusiveWriteExecution(repairTaskId, "2026-07-15T10:50:00Z"),
+      ],
+    });
+    assert.equal(repairResult.status, "completed");
+    const dependentReadiness = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graphWithDependent.version,
+    });
+    assert.equal(dependentReadiness.ok, true);
+    if (!dependentReadiness.ok) {
+      return;
+    }
+    assert.deepEqual(dependentReadiness.frontier, [dependentTaskId]);
+    const dependentResult = await restartedScheduler.run({
+      readiness: dependentReadiness,
+      executions: [
+        exclusiveWriteExecution(dependentTaskId, "2026-07-15T10:55:00Z"),
+      ],
+    });
+    assert.equal(dependentResult.status, "completed");
+
+    const parentAfterRepair = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentAfterRepair.ok, true);
+    if (!parentAfterRepair.ok) {
+      return;
+    }
+    const reentered = await restartedScheduler.integrate({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedVersion: parentAfterRepair.state.projection.version,
+      expectedGraphVersion: graphWithDependent.version,
+      event: revisionEvent("DEMO-INTEGRATION-PASSED"),
+      run: async () => ({ kind: "accepted" as const }),
+    });
+    assert.equal(reentered.status, "completed");
+    const parentBeforeFinish = await readDurableTask({
+      fileSystem: fixture.fileSystem,
+      taskId: INITIATIVE_ID,
+    });
+    assert.equal(parentBeforeFinish.ok, true);
+    if (!parentBeforeFinish.ok) {
+      return;
+    }
+    const completedReadiness = await coreContract.inspectDurableInitiativeReadiness({
+      fileSystem: fixture.fileSystem,
+      initiativeTaskId: INITIATIVE_ID,
+      expectedGraphVersion: graphWithDependent.version,
+    });
+    assert.equal(completedReadiness.ok, true);
+    if (!completedReadiness.ok) {
+      return;
+    }
+    assert.deepEqual(completedReadiness.frontier, []);
+    assert.equal(
+      completedReadiness.nodes.every((node) => node.readiness === "completed"),
+      true,
+    );
+
+    const finished = await advance(
+      fixture.fileSystem,
+      parentBeforeFinish.state,
+      "finish",
+      "DEMO-FINISH",
+    );
+    const terminalTransition = coreContract
+      .readRouteDefinition("initiative")
+      .transitions.find(
+        (candidate) =>
+          candidate.from.lifecycle === finished.projection.lifecycle &&
+          candidate.from.phase === finished.projection.phase &&
+          candidate.to.lifecycle === "completed" &&
+          candidate.to.phase === "finish",
+      );
+    assert.ok(terminalTransition, "Missing Initiative terminal transition.");
+    const nodeCommitTaskIds = [
+      writerOneTaskId,
+      writerTwoTaskId,
+      MISSING_NODE_ID,
+      repairTaskId,
+      dependentTaskId,
+    ];
+    const nodeCommitEvidence = Object.freeze({
+      schemaVersion: 1,
+      nodes: Object.freeze(
+        nodeCommitTaskIds.map((taskId) => {
+          const commit = nodeCommits.get(taskId);
+          assert.ok(commit, `Missing observed Git commit for ${taskId}.`);
+          return Object.freeze({ taskId, commit });
+        }),
+      ),
+    });
+    await mkdir(
+      join(fixture.repository, ".sayhi", "tasks", INITIATIVE_ID, "evidence"),
+      { recursive: true },
+    );
+    await writeFile(
+      join(
+        fixture.repository,
+        ".sayhi",
+        "tasks",
+        INITIATIVE_ID,
+        "evidence",
+        "node-commits.json",
+      ),
+      `${JSON.stringify(nodeCommitEvidence, null, 2)}\n`,
+      "utf8",
+    );
+    const completed = await advanceDurableTask({
+      fileSystem: fixture.fileSystem,
+      transition: {
+        contractVersion: 1,
+        taskId: INITIATIVE_ID,
+        expectedVersion: finished.projection.version,
+        to: terminalTransition.to,
+        gates: terminalTransition.requiredGates.map((gate) => ({
+          gate,
+          evidence: [
+            {
+              kind: readGateEvidenceKinds(gate)[0]!,
+              reference:
+                gate === "finish"
+                  ? "evidence/node-commits.json"
+                  : `evidence/DEMO-COMPLETED-${gate}.json`,
+            },
+          ],
+        })),
+        event: eventMetadata("DEMO-COMPLETED"),
+      },
+    });
+    assert.equal(completed.ok, true);
+    if (!completed.ok) {
+      return;
+    }
+    assert.equal(completed.state.projection.lifecycle, "completed");
+    assert.equal(completed.state.projection.phase, "finish");
+    assert.deepEqual(
+      JSON.parse(
+        await readFile(
+          join(
+            fixture.repository,
+            ".sayhi",
+            "tasks",
+            INITIATIVE_ID,
+            "evidence",
+            "node-commits.json",
+          ),
+          "utf8",
+        ),
+      ),
+      nodeCommitEvidence,
+    );
+    const archived = await archiveDurableTask({
+      fileSystem: fixture.fileSystem,
+      transition: {
+        contractVersion: 1,
+        taskId: INITIATIVE_ID,
+        expectedVersion: completed.state.projection.version,
+        to: { lifecycle: "archived", phase: "finish", step: "archived" },
+        gates: [
+          {
+            gate: "archive",
+            evidence: [{ kind: "validation", reference: "evidence/node-commits.json" }],
+          },
+        ],
+        event: eventMetadata("DEMO-ARCHIVED"),
+      },
+    });
+    assert.equal(archived.ok, true);
+    if (!archived.ok) {
+      return;
+    }
+    assert.equal(archived.state.projection.lifecycle, "archived");
+    assert.equal(archived.state.projection.phase, "finish");
+  },
+);
+
 async function createInitiativeGraphFixture(
   t: test.TestContext,
   recordedNodeState: "active" | "archived" | "completed" = "active",
@@ -1357,28 +2152,7 @@ async function createInitiativeGraphFixture(
     if (!recordedNode.ok) {
       assert.fail(recordedNode.diagnostics[0]?.message ?? "Node creation failed");
     }
-    await mkdir(
-      join(
-        repository,
-        ".sayhi",
-        "tasks",
-        RECORDED_NODE_ID,
-        "context",
-      ),
-      { recursive: true },
-    );
-    await writeFile(
-      join(
-        repository,
-        ".sayhi",
-        "tasks",
-        RECORDED_NODE_ID,
-        "context",
-        "triage.jsonl",
-      ),
-      "",
-      "utf8",
-    );
+    await writeTriageContext(repository, RECORDED_NODE_ID);
   }
 
   const created = await createDurableTask({
@@ -1434,6 +2208,47 @@ async function createInitiativeGraphFixture(
       "graph.json",
     ),
   });
+}
+
+async function writeTriageContext(repository: string, taskId: string): Promise<void> {
+  await mkdir(join(repository, ".sayhi", "tasks", taskId, "context"), {
+    recursive: true,
+  });
+  await writeFile(
+    join(repository, ".sayhi", "tasks", taskId, "context", "triage.jsonl"),
+    "",
+    "utf8",
+  );
+}
+
+async function initializeGitRepository(repository: string): Promise<void> {
+  await rm(join(repository, ".git"), { recursive: true, force: true });
+  await runGit(repository, "init", "--quiet");
+  await runGit(repository, "config", "user.email", "sayhi-tests@example.test");
+  await runGit(repository, "config", "user.name", "SayHi Tests");
+  await writeFile(join(repository, "README.md"), "Initiative fixture\n", "utf8");
+  await runGit(repository, "add", "README.md");
+  await runGit(repository, "commit", "--quiet", "-m", "Initialize Initiative fixture");
+}
+
+async function recordNodeCommit(
+  repository: string,
+  taskId: string,
+  directory: string,
+): Promise<string> {
+  const path = `${directory}/${taskId.toLowerCase()}.txt`;
+  await mkdir(join(repository, directory), { recursive: true });
+  await writeFile(join(repository, path), `${taskId}\n`, "utf8");
+  await runGit(repository, "add", path);
+  await runGit(repository, "commit", "--quiet", "-m", `Complete ${taskId}`);
+  const commit = await runGit(repository, "rev-parse", "HEAD");
+  assert.match(commit, /^[a-f0-9]{40}$/u);
+  return commit;
+}
+
+async function runGit(repository: string, ...args: readonly string[]): Promise<string> {
+  const result = await executeFile("git", args, { cwd: repository, windowsHide: true });
+  return String(result.stdout).trim();
 }
 
 async function advance(
