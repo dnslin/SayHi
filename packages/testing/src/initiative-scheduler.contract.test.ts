@@ -424,3 +424,33 @@ test("A Read Wave continues persisting later outcomes after one persistence fail
   assert.equal(writerStarted, false);
   assert.equal(scheduler.barrier.activeWriterOwner, null);
 });
+
+test("Default Initiative schedulers share one Reader Writer barrier", async () => {
+  const readerScheduler = new InitiativeExecutionScheduler();
+  const writerScheduler = new InitiativeExecutionScheduler();
+  const readerStarted = deferred<void>();
+  const releaseReader = deferred<void>();
+  let writerStarted = false;
+
+  const reader = readerScheduler.barrier.runReadWave(
+    async () => {
+      readerStarted.resolve();
+      await releaseReader.promise;
+    },
+    { kind: "read-wave-results", taskIds: ["TASK-SHARED-READER"] },
+    async () => undefined,
+  );
+  await readerStarted.promise;
+  const writer = writerScheduler.barrier.runWriter(
+    { kind: "node", taskId: "TASK-SHARED-WRITER" },
+    async () => {
+      writerStarted = true;
+    },
+  );
+
+  await Promise.resolve();
+  assert.equal(writerStarted, false);
+  releaseReader.resolve();
+  await Promise.all([reader, writer]);
+  assert.equal(writerStarted, true);
+});

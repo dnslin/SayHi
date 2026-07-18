@@ -345,7 +345,16 @@ export async function createCompletedDurableTask(
   if (!created.ok) {
     throw new Error(created.diagnostics[0]?.message ?? "Task creation failed");
   }
-  let state = created.state;
+  return completeDurableTask(fileSystem, fixture, created.state, transitionedAt);
+}
+
+export async function completeDurableTask(
+  fileSystem: ContextManifestFileSystem,
+  fixture: TaskLifecycleFixture,
+  initialState: WorkflowState,
+  transitionedAt: string,
+): Promise<WorkflowState> {
+  let state = initialState;
   for (const [lifecycle, phase] of [
     ["active", "explore"],
     ["active", "plan"],

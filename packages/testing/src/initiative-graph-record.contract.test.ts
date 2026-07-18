@@ -6,10 +6,11 @@ import test from "node:test";
 
 import { NodeManagedProjectFileSystem, runCli, type CliJsonEnvelope } from "@dnslin/sayhi-cli";
 import {
-  archiveDurableTask,
   advanceDurableTask,
+  archiveDurableTask,
   coreContract,
   createDurableTask,
+  InitiativeExecutionScheduler,
   inspectDurableInitiativeGraph,
   readDurableTask,
   recoverDurableTask,
@@ -23,7 +24,10 @@ import {
   type WorkflowState,
 } from "@dnslin/sayhi-core";
 
-import { createCompletedDurableTask } from "./task-lifecycle-test-support.js";
+import {
+  completeDurableTask,
+  createCompletedDurableTask,
+} from "./task-lifecycle-test-support.js";
 
 const INITIATIVE_ID = "TASK-14-INITIATIVE";
 const GRAPH_ID = "GRAPH-14";
@@ -454,6 +458,41 @@ test("Core rejects unsafe and stale Initiative graph revisions without replacing
       code: "workflow.graph.invalid",
     },
     {
+      name: "repair-bypass",
+      graph: {
+        ...revisedGraph(fixture.graph, "EVENT-14-REPAIR-BYPASS"),
+        nodes: [
+          ...fixture.graph.nodes,
+          {
+            taskId: "TASK-14-REPAIR-BYPASS",
+            priority: 30,
+            resources: { files: [], apis: [], schemas: [], locks: [] },
+            repair: {
+              failureKind: "acceptance-failed" as const,
+              summary: "Bypasses durable Integration Repair creation.",
+              evidence: [
+                {
+                  kind: "validation" as const,
+                  reference: "evidence/repair-bypass.json",
+                },
+              ],
+            },
+          },
+        ],
+        edges: [
+          ...fixture.graph.edges,
+          {
+            from: RECORDED_NODE_ID,
+            to: "TASK-14-REPAIR-BYPASS",
+            type: "blocks" as const,
+            reason: "The Repair must not bypass its completed Build predecessor.",
+          },
+        ],
+      },
+      expectedGraphVersion: fixture.graph.version,
+      code: "workflow.graph.invalid",
+    },
+    {
       name: "stale-graph-version",
       graph: revisedGraph(fixture.graph, "EVENT-14-STALE"),
       expectedGraphVersion: fixture.graph.version + 1,
@@ -659,9 +698,413 @@ test("Graph inspection rejects invalid and incompatible records without changing
   assert.deepEqual(after, before);
 });
 
+test("Integration creates a durable Repair node behind the Writer barrier and resumes scheduling", async (t) => {
+  const scheduler = new InitiativeExecutionScheduler();
+  const incompleteFixture = await createInitiativeGraphFixture(t);
+  const incompleteParent = await readDurableTask({
+    fileSystem: incompleteFixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(incompleteParent.ok, true);
+  if (!incompleteParent.ok) {
+    return;
+  }
+  const ineligible = await scheduler.integrate({
+    fileSystem: incompleteFixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: incompleteParent.state.projection.version,
+    expectedGraphVersion: incompleteFixture.graph.version,
+    event: revisionEvent("INTEGRATION-INCOMPLETE"),
+    run: async () => {
+      assert.fail("Integration must not run while durable Build nodes are incomplete.");
+    },
+  });
+  assert.equal(ineligible.status, "waiting");
+  if (ineligible.status === "waiting") {
+    assert.deepEqual(ineligible.pendingTaskIds, [RECORDED_NODE_ID, MISSING_NODE_ID]);
+  }
+
+  const fixture = await createInitiativeGraphFixture(t, "completed");
+  const parentBefore = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(parentBefore.ok, true);
+  if (!parentBefore.ok) {
+    return;
+  }
+  const event = revisionEvent("INTEGRATION-REPAIR");
+  let releaseReader!: () => void;
+  const readerReleased = new Promise<void>((resolve) => {
+    releaseReader = resolve;
+  });
+  let signalReaderStarted!: () => void;
+  const readerStarted = new Promise<void>((resolve) => {
+    signalReaderStarted = resolve;
+  });
+  const reader = scheduler.barrier.runReadWave(
+    async () => {
+      signalReaderStarted();
+      await readerReleased;
+    },
+    { kind: "read-wave-results", taskIds: ["TASK-14-READER"] },
+    async () => undefined,
+  );
+  await readerStarted;
+
+  const repairFixture = {
+    taskId: "TASK-14-REPAIR",
+    title: "Exercise TASK-14-REPAIR",
+    goal: "Complete TASK-14-REPAIR",
+    acceptanceCriterion: "TASK-14-REPAIR persists correctly",
+    files: ["packages/core/**", "packages/cli/**"],
+    eventNamespace: "14-REPAIR",
+    sessionRef: "session-14",
+  } as const;
+  let integrationRan = false;
+  const writerLease = trackWriterLease(fixture.fileSystem);
+  const integration = scheduler.integrate({
+    fileSystem: writerLease.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: parentBefore.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    event,
+    run: async () => {
+      integrationRan = true;
+      assert.deepEqual(scheduler.barrier.activeWriterOwner, {
+        kind: "integration",
+        initiativeTaskId: INITIATIVE_ID,
+      });
+      assert.equal(writerLease.acquired(), true);
+      return {
+        kind: "repair-required" as const,
+        repairs: [
+          {
+            taskId: repairFixture.taskId,
+            priority: 60,
+            resources: {
+              files: ["packages/core/**"],
+              apis: ["InitiativeExecutionScheduler.integrate"],
+              schemas: ["graph.json"],
+              locks: [],
+            },
+            blockers: [RECORDED_NODE_ID, MISSING_NODE_ID],
+            context: {
+              failureKind: "acceptance-failed",
+              summary: "Parent integration validation failed.",
+              evidence: [
+                {
+                  kind: "validation",
+                  reference: "evidence/integration-failure.json",
+                },
+              ],
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  await Promise.resolve();
+  assert.equal(integrationRan, false);
+  releaseReader();
+  await reader;
+
+  const integrated = await integration;
+  assert.equal(integrated.status, "repair-required");
+  assert.equal(writerLease.acquired(), true);
+  if (integrated.status !== "repair-required") {
+    return;
+  }
+  const repairGraph = integrated.graph;
+  assert.deepEqual(
+    repairGraph.nodes.slice(0, fixture.graph.nodes.length),
+    fixture.graph.nodes,
+  );
+  assert.deepEqual(repairGraph.nodes.at(-1), {
+    taskId: repairFixture.taskId,
+    priority: 60,
+    resources: {
+      files: ["packages/core/**"],
+      apis: ["InitiativeExecutionScheduler.integrate"],
+      schemas: ["graph.json"],
+      locks: [],
+    },
+    repair: {
+      failureKind: "acceptance-failed",
+      summary: "Parent integration validation failed.",
+      evidence: [
+        {
+          kind: "validation",
+          reference: "evidence/integration-failure.json",
+        },
+      ],
+    },
+  });
+  assert.deepEqual(
+    repairGraph.edges.filter((edge) => edge.to === repairFixture.taskId),
+    [
+      {
+        from: RECORDED_NODE_ID,
+        to: repairFixture.taskId,
+        type: "blocks",
+        reason: "Parent integration validation failed.",
+      },
+      {
+        from: MISSING_NODE_ID,
+        to: repairFixture.taskId,
+        type: "blocks",
+        reason: "Parent integration validation failed.",
+      },
+    ],
+  );
+
+  const durable = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(durable.ok, true);
+  if (!durable.ok) {
+    return;
+  }
+  assert.deepEqual(durable.graph, repairGraph);
+  assert.deepEqual(
+    JSON.parse(
+      await readFile(
+        join(
+          fixture.repository,
+          ".sayhi",
+          ".runtime",
+          "initiative-repair-operation.json",
+        ),
+        "utf8",
+      ),
+    ),
+    {
+      schemaVersion: 1,
+      initiativeTaskId: INITIATIVE_ID,
+      graphEventId: event.eventId,
+      repairTaskIds: [repairFixture.taskId],
+      state: "completed",
+    },
+  );
+  const parentAfter = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(parentAfter.ok, true);
+  if (!parentAfter.ok) {
+    return;
+  }
+  assert.deepEqual(
+    parentAfter.state.events.slice(0, parentBefore.state.events.length),
+    parentBefore.state.events,
+  );
+  const repair = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: repairFixture.taskId,
+  });
+  assert.equal(repair.ok, true);
+  if (!repair.ok) {
+    return;
+  }
+  assert.equal(repair.state.projection.route, "build");
+  assert.equal(repair.state.projection.parentTaskId, INITIATIVE_ID);
+
+  await mkdir(
+    join(fixture.repository, ".sayhi", "tasks", repairFixture.taskId, "context"),
+    { recursive: true },
+  );
+  await writeFile(
+    join(
+      fixture.repository,
+      ".sayhi",
+      "tasks",
+      repairFixture.taskId,
+      "context",
+      "triage.jsonl",
+    ),
+    "",
+    "utf8",
+  );
+  const ready = await coreContract.inspectDurableInitiativeReadiness({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedGraphVersion: repairGraph.version,
+  });
+  assert.equal(ready.ok, true);
+  if (!ready.ok) {
+    return;
+  }
+  assert.deepEqual(ready.frontier, [repairFixture.taskId]);
+  const repairScheduled = await scheduler.run({
+    readiness: ready,
+    executions: [
+      {
+        taskId: repairFixture.taskId,
+        repositoryAccess: "exclusive-write",
+        run: async () => ({ kind: "succeeded" as const, value: undefined }),
+        persist: async () => undefined,
+      },
+    ],
+  });
+  assert.equal(repairScheduled.status, "completed");
+
+  const completedRepair = await completeDurableTask(
+    fixture.fileSystem,
+    repairFixture,
+    repair.state,
+    "2026-07-15T10:10:00Z",
+  );
+  assert.equal(completedRepair.projection.lifecycle, "completed");
+  const archivedRepair = await archiveDurableTask({
+    fileSystem: fixture.fileSystem,
+    transition: {
+      contractVersion: 1,
+      taskId: repairFixture.taskId,
+      expectedVersion: completedRepair.projection.version,
+      to: { lifecycle: "archived", phase: "finish", step: "archived" },
+      gates: [
+        {
+          gate: "archive",
+          evidence: [
+            { kind: "validation", reference: "evidence/repair-archived.json" },
+          ],
+        },
+      ],
+      event: revisionEvent("REPAIR-ARCHIVED"),
+    },
+  });
+  assert.equal(archivedRepair.ok, true);
+  if (!archivedRepair.ok) {
+    return;
+  }
+  const recoveredArchivedRepair = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(recoveredArchivedRepair.ok, true);
+  const activeArchivedRepair = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: repairFixture.taskId,
+  });
+  assert.equal(activeArchivedRepair.ok, false);
+  const reentered = await scheduler.integrate({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: parentAfter.state.projection.version,
+    expectedGraphVersion: repairGraph.version,
+    event: revisionEvent("INTEGRATION-PASSED"),
+    run: async () => ({ kind: "accepted" as const }),
+  });
+  assert.equal(reentered.status, "completed");
+});
+
+test("Task recovery creates missing Repair children after an interrupted Integration", async (t) => {
+  const fixture = await createInitiativeGraphFixture(t, "completed");
+  const parent = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  assert.equal(parent.ok, true);
+  if (!parent.ok) {
+    return;
+  }
+  const repairTaskId = "TASK-14-RECOVERY-REPAIR";
+  let failRepairCreation = true;
+  const faultingFileSystem = new Proxy(fixture.fileSystem, {
+    get(target, property, receiver) {
+      if (property === "appendFile") {
+        return async (path: string, content: string) => {
+          if (
+            failRepairCreation &&
+            path === `.sayhi/tasks/${repairTaskId}/events.jsonl`
+          ) {
+            failRepairCreation = false;
+            throw new Error("Injected Repair Task creation interruption.");
+          }
+          await target.appendFile(path, content);
+        };
+      }
+      const member = Reflect.get(target, property, receiver);
+      return typeof member === "function" ? member.bind(target) : member;
+    },
+  });
+  const interrupted = await new InitiativeExecutionScheduler().integrate({
+    fileSystem: faultingFileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+    expectedVersion: parent.state.projection.version,
+    expectedGraphVersion: fixture.graph.version,
+    event: revisionEvent("RECOVERY-REPAIR"),
+    run: async () => ({
+      kind: "repair-required" as const,
+      repairs: [
+        {
+          taskId: repairTaskId,
+          priority: 60,
+          resources: { files: [], apis: [], schemas: [], locks: [] },
+          blockers: [RECORDED_NODE_ID],
+          context: {
+            failureKind: "conflict",
+            summary: "Integration found incompatible generated output.",
+            evidence: [
+              {
+                kind: "validation",
+                reference: "evidence/integration-conflict.json",
+              },
+            ],
+          },
+        },
+      ],
+    }),
+  });
+  assert.equal(interrupted.status, "failed");
+  const graph = await inspectDurableInitiativeGraph({
+    fileSystem: fixture.fileSystem,
+    initiativeTaskId: INITIATIVE_ID,
+  });
+  assert.equal(graph.ok, true);
+  if (!graph.ok) {
+    return;
+  }
+  assert.equal(graph.graph.nodes.at(-1)?.taskId, repairTaskId);
+
+  const recovered = await recoverDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: INITIATIVE_ID,
+  });
+  if (!recovered.ok) {
+    assert.fail(recovered.diagnostics[0]?.message ?? "Repair recovery failed");
+  }
+  assert.equal(recovered.recovered, true);
+  assert.equal(
+    JSON.parse(
+      await readFile(
+        join(
+          fixture.repository,
+          ".sayhi",
+          ".runtime",
+          "initiative-repair-operation.json",
+        ),
+        "utf8",
+      ),
+    ).state,
+    "completed",
+  );
+  const repair = await readDurableTask({
+    fileSystem: fixture.fileSystem,
+    taskId: repairTaskId,
+  });
+  assert.equal(repair.ok, true);
+  if (repair.ok) {
+    assert.equal(repair.state.projection.parentTaskId, INITIATIVE_ID);
+  }
+});
+
+
 async function createInitiativeGraphFixture(
   t: test.TestContext,
-  recordedNodeState: "active" | "archived" = "active",
+  recordedNodeState: "active" | "archived" | "completed" = "active",
 ) {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-initiative-graph-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
@@ -672,7 +1115,7 @@ async function createInitiativeGraphFixture(
   );
   const fileSystem = new NodeManagedProjectFileSystem(repository);
 
-  if (recordedNodeState === "archived") {
+  if (recordedNodeState === "archived" || recordedNodeState === "completed") {
     const completed = await createCompletedDurableTask(
       fileSystem,
       {
@@ -687,26 +1130,43 @@ async function createInitiativeGraphFixture(
       "2026-07-15T10:00:00Z",
       "2026-07-15T10:01:00Z",
     );
-    const archived = await archiveDurableTask({
-      fileSystem,
-      transition: {
-        contractVersion: 1,
-        taskId: RECORDED_NODE_ID,
-        expectedVersion: completed.projection.version,
-        to: { lifecycle: "archived", phase: "finish", step: "archived" },
-        gates: [
-          {
-            gate: "archive",
-            evidence: [
-              { kind: "validation", reference: "evidence/node-archived.json" },
-            ],
-          },
-        ],
-        event: eventMetadata("NODE-ARCHIVED"),
-      },
-    });
-    if (!archived.ok) {
-      assert.fail(archived.diagnostics[0]?.message ?? "Node archive failed");
+    if (recordedNodeState === "archived") {
+      const archived = await archiveDurableTask({
+        fileSystem,
+        transition: {
+          contractVersion: 1,
+          taskId: RECORDED_NODE_ID,
+          expectedVersion: completed.projection.version,
+          to: { lifecycle: "archived", phase: "finish", step: "archived" },
+          gates: [
+            {
+              gate: "archive",
+              evidence: [
+                { kind: "validation", reference: "evidence/node-archived.json" },
+              ],
+            },
+          ],
+          event: eventMetadata("NODE-ARCHIVED"),
+        },
+      });
+      if (!archived.ok) {
+        assert.fail(archived.diagnostics[0]?.message ?? "Node archive failed");
+      }
+    } else {
+      await createCompletedDurableTask(
+        fileSystem,
+        {
+          taskId: MISSING_NODE_ID,
+          title: `Exercise ${MISSING_NODE_ID}`,
+          goal: `Complete ${MISSING_NODE_ID}`,
+          acceptanceCriterion: `${MISSING_NODE_ID} persists correctly`,
+          files: ["packages/core/**", "packages/cli/**"],
+          eventNamespace: "14-COMPLETED",
+          sessionRef: "session-14",
+        },
+        "2026-07-15T10:00:00Z",
+        "2026-07-15T10:01:00Z",
+      );
     }
   } else {
     const recordedNode = await createDurableTask({
@@ -852,6 +1312,7 @@ function startRequest(
   route: Exclude<WorkflowRoute, "quick">,
   initiativeGraphId: string | null,
   suffix: string,
+  parentTaskId: string | null = null,
 ): StartWorkflowTaskRequest {
   return {
     contractVersion: 1,
@@ -859,7 +1320,7 @@ function startRequest(
       id: taskId,
       title: `Exercise ${taskId}`,
       route,
-      parentTaskId: null,
+      parentTaskId,
       initiativeGraphId,
       intent: {
         goals: [`Complete ${taskId}`],

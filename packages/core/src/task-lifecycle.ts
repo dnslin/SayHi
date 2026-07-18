@@ -15,9 +15,16 @@ import {
   type DependencyGraphDiagnostic,
 } from "./dependency-graph.js";
 import {
+  pendingInitiativeIntegrationTaskIds,
+  prepareInitiativeRepairGraph,
+  type InitiativeRepairNode,
+} from "./initiative-integration.js";
+
+import {
   deriveInitiativeReadiness,
   requiresInitiativeTriageContext,
   type InitiativeReadinessNode,
+  type InitiativeReadinessResult,
   type InitiativeReadinessTask,
 } from "./initiative-readiness.js";
 import {
@@ -70,6 +77,8 @@ import {
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
   reviseInitiativeGraph,
+  reviseInitiativeGraphWithRepairs,
+
   type BaselineAdoptedEvent,
   type StartWorkflowTaskRequest,
   type ContextManifestChangedEvent,
@@ -100,6 +109,8 @@ export const TASK_LIFECYCLE_CONTRACT_VERSION = 1 as const;
 const TASKS_DIRECTORY = ".sayhi/tasks";
 const TASK_ARCHIVE_DIRECTORY = `${TASKS_DIRECTORY}/archive`;
 const QUICK_RESULT_FILE_NAME = "quick.json";
+const INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH =
+  ".sayhi/.runtime/initiative-repair-operation.json";
 
 export interface TaskLifecycleDirectoryEntry {
   readonly name: string;
@@ -357,6 +368,42 @@ export type InspectDurableInitiativeReadinessResult =
     }>
   | TaskLifecycleFailure;
 
+export type InspectDurableInitiativeIntegrationResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+    }>
+  | TaskLifecycleFailure;
+
+export interface CreateDurableInitiativeRepairsRequest {
+  readonly fileSystem: InitiativeReadinessFileSystem;
+  readonly initiativeTaskId: string;
+  readonly expectedVersion: number;
+  readonly expectedGraphVersion: number;
+  readonly repairs: readonly InitiativeRepairNode[];
+  readonly event: WorkflowEventMetadata;
+}
+
+export interface DurableInitiativeWriter {
+  readonly inspectIntegration: (
+    expectedVersion: number,
+  ) => Promise<InspectDurableInitiativeIntegrationResult>;
+  readonly inspectReadiness: (
+    expectedGraphVersion: number | undefined,
+  ) => Promise<InspectDurableInitiativeReadinessResult>;
+  readonly createRepairs: (
+    request: Omit<
+      CreateDurableInitiativeRepairsRequest,
+      "fileSystem" | "initiativeTaskId"
+    >,
+  ) => Promise<CreateDurableInitiativeRepairsResult>;
+}
+export interface WithDurableInitiativeWriterRequest<Value> {
+  readonly fileSystem: InitiativeReadinessFileSystem;
+  readonly initiativeTaskId: string;
+  readonly operation: (writer: DurableInitiativeWriter) => Promise<Value>;
+}
+
 
 export interface DiagnoseDurableTasksRequest {
   readonly fileSystem: TaskLifecycleFileSystem;
@@ -514,6 +561,25 @@ export type ReviseDurableInitiativeGraphResult =
       state: WorkflowState;
       event: InitiativeGraphRevisedEvent;
       appended: boolean;
+    }>
+  | TaskLifecycleFailure;
+
+export type CreateDurableInitiativeRepairsResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: InitiativeGraphRevisedEvent;
+      graph: DependencyGraph;
+      repairTaskIds: readonly string[];
+    }>
+  | TaskLifecycleFailure;
+
+export type WithDurableInitiativeWriterResult<Value> =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof TASK_LIFECYCLE_CONTRACT_VERSION;
+      value: Value;
     }>
   | TaskLifecycleFailure;
 
@@ -962,6 +1028,73 @@ export async function reviseDurableInitiativeGraph(
   );
 }
 
+export async function createDurableInitiativeRepairs(
+  request: CreateDurableInitiativeRepairsRequest,
+): Promise<CreateDurableInitiativeRepairsResult> {
+  const paths = taskPaths(request.initiativeTaskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  return runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
+    createDurableInitiativeRepairsLocked(request, paths),
+  );
+}
+
+export async function withDurableInitiativeWriter<Value>(
+  request: WithDurableInitiativeWriterRequest<Value>,
+): Promise<WithDurableInitiativeWriterResult<Value>> {
+  const paths = taskPaths(request.initiativeTaskId);
+  if (!paths.ok) {
+    return paths;
+  }
+  const result = await runWithInitiativeGraphLease(
+    request.fileSystem,
+    paths.lockPath,
+    async () =>
+      Object.freeze({
+        ok: true as const,
+        contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+        value: await request.operation(
+          Object.freeze({
+            inspectIntegration: (expectedVersion: number) =>
+              inspectDurableInitiativeIntegrationLocked(
+                request.fileSystem,
+                request.initiativeTaskId,
+                expectedVersion,
+                paths,
+              ),
+            inspectReadiness: (expectedGraphVersion: number | undefined) =>
+              inspectDurableInitiativeReadinessLocked(
+                {
+                  fileSystem: request.fileSystem,
+                  initiativeTaskId: request.initiativeTaskId,
+                  ...(expectedGraphVersion === undefined
+                    ? {}
+                    : { expectedGraphVersion }),
+                },
+                paths,
+              ),
+            createRepairs: (
+              repairRequest: Omit<
+                CreateDurableInitiativeRepairsRequest,
+                "fileSystem" | "initiativeTaskId"
+              >,
+            ) =>
+              createDurableInitiativeRepairsLocked(
+                {
+                  fileSystem: request.fileSystem,
+                  initiativeTaskId: request.initiativeTaskId,
+                  ...repairRequest,
+                },
+                paths,
+              ),
+          }),
+        ),
+      }),
+  );
+  return result;
+}
+
 export async function escalateDurableQuickToBuild(
   request: EscalateDurableQuickToBuildRequest,
 ): Promise<EscalateDurableQuickToBuildResult> {
@@ -1068,6 +1201,21 @@ export async function recoverDurableTask(
   const paths = taskPaths(request.taskId);
   if (!paths.ok) {
     return paths;
+  }
+  const current = await readDurableTask({
+    fileSystem: request.fileSystem,
+    taskId: request.taskId,
+  });
+  if (!current.ok) {
+    return current;
+  }
+  const graph = latestInitiativeGraph(current.state.events);
+  if (
+    graph !== null &&
+    graph.nodes.some((node) => node.repair !== undefined) &&
+    !isInitiativeGraphFileSystem(request.fileSystem)
+  ) {
+    return writerUnavailable();
   }
   return isInitiativeGraphFileSystem(request.fileSystem)
     ? runWithInitiativeGraphLease(request.fileSystem, paths.lockPath, () =>
@@ -1357,12 +1505,10 @@ async function inspectDurableInitiativeReadinessLocked(
       ),
     ]);
   }
-  const tasks = await Promise.all(
-    inspection.nodes.map((node) =>
-      inspectInitiativeReadinessTask(request.fileSystem, node),
-    ),
+  const readiness = await deriveDurableInitiativeReadiness(
+    request.fileSystem,
+    inspection,
   );
-  const readiness = deriveInitiativeReadiness(inspection.graph, tasks);
   return Object.freeze({
     ok: true,
     contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
@@ -1404,6 +1550,7 @@ type DurableInitiativeGraphInspection =
   | Readonly<{
       ok: true;
       graph: DependencyGraph;
+      state: WorkflowState;
       nodes: readonly Readonly<{
         inspection: InitiativeGraphNodeInspection;
         state: WorkflowState | null;
@@ -1453,7 +1600,19 @@ async function loadDurableInitiativeGraphInspection(
     ok: true,
     graph: graphRecord.graph,
     nodes: Object.freeze(nodes),
+    state: loaded.state,
+
   });
+}
+
+async function deriveDurableInitiativeReadiness(
+  fileSystem: InitiativeReadinessFileSystem,
+  inspection: Extract<DurableInitiativeGraphInspection, { ok: true }>,
+): Promise<InitiativeReadinessResult> {
+  const tasks = await Promise.all(
+    inspection.nodes.map((node) => inspectInitiativeReadinessTask(fileSystem, node)),
+  );
+  return deriveInitiativeReadiness(inspection.graph, tasks);
 }
 
 
@@ -3770,12 +3929,15 @@ async function advanceDurableTaskLocked(
 async function reviseDurableInitiativeGraphLocked(
   request: ReviseDurableInitiativeGraphRequest,
   paths: TaskPaths,
+  allowRepairNodes = false,
 ): Promise<ReviseDurableInitiativeGraphResult> {
   const loaded = await loadTask(request.fileSystem, request.taskId);
   if (!loaded.ok) {
     return loaded;
   }
-  const revised = reviseInitiativeGraph(loaded.state, {
+  const revised = (allowRepairNodes
+    ? reviseInitiativeGraphWithRepairs
+    : reviseInitiativeGraph)(loaded.state, {
     contractVersion: 1,
     taskId: request.taskId,
     expectedVersion: request.expectedVersion,
@@ -3836,6 +3998,7 @@ async function reviseDurableInitiativeGraphLocked(
       const recovered = await recoverDurableTaskLocked(
         { fileSystem: request.fileSystem, taskId: request.taskId },
         paths,
+        false,
       );
       if (recovered.ok) {
         return Object.freeze({
@@ -3850,6 +4013,490 @@ async function reviseDurableInitiativeGraphLocked(
     return ioFailure(persisted.path);
   } catch {
     return ioFailure(paths.graphPath);
+  }
+}
+
+async function inspectDurableInitiativeIntegrationLocked(
+  fileSystem: InitiativeGraphFileSystem,
+  initiativeTaskId: string,
+  expectedVersion: number,
+  paths: TaskPaths,
+): Promise<InspectDurableInitiativeIntegrationResult> {
+  const loaded = await loadTask(fileSystem, initiativeTaskId);
+  if (!loaded.ok) {
+    return loaded;
+  }
+  const projection = loaded.state.projection;
+  if (
+    projection.route !== "initiative" ||
+    projection.lifecycle !== "active" ||
+    projection.phase !== "integrate"
+  ) {
+    return failure([
+      diagnostic(
+        "workflow.gate.unmet",
+        "$.initiativeTaskId",
+        "Initiative Integration requires an active Initiative Task in the Integrate phase.",
+        "Advance the Initiative through Plan and enter Integrate before running integration.",
+      ),
+    ]);
+  }
+  if (projection.version !== expectedVersion) {
+    return failure([
+      diagnostic(
+        "workflow.version.stale",
+        "$.expectedVersion",
+        `Expected Initiative version ${expectedVersion} does not match durable version ${projection.version}.`,
+        "Reload the Initiative Task before running integration.",
+      ),
+    ]);
+  }
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+  });
+}
+
+async function createDurableInitiativeRepairsLocked(
+  request: CreateDurableInitiativeRepairsRequest,
+  paths: TaskPaths,
+): Promise<CreateDurableInitiativeRepairsResult> {
+  const integration = await inspectDurableInitiativeIntegrationLocked(
+    request.fileSystem,
+    request.initiativeTaskId,
+    request.expectedVersion,
+    paths,
+  );
+  if (!integration.ok) {
+    return integration;
+  }
+  const inspection = await loadDurableInitiativeGraphInspection(request, paths);
+  if (!inspection.ok) {
+    return inspection;
+  }
+  const readiness = await deriveDurableInitiativeReadiness(
+    request.fileSystem,
+    inspection,
+  );
+  const pendingTaskIds = pendingInitiativeIntegrationTaskIds(
+    inspection.graph,
+    readiness,
+  );
+  if (pendingTaskIds.length > 0) {
+    return failure([
+      diagnostic(
+        "workflow.gate.unmet",
+        "$.repairs",
+        `Initiative Integration cannot create Repair nodes before all graph nodes complete: ${pendingTaskIds.join(", ")}.`,
+        "Complete the listed Build nodes and reload Initiative readiness before integrating.",
+      ),
+    ]);
+  }
+
+  let graph: DependencyGraph;
+  try {
+    graph = prepareInitiativeRepairGraph({
+      graph: inspection.graph,
+      readiness,
+      repairs: request.repairs,
+      updatedByEvent: request.event.eventId,
+    });
+  } catch {
+    return failure([
+      diagnostic(
+        "workflow.graph.invalid",
+        "$.repairs",
+        "Initiative Repair nodes cannot form a valid Dependency Graph revision.",
+        "Provide unique Repair nodes with completed blockers and grounded failure context.",
+      ),
+    ]);
+  }
+
+  const journal = initiativeRepairOperationJournal(
+    request.initiativeTaskId,
+    graph,
+    request.event.eventId,
+    "prepared",
+  );
+  try {
+    await request.fileSystem.writeFile(
+      INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH,
+      serializeInitiativeRepairOperationJournal(journal),
+    );
+  } catch {
+    return ioFailure(INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH);
+  }
+
+  const revised = await reviseDurableInitiativeGraphLocked(
+    {
+      fileSystem: request.fileSystem,
+      taskId: request.initiativeTaskId,
+      expectedVersion: request.expectedVersion,
+      expectedGraphVersion: request.expectedGraphVersion,
+      graph,
+      event: request.event,
+    },
+    paths,
+    true,
+  );
+  if (!revised.ok) {
+    return revised;
+  }
+  try {
+    await request.fileSystem.writeFile(
+      INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH,
+      serializeInitiativeRepairOperationJournal({ ...journal, state: "graph-revised" }),
+    );
+  } catch {
+    return ioFailure(INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH);
+  }
+
+  const repairs = await recoverInitiativeRepairTasks(
+    request.fileSystem,
+    revised.state,
+  );
+  if (!repairs.ok) {
+    return repairs;
+  }
+  try {
+    await request.fileSystem.writeFile(
+      INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH,
+      serializeInitiativeRepairOperationJournal({ ...journal, state: "completed" }),
+    );
+  } catch {
+    return ioFailure(INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH);
+  }
+
+  return Object.freeze({
+    ok: true,
+    contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
+    state: revised.state,
+    event: revised.event,
+    graph: revised.event.initiativeGraph,
+    repairTaskIds: Object.freeze(request.repairs.map((repair) => repair.taskId)),
+  });
+}
+
+type InitiativeRepairRecoveryResult =
+  | Readonly<{ ok: true; recovered: boolean }>
+  | TaskLifecycleFailure;
+
+async function recoverInitiativeRepairTasks(
+  fileSystem: InitiativeGraphFileSystem,
+  state: WorkflowState,
+): Promise<InitiativeRepairRecoveryResult> {
+  if (state.projection.route !== "initiative") {
+    return Object.freeze({ ok: true, recovered: false });
+  }
+  const graph = latestInitiativeGraph(state.events);
+  if (graph === null) {
+    return Object.freeze({ ok: true, recovered: false });
+  }
+  let recovered = false;
+  for (const node of graph.nodes) {
+    if (node.repair === undefined) {
+      continue;
+    }
+    const repairPaths = taskPaths(node.taskId);
+    if (!repairPaths.ok) {
+      return repairPaths;
+    }
+    const entry = await fileSystem.inspect(repairPaths.taskDirectory);
+    if (entry.kind !== "missing") {
+      const existing = await loadTask(fileSystem, node.taskId);
+      if (!existing.ok) {
+        if (
+          !existing.diagnostics.some(
+            (diagnosticValue) =>
+              diagnosticValue.code === "task_lifecycle.history.missing",
+          )
+        ) {
+          return existing;
+        }
+        const creationEvent = initiativeRepairCreationEvent(state, node.taskId);
+        if (creationEvent === null) {
+          return failure([
+            diagnostic(
+              "workflow.graph.invalid",
+              repairPaths.taskDirectory,
+              "A Repair node has no accepted Initiative graph revision Event.",
+              "Recover the Initiative Event history before recreating Repair Tasks.",
+            ),
+          ]);
+        }
+        const started = startWorkflowTask(
+          startInitiativeRepairTask(state.projection, creationEvent, node),
+        );
+        if (!started.ok) {
+          return failure(started.diagnostics);
+        }
+        const ensured = await ensureDurableInitiativeRepairTask(
+          fileSystem,
+          repairPaths,
+          started.state,
+          started.event,
+        );
+        if (ensured !== null) {
+          return ensured;
+        }
+        recovered = true;
+        continue;
+      }
+      if (
+        existing.state.projection.route !== "build" ||
+        existing.state.projection.parentTaskId !== state.projection.id
+      ) {
+        return failure([
+          diagnostic(
+            "task_lifecycle.task.exists",
+            repairPaths.taskDirectory,
+            "A Repair node Task exists but is not the matching child Build Task.",
+            "Restore the matching Repair Task or resolve the conflicting Task id before recovery.",
+          ),
+        ]);
+      }
+      continue;
+    }
+    const archivedEntry = await fileSystem.inspect(repairPaths.archiveTaskDirectory);
+    if (archivedEntry.kind !== "missing") {
+      if (archivedEntry.kind !== "directory") {
+        return failure([
+          diagnostic(
+            "task_lifecycle.history.invalid",
+            repairPaths.archiveTaskDirectory,
+            "The archived Repair Task location is not a real directory.",
+            "Restore the archived Repair Task directory before recovery.",
+          ),
+        ]);
+      }
+      const archived = await loadTask(
+        fileSystem,
+        node.taskId,
+        repairPaths.archiveTaskDirectory,
+      );
+      if (!archived.ok) {
+        return archived;
+      }
+      if (
+        archived.state.projection.lifecycle !== "archived" ||
+        archived.state.projection.route !== "build" ||
+        archived.state.projection.parentTaskId !== state.projection.id
+      ) {
+        return failure([
+          diagnostic(
+            "task_lifecycle.task.exists",
+            repairPaths.archiveTaskDirectory,
+            "An archived Repair Task does not match the Initiative Repair node.",
+            "Restore the matching archived Repair Task or resolve the conflicting Task id before recovery.",
+          ),
+        ]);
+      }
+      continue;
+    }
+    const creationEvent = initiativeRepairCreationEvent(state, node.taskId);
+    if (creationEvent === null) {
+      return failure([
+        diagnostic(
+          "workflow.graph.invalid",
+          repairPaths.taskDirectory,
+          "A Repair node has no accepted Initiative graph revision Event.",
+          "Recover the Initiative Event history before recreating Repair Tasks.",
+        ),
+      ]);
+    }
+    const started = startWorkflowTask(
+      startInitiativeRepairTask(state.projection, creationEvent, node),
+    );
+    if (!started.ok) {
+      return failure(started.diagnostics);
+    }
+    const ensured = await ensureDurableInitiativeRepairTask(
+      fileSystem,
+      repairPaths,
+      started.state,
+      started.event,
+    );
+    if (ensured !== null) {
+      return ensured;
+    }
+    recovered = true;
+  }
+  return Object.freeze({ ok: true, recovered });
+}
+
+type InitiativeRepairOperationState = "prepared" | "graph-revised" | "completed";
+
+interface InitiativeRepairOperationJournal {
+  readonly schemaVersion: 1;
+  readonly initiativeTaskId: string;
+  readonly graphEventId: string;
+  readonly repairTaskIds: readonly string[];
+  readonly state: InitiativeRepairOperationState;
+}
+
+function initiativeRepairOperationJournal(
+  initiativeTaskId: string,
+  graph: DependencyGraph,
+  graphEventId: string,
+  state: InitiativeRepairOperationState,
+): InitiativeRepairOperationJournal {
+  return Object.freeze({
+    schemaVersion: 1 as const,
+    initiativeTaskId,
+    graphEventId,
+    repairTaskIds: Object.freeze(
+      graph.nodes
+        .filter((node) => node.repair !== undefined)
+        .map((node) => node.taskId),
+    ),
+    state,
+  });
+}
+
+function serializeInitiativeRepairOperationJournal(
+  journal: InitiativeRepairOperationJournal,
+): string {
+  return `${JSON.stringify(journal)}\n`;
+}
+
+function initiativeRepairCreationEvent(
+  state: WorkflowState,
+  taskId: string,
+): InitiativeGraphRevisedEvent | null {
+  for (const event of state.events) {
+    if (
+      event.type === "initiative_graph_revised" &&
+      event.initiativeGraph.nodes.some(
+        (node) => node.taskId === taskId && node.repair !== undefined,
+      )
+    ) {
+      return event;
+    }
+  }
+  return null;
+}
+
+function startInitiativeRepairTask(
+  initiative: TaskProjection,
+  event: InitiativeGraphRevisedEvent,
+  node: DependencyGraph["nodes"][number],
+): StartWorkflowTaskRequest {
+  const repair = node.repair;
+  if (repair === undefined) {
+    throw new TypeError("Initiative Repair Task requires Repair context.");
+  }
+  const identifier = `REPAIR-${event.eventId}-${node.taskId}`;
+  return {
+    contractVersion: 1,
+    task: {
+      id: node.taskId,
+      title: `Repair ${node.taskId}`,
+      route: "build",
+      parentTaskId: initiative.id,
+      initiativeGraphId: null,
+      intent: {
+        goals: [repair.summary],
+        nonGoals: [],
+        acceptanceCriteria: [repair.summary],
+      },
+      scope: node.resources,
+      baselineRef: "baseline.json",
+      contexts: { triage: "context/triage.jsonl" },
+      policies: initiative.policies,
+    },
+    routeGate: {
+      gate: "route",
+      evidence: [
+        {
+          kind: "human-approval",
+          reference: `events/${event.eventId}`,
+        },
+      ],
+    },
+    event: {
+      eventId: identifier,
+      actor: event.actor,
+      reason: `Create Repair Task ${node.taskId} from failed Initiative Integration.`,
+      idempotencyKey: identifier,
+      occurredAt: event.occurredAt,
+    },
+  };
+}
+
+async function ensureDurableInitiativeRepairTask(
+  fileSystem: InitiativeGraphFileSystem,
+  paths: TaskPaths,
+  state: WorkflowState,
+  event: TaskCreatedEvent,
+): Promise<TaskLifecycleFailure | null> {
+  const created = await runWithTaskLock(fileSystem, paths.lockPath, () =>
+    createDurableTaskLocked(fileSystem, paths, state, event),
+  );
+  if (created.ok) {
+    return null;
+  }
+  if (!created.diagnostics.some((diagnosticValue) => diagnosticValue.code === "task_lifecycle.task.exists")) {
+    return created;
+  }
+  const existing = await loadTask(fileSystem, state.projection.id);
+  if (!existing.ok) {
+    if (
+      !existing.diagnostics.some(
+        (diagnosticValue) =>
+          diagnosticValue.code === "task_lifecycle.history.missing",
+      )
+    ) {
+      return existing;
+    }
+    return resumeInterruptedInitiativeRepairTask(
+      fileSystem,
+      paths,
+      state,
+      event,
+    );
+  }
+  if (stableJson(existing.state.projection) !== stableJson(state.projection)) {
+    return failure([
+      diagnostic(
+        "task_lifecycle.task.exists",
+        paths.taskDirectory,
+        "The existing Repair Task does not match the requested durable Repair node.",
+        "Use the original Repair Task definition or choose a new Repair Task id.",
+      ),
+    ]);
+  }
+  return null;
+}
+
+async function resumeInterruptedInitiativeRepairTask(
+  fileSystem: InitiativeGraphFileSystem,
+  paths: TaskPaths,
+  state: WorkflowState,
+  event: TaskCreatedEvent,
+): Promise<TaskLifecycleFailure | null> {
+  const events = await fileSystem.inspect(paths.eventsPath);
+  const projection = await fileSystem.inspect(paths.projectionPath);
+  if (events.kind !== "missing" || projection.kind !== "missing") {
+    return failure([
+      diagnostic(
+        "task_lifecycle.history.invalid",
+        paths.taskDirectory,
+        "An interrupted Repair Task contains incomplete durable history.",
+        "Recover the Task history before retrying the Initiative Repair operation.",
+      ),
+    ]);
+  }
+  let activePath = paths.eventsPath;
+  try {
+    await fileSystem.appendFile(paths.eventsPath, serializeEvent(event));
+    activePath = paths.projectionPath;
+    await fileSystem.writeFile(
+      paths.projectionPath,
+      serializeProjection(state.projection),
+    );
+    return null;
+  } catch {
+    return ioFailure(activePath);
   }
 }
 
@@ -3939,6 +4586,7 @@ async function escalateDurableQuickToBuildLocked(
 async function recoverDurableTaskLocked(
   request: RecoverDurableTaskRequest,
   paths: TaskPaths,
+  recoverRepairTasks = true,
 ): Promise<RecoverDurableTaskResult> {
   const loaded = await loadTask(request.fileSystem, request.taskId);
   if (!loaded.ok) {
@@ -3961,6 +4609,51 @@ async function recoverDurableTaskLocked(
         graph,
       );
     }
+    const hasRecoverableRepairs =
+      recoverRepairTasks &&
+      graph !== null &&
+      graph.nodes.some((node) => node.repair !== undefined);
+    if (hasRecoverableRepairs) {
+      activePath = INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH;
+      await request.fileSystem.writeFile(
+        INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH,
+        serializeInitiativeRepairOperationJournal(
+          initiativeRepairOperationJournal(
+            loaded.state.projection.id,
+            graph,
+            graph.updatedByEvent,
+            "graph-revised",
+          ),
+        ),
+      );
+    }
+    let repairTasksRecovered = false;
+    if (hasRecoverableRepairs && isInitiativeGraphFileSystem(request.fileSystem)) {
+      const repairs = await recoverInitiativeRepairTasks(
+        request.fileSystem,
+        loaded.state,
+      );
+      if (!repairs.ok) {
+        return repairs;
+      }
+      repairTasksRecovered = repairs.recovered;
+    }
+    if (hasRecoverableRepairs) {
+      activePath = INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH;
+      await request.fileSystem.writeFile(
+        INITIATIVE_REPAIR_OPERATION_JOURNAL_PATH,
+        serializeInitiativeRepairOperationJournal(
+          initiativeRepairOperationJournal(
+            loaded.state.projection.id,
+            graph,
+            graph.updatedByEvent,
+            "completed",
+          ),
+        ),
+      );
+    }
+
+
     activePath = paths.handoffPath;
     const handoff = await loadDurableTaskHandoff(
       request.fileSystem,
@@ -3974,7 +4667,7 @@ async function recoverDurableTaskLocked(
       ok: true,
       contractVersion: TASK_LIFECYCLE_CONTRACT_VERSION,
       state: loaded.state,
-      recovered: projectionRecovered || graphRecovered,
+      recovered: projectionRecovered || graphRecovered || repairTasksRecovered,
       handoff: handoff.value,
     });
   } catch {

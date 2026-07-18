@@ -1,5 +1,15 @@
 import type { AgentRepositoryAccess } from "./execution.js";
 import type { InitiativeReadinessResult } from "./initiative-readiness.js";
+import {
+  pendingInitiativeIntegrationTaskIds,
+  type InitiativeRepairNode,
+} from "./initiative-integration.js";
+import {
+  withDurableInitiativeWriter,
+  type InitiativeReadinessFileSystem,
+} from "./task-lifecycle.js";
+import type { DependencyGraph, WorkflowEventMetadata } from "./workflow.js";
+
 
 export type InitiativeNodeExecutionOutcome<Value> =
   | Readonly<{ kind: "succeeded"; value: Value }>
@@ -48,6 +58,46 @@ export type InitiativeScheduleResult<Value> =
       results: readonly InitiativeNodeExecutionResult<Value>[];
     }>;
 
+export type InitiativeIntegrationOutcome =
+  | Readonly<{ kind: "accepted" }>
+  | Readonly<{
+      kind: "repair-required";
+      repairs: readonly InitiativeRepairNode[];
+    }>;
+
+export interface InitiativeIntegrationExecution {
+  readonly fileSystem: InitiativeReadinessFileSystem;
+  readonly initiativeTaskId: string;
+  readonly expectedVersion: number;
+  readonly expectedGraphVersion: number;
+  readonly event: WorkflowEventMetadata;
+  readonly signal?: AbortSignal;
+  readonly run: (
+    signal: AbortSignal | undefined,
+  ) => Promise<InitiativeIntegrationOutcome>;
+}
+
+export type InitiativeIntegrationResult =
+  | Readonly<{
+      status: "completed";
+      outcome: Readonly<{ kind: "accepted" }>;
+    }>
+  | Readonly<{
+      status: "repair-required";
+      outcome: Readonly<{
+        kind: "repair-required";
+        repairs: readonly InitiativeRepairNode[];
+      }>;
+      graph: DependencyGraph;
+      repairTaskIds: readonly string[];
+    }>
+  | Readonly<{
+      status: "waiting";
+      pendingTaskIds: readonly string[];
+    }>
+  | Readonly<{ status: "cancelled" }>
+  | Readonly<{ status: "failed"; error: unknown }>;
+
 export type InitiativeWriterOwner =
   | Readonly<{
       kind: "read-wave-results";
@@ -56,6 +106,10 @@ export type InitiativeWriterOwner =
   | Readonly<{
       kind: "node";
       taskId: string;
+    }>
+  | Readonly<{
+      kind: "integration";
+      initiativeTaskId: string;
     }>;
 
 export class InitiativeReadWriteBarrier {
@@ -146,10 +200,12 @@ export class InitiativeReadWriteBarrier {
   }
 }
 
+const DEFAULT_INITIATIVE_BARRIER = new InitiativeReadWriteBarrier();
+
 export class InitiativeExecutionScheduler {
   readonly barrier: InitiativeReadWriteBarrier;
 
-  constructor(barrier = new InitiativeReadWriteBarrier()) {
+  constructor(barrier = DEFAULT_INITIATIVE_BARRIER) {
     this.barrier = barrier;
   }
 
@@ -237,6 +293,82 @@ export class InitiativeExecutionScheduler {
       }
     }
     return completed(results);
+  }
+
+  async integrate(
+    request: InitiativeIntegrationExecution,
+  ): Promise<InitiativeIntegrationResult> {
+    if (isAborted(request.signal)) {
+      return Object.freeze({ status: "cancelled" });
+    }
+    return this.barrier.runWriter(
+      Object.freeze({
+        kind: "integration",
+        initiativeTaskId: request.initiativeTaskId,
+      }),
+      async () => {
+        if (isAborted(request.signal)) {
+          return Object.freeze({ status: "cancelled" });
+        }
+        const durable = await withDurableInitiativeWriter({
+          fileSystem: request.fileSystem,
+          initiativeTaskId: request.initiativeTaskId,
+          operation: async (writer): Promise<InitiativeIntegrationResult> => {
+            const integration = await writer.inspectIntegration(
+              request.expectedVersion,
+            );
+            if (!integration.ok) {
+              return Object.freeze({ status: "failed", error: integration });
+            }
+            const readiness = await writer.inspectReadiness(
+              request.expectedGraphVersion,
+            );
+            if (!readiness.ok) {
+              return Object.freeze({ status: "failed", error: readiness });
+            }
+            const pendingTaskIds = pendingInitiativeIntegrationTaskIds(
+              readiness.graph,
+              readiness,
+            );
+            if (pendingTaskIds.length > 0) {
+              return Object.freeze({ status: "waiting", pendingTaskIds });
+            }
+            let outcome: InitiativeIntegrationOutcome;
+            try {
+              outcome = await request.run(request.signal);
+            } catch (error) {
+              return Object.freeze({ status: "failed", error });
+            }
+            if (!isInitiativeIntegrationOutcome(outcome)) {
+              return Object.freeze({
+                status: "failed",
+                error: new TypeError("Initiative Integration returned an invalid outcome."),
+              });
+            }
+            if (outcome.kind === "accepted") {
+              return Object.freeze({ status: "completed", outcome });
+            }
+            const repairs = await writer.createRepairs({
+              expectedVersion: request.expectedVersion,
+              expectedGraphVersion: request.expectedGraphVersion,
+              repairs: outcome.repairs,
+              event: request.event,
+            });
+            return repairs.ok
+              ? Object.freeze({
+                  status: "repair-required",
+                  outcome,
+                  graph: repairs.graph,
+                  repairTaskIds: repairs.repairTaskIds,
+                })
+              : Object.freeze({ status: "failed", error: repairs });
+          },
+        });
+        return durable.ok
+          ? durable.value
+          : Object.freeze({ status: "failed", error: durable });
+      },
+    );
   }
 
   async #persistReadWave<Value>(
@@ -370,13 +502,27 @@ async function runExecution<Value>(
 function isExecutionOutcome<Value>(
   outcome: unknown,
 ): outcome is InitiativeNodeExecutionOutcome<Value> {
+  if (typeof outcome !== "object" || outcome === null || !("kind" in outcome)) {
+    return false;
+  }
   return (
-    typeof outcome === "object" &&
-    outcome !== null &&
-    "kind" in outcome &&
-    ((outcome as { kind?: unknown }).kind === "succeeded" ||
-      (outcome as { kind?: unknown }).kind === "failed" ||
-      (outcome as { kind?: unknown }).kind === "cancelled")
+    outcome.kind === "succeeded" ||
+    outcome.kind === "failed" ||
+    outcome.kind === "cancelled"
+  );
+}
+
+function isInitiativeIntegrationOutcome(
+  value: unknown,
+): value is InitiativeIntegrationOutcome {
+  if (typeof value !== "object" || value === null || !("kind" in value)) {
+    return false;
+  }
+  return (
+    value.kind === "accepted" ||
+    (value.kind === "repair-required" &&
+      "repairs" in value &&
+      Array.isArray(value.repairs))
   );
 }
 

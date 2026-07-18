@@ -58,6 +58,72 @@ test("Core validates an acyclic Dependency Graph without losing durable identity
   assert.ok(Object.isFrozen(result.graph.edges));
 });
 
+test("Core preserves graph-visible Repair context and rejects ungrounded failures", () => {
+  const repairNode = {
+    taskId: "TASK-5-REPAIR",
+    priority: 30,
+    resources: { files: [], apis: [], schemas: [], locks: [] },
+    repair: {
+      failureKind: "conflict" as const,
+      summary: "Integration discovered incompatible generated artifacts.",
+      evidence: [
+        {
+          kind: "validation" as const,
+          reference: "evidence/integration-conflict.json",
+        },
+      ],
+    },
+  } as const;
+  const graph = {
+    ...validGraph,
+    nodes: [...validGraph.nodes, repairNode],
+    edges: [
+      ...validGraph.edges,
+      {
+        from: "TASK-5-A",
+        to: repairNode.taskId,
+        type: "blocks" as const,
+        reason: "The repair depends on the conflicting Build output.",
+      },
+    ],
+  };
+  const accepted = coreContract.validateDependencyGraph({
+    contractVersion: 1,
+    graph,
+  });
+  assert.equal(accepted.ok, true);
+  if (!accepted.ok) {
+    return;
+  }
+  assert.deepEqual(accepted.graph.nodes[2]?.repair, repairNode.repair);
+  assert.ok(Object.isFrozen(accepted.graph.nodes[2]?.repair));
+
+  const rejected = coreContract.validateDependencyGraph({
+    contractVersion: 1,
+    graph: {
+      ...graph,
+      nodes: [
+        ...validGraph.nodes,
+        { ...repairNode, repair: { ...repairNode.repair, evidence: [] } },
+      ],
+    },
+  });
+  assert.deepEqual(rejected, {
+    ok: false,
+    contractVersion: 1,
+    diagnostics: [
+      {
+        code: "dependency_graph.graph.invalid",
+        path: "$.graph.nodes[2].repair.evidence",
+        message:
+          "Dependency Graph Repair context must retain at least one evidence reference.",
+        remediation:
+          "Reference the conflict or failed acceptance evidence for the Repair node.",
+      },
+    ],
+  });
+});
+
 test("Core rejects unsupported Dependency Graph contract and schema versions precisely", () => {
   assert.deepEqual(
     coreContract.validateDependencyGraph({ contractVersion: 2, graph: validGraph }),

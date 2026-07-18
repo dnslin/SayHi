@@ -123,6 +123,14 @@ export interface TaskScope {
   readonly locks: readonly string[];
 }
 
+export type InitiativeRepairFailureKind = "conflict" | "acceptance-failed";
+
+export interface InitiativeRepairContext {
+  readonly failureKind: InitiativeRepairFailureKind;
+  readonly summary: string;
+  readonly evidence: readonly GateEvidence[];
+}
+
 export type DependencyGraphEdgeType =
   | "blocks"
   | "informs"
@@ -133,6 +141,7 @@ export interface DependencyGraphNode {
   readonly taskId: string;
   readonly priority: number;
   readonly resources: TaskScope;
+  readonly repair?: InitiativeRepairContext;
 }
 
 export interface DependencyGraphEdge {
@@ -1188,6 +1197,21 @@ export function reviseInitiativeGraph(
   state: WorkflowState,
   request: ReviseInitiativeGraphRequest,
 ): ReviseInitiativeGraphResult {
+  return reviseInitiativeGraphInternal(state, request, false);
+}
+
+export function reviseInitiativeGraphWithRepairs(
+  state: WorkflowState,
+  request: ReviseInitiativeGraphRequest,
+): ReviseInitiativeGraphResult {
+  return reviseInitiativeGraphInternal(state, request, true);
+}
+
+function reviseInitiativeGraphInternal(
+  state: WorkflowState,
+  request: ReviseInitiativeGraphRequest,
+  allowRepairNodes: boolean,
+): ReviseInitiativeGraphResult {
   const eventDiagnostic = validateEventMetadata(request.event, "$.event");
   if (eventDiagnostic !== null) {
     return initiativeGraphRevisionFailure(state, eventDiagnostic);
@@ -1227,6 +1251,7 @@ export function reviseInitiativeGraph(
     state,
     request,
     stateIsConsistent,
+    allowRepairNodes,
   );
   if (isWorkflowDiagnostic(graph)) {
     return initiativeGraphRevisionFailure(state, graph);
@@ -1692,6 +1717,7 @@ export function replayWorkflowEvents(
           graph: sourceEvent.initiativeGraph,
           event: sourceEvent,
         },
+        true,
         true,
       );
       if (isWorkflowDiagnostic(graph)) {
@@ -2473,6 +2499,7 @@ function validateInitiativeGraphRevisionRequest(
   state: WorkflowState,
   request: ReviseInitiativeGraphRequest,
   stateIsConsistent: boolean,
+  allowRepairNodes = false,
 ): DependencyGraph | WorkflowDiagnostic {
   if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
     return diagnostic(
@@ -2601,6 +2628,26 @@ function validateInitiativeGraphRevisionRequest(
       `Dependency Graph revision cannot remove durable Build Task node ${removedNode.taskId}.`,
     );
   }
+  if (!allowRepairNodes) {
+    const introducedRepairIndex = validation.graph.nodes.findIndex((node) => {
+      const previous = current.nodes.find(
+        (candidate) => candidate.taskId === node.taskId,
+      );
+      return (
+        node.repair !== undefined &&
+        (previous === undefined ||
+          previous.repair === undefined ||
+          stableJson(node.repair) !== stableJson(previous.repair))
+      );
+    });
+    if (introducedRepairIndex !== -1) {
+      return graphFailure(
+        `$.graph.nodes[${introducedRepairIndex}].repair`,
+        "Repair nodes must be created through the durable Initiative Integration operation.",
+      );
+    }
+  }
+
   return validation.graph;
 }
 
