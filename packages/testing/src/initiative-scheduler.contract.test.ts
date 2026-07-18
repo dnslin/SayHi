@@ -91,6 +91,129 @@ test("Ready read-only Initiative nodes share a Read Wave before serialized Write
   assert.equal(maxActiveWriters, 1);
 });
 
+test("Concurrent ready Build requests queue the second Writer before it edits", async () => {
+  const scheduler = new InitiativeExecutionScheduler();
+  const firstWriterStarted = deferred<void>();
+  const releaseFirstWriter = deferred<void>();
+  const events: string[] = [];
+  let secondWriterStarted = false;
+  let secondWriterPersisted = false;
+
+  const first = scheduler.run({
+    readiness: readyFrontier("TASK-CONTEND-FIRST"),
+    executions: [
+      {
+        taskId: "TASK-CONTEND-FIRST",
+        repositoryAccess: "exclusive-write",
+        run: async () => {
+          events.push("run:first");
+          firstWriterStarted.resolve();
+          await releaseFirstWriter.promise;
+          return { kind: "succeeded", value: "first" };
+        },
+        persist: async (outcome) => {
+          events.push(`persist:first:${outcome.kind}`);
+        },
+      },
+    ] satisfies readonly InitiativeNodeExecution<string>[],
+  });
+
+  await firstWriterStarted.promise;
+  const second = scheduler.run({
+    readiness: readyFrontier("TASK-CONTEND-SECOND"),
+    executions: [
+      {
+        taskId: "TASK-CONTEND-SECOND",
+        repositoryAccess: "exclusive-write",
+        run: async () => {
+          secondWriterStarted = true;
+          events.push("run:second");
+          return { kind: "succeeded", value: "second" };
+        },
+        persist: async (outcome) => {
+          secondWriterPersisted = true;
+          events.push(`persist:second:${outcome.kind}`);
+        },
+      },
+    ] satisfies readonly InitiativeNodeExecution<string>[],
+  });
+
+  await Promise.resolve();
+  assert.equal(secondWriterStarted, false);
+  assert.equal(secondWriterPersisted, false);
+  releaseFirstWriter.resolve();
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(firstResult.status, "completed");
+  assert.equal(secondResult.status, "completed");
+  assert.deepEqual(events, [
+    "run:first",
+    "persist:first:succeeded",
+    "run:second",
+    "persist:second:succeeded",
+  ]);
+});
+
+test("An active validation Writer denies a new Read Wave", async () => {
+  const scheduler = new InitiativeExecutionScheduler();
+  const validationStarted = deferred<void>();
+  const releaseValidation = deferred<void>();
+  const events: string[] = [];
+  let readerStarted = false;
+
+  const validation = scheduler.run({
+    readiness: readyFrontier("TASK-VALIDATION"),
+    executions: [
+      {
+        taskId: "TASK-VALIDATION",
+        repositoryAccess: "read-only-plus-exclusive-validation",
+        run: async () => {
+          events.push("run:validation");
+          validationStarted.resolve();
+          await releaseValidation.promise;
+          return { kind: "succeeded", value: "validation" };
+        },
+        persist: async (outcome) => {
+          events.push(`persist:validation:${outcome.kind}`);
+        },
+      },
+    ] satisfies readonly InitiativeNodeExecution<string>[],
+  });
+
+  await validationStarted.promise;
+  const reader = scheduler.run({
+    readiness: readyFrontier("TASK-READER-DENIED"),
+    executions: [
+      {
+        taskId: "TASK-READER-DENIED",
+        repositoryAccess: "read-only",
+        run: async () => {
+          readerStarted = true;
+          events.push("run:reader");
+          return { kind: "succeeded", value: "reader" };
+        },
+        persist: async (outcome) => {
+          events.push(`persist:reader:${outcome.kind}`);
+        },
+      },
+    ] satisfies readonly InitiativeNodeExecution<string>[],
+  });
+
+  await Promise.resolve();
+  assert.equal(readerStarted, false);
+  releaseValidation.resolve();
+
+  const [validationResult, readerResult] = await Promise.all([validation, reader]);
+  assert.equal(validationResult.status, "completed");
+  assert.equal(readerResult.status, "completed");
+  assert.deepEqual(events, [
+    "run:validation",
+    "persist:validation:succeeded",
+    "run:reader",
+    "persist:reader:succeeded",
+  ]);
+});
+
 function readyFrontier(...taskIds: string[]): InitiativeReadinessResult {
   return {
     nodes: taskIds.map((taskId) => ({
