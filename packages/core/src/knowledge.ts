@@ -4,6 +4,8 @@ import { hashTextContent } from "./context-manifest.js";
 import { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
 import {
   RECORD_CONTRACT_VERSION,
+  isKnowledgeCandidateStatus,
+  isKnowledgeReviewDisposition,
   validateContractRecord,
   type KnowledgeCandidateRecord,
   type KnowledgeCandidateStatus,
@@ -13,9 +15,9 @@ import {
 import { isRepositoryRelativePath } from "./repository-path.js";
 import {
   readDurableTask,
+  readAcceptedTaskEvidenceReferences,
   type TaskLifecycleFileSystem,
 } from "./task-lifecycle.js";
-import type { WorkflowEvent } from "./workflow.js";
 import {
   isIdentifier,
   isTimestamp,
@@ -188,7 +190,7 @@ export async function createKnowledgeCandidate(
           );
         }
 
-        const sourceEvidence = sourceTaskEvidenceReferences(source.state.events);
+        const sourceEvidence = readAcceptedTaskEvidenceReferences(source.state);
         const unlinkedEvidence = request.candidate.evidence.find(
           (reference) => !sourceEvidence.has(reference),
         );
@@ -749,36 +751,11 @@ function candidateStorageKey(candidateId: string): string {
   return createHash("sha256").update(candidateId).digest("hex");
 }
 
-function sourceTaskEvidenceReferences(
-  events: readonly WorkflowEvent[],
-): ReadonlySet<string> {
-  const references = new Set<string>();
-  for (const event of events) {
-    for (const gate of event.gates) {
-      for (const evidence of gate.evidence) {
-        references.add(evidence.reference);
-      }
-    }
-    if (
-      event.type === "phase_execution_result_accepted" &&
-      isRecord(event.result) &&
-      isStringArray(event.result.evidence)
-    ) {
-      for (const reference of event.result.evidence) {
-        references.add(reference);
-      }
-    }
-  }
-  return references;
-}
 
 function isStringArray(value: unknown): value is readonly string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function reviewStatus(disposition: KnowledgeReviewDisposition): KnowledgeCandidateStatus {
   switch (disposition) {
@@ -791,25 +768,7 @@ function reviewStatus(disposition: KnowledgeReviewDisposition): KnowledgeCandida
   }
 }
 
-export function isKnowledgeCandidateStatus(
-  value: unknown,
-): value is KnowledgeCandidateStatus {
-  return (
-    value === "pending" ||
-    value === "accepted" ||
-    value === "rejected" ||
-    value === "revision-requested" ||
-    value === "superseded"
-  );
-}
 
-function isKnowledgeReviewDisposition(value: unknown): value is KnowledgeReviewDisposition {
-  return (
-    value === "approved" ||
-    value === "rejected" ||
-    value === "revision-requested"
-  );
-}
 
 function sameContentHash(left: ContentHash, right: ContentHash): boolean {
   return (

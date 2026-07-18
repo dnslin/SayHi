@@ -297,6 +297,8 @@ test("the CLI lists, shows, and records a human Knowledge review without promoti
     "review",
     candidateId,
     "--approve",
+    "--reviewer",
+    "maintainer-29",
     "--reason",
     "Ready for a separate promotion decision.",
     "--cwd",
@@ -308,6 +310,7 @@ test("the CLI lists, shows, and records a human Knowledge review without promoti
   assert.equal(reviewedEnvelope.operation, "knowledge.review");
   const reviewedCandidate = requireRecord(requireRecord(reviewedEnvelope.result).candidate);
   assert.equal(reviewedCandidate.status, "accepted");
+  assert.equal(requireRecord(reviewedCandidate.review).reviewer, "maintainer-29");
   assert.equal(
     await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
     targetBefore,

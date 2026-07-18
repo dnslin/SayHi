@@ -501,7 +501,7 @@ function validateKnowledgeCandidate(
       "targetIdentity must be a Content Hash or null when the target does not exist.",
     );
   }
-  if (!isKnowledgeStatus(record.status)) {
+  if (!isKnowledgeCandidateStatus(record.status)) {
     return invalidKnowledge(
       "$.record.status",
       "status must be pending, accepted, rejected, revision-requested, or superseded.",
@@ -1391,7 +1391,9 @@ function isContractRecordKind(value: unknown): value is ContractRecordKind {
   );
 }
 
-function isKnowledgeStatus(value: unknown): value is KnowledgeCandidateStatus {
+export function isKnowledgeCandidateStatus(
+  value: unknown,
+): value is KnowledgeCandidateStatus {
   return (
     value === "pending" ||
     value === "accepted" ||
@@ -1427,7 +1429,7 @@ function isKnowledgeReview(
   );
 }
 
-function isKnowledgeReviewDisposition(
+export function isKnowledgeReviewDisposition(
   value: unknown,
 ): value is KnowledgeReviewDisposition {
   return (

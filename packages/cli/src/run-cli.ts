@@ -209,6 +209,7 @@ interface ParsedKnowledgeArguments {
   readonly status?: KnowledgeCandidateStatus;
   readonly disposition?: KnowledgeReviewDisposition;
   readonly reason?: string;
+  readonly reviewer?: string;
 }
 type KnowledgeArgumentResult = ParsedKnowledgeArguments | InvalidCliArguments;
 
@@ -565,7 +566,7 @@ async function runKnowledgeCli(
         fileSystem,
         candidateId: parsed.candidateId!,
         disposition: parsed.disposition!,
-        reviewer: "sayhi-cli",
+        reviewer: parsed.reviewer!,
         reason: parsed.reason!,
         reviewedAt: new Date().toISOString(),
       });
@@ -2981,6 +2982,7 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   let json = false;
   let status: KnowledgeCandidateStatus | undefined;
   let disposition: KnowledgeReviewDisposition | undefined;
+  let reviewer: string | undefined;
   let reason: string | undefined;
   let knowledgeCount = 0;
   const values: string[] = [];
@@ -2993,7 +2995,12 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
     if (isGlobalPresentationOption(argument)) {
       continue;
     }
-    if (argument === "--cwd" || argument === "--status" || argument === "--reason") {
+    if (
+      argument === "--cwd" ||
+      argument === "--status" ||
+      argument === "--reason" ||
+      argument === "--reviewer"
+    ) {
       const value = args[index + 1];
       if (value === undefined || value.startsWith("--")) {
         return { ok: false, message: `${argument} requires a value.` };
@@ -3008,6 +3015,11 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
           return { ok: false, message: "--status is not a supported Knowledge Candidate status." };
         }
         status = value;
+      } else if (argument === "--reviewer") {
+        if (reviewer !== undefined) {
+          return { ok: false, message: "Specify --reviewer exactly once." };
+        }
+        reviewer = value;
       } else if (reason !== undefined) {
         return { ok: false, message: "Specify --reason exactly once." };
       } else {
@@ -3046,7 +3058,11 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
   }
   const [subcommand, candidateId, ...tail] = values;
   if (subcommand === "list") {
-    return candidateId === undefined && tail.length === 0 && disposition === undefined && reason === undefined
+    return candidateId === undefined &&
+      tail.length === 0 &&
+      disposition === undefined &&
+      reason === undefined &&
+      reviewer === undefined
       ? {
           ok: true,
           command: "knowledge",
@@ -3062,7 +3078,8 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
       tail.length === 0 &&
       status === undefined &&
       disposition === undefined &&
-      reason === undefined
+      reason === undefined &&
+      reviewer === undefined
       ? { ok: true, command: "knowledge", subcommand, cwd, json, candidateId }
       : { ok: false, message: "knowledge show requires exactly one Candidate id." };
   }
@@ -3071,6 +3088,7 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
       tail.length === 0 &&
       status === undefined &&
       disposition !== undefined &&
+      reviewer !== undefined &&
       reason !== undefined
       ? {
           ok: true,
@@ -3080,12 +3098,13 @@ function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResu
           json,
           candidateId,
           disposition,
+          reviewer,
           reason,
         }
       : {
           ok: false,
           message:
-            "knowledge review requires one Candidate id, one review disposition, and --reason <text>.",
+            "knowledge review requires one Candidate id, one review disposition, --reviewer <id>, and --reason <text>.",
         };
   }
   return { ok: false, message: "Knowledge command is not supported." };

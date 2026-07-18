@@ -175,7 +175,7 @@ Journal commands MUST distinguish committed shared summaries from local machine 
 ```text
 sayhi knowledge list [--status pending]
 sayhi knowledge show <candidate-id>
-sayhi knowledge review <candidate-id> --approve|--reject|--request-revision --reason <text>
+sayhi knowledge review <candidate-id> --approve|--reject|--request-revision --reviewer <id> --reason <text>
 ```
 
 `knowledge review` records a human decision on the Candidate only. It presents the Candidate provenance and current disposition but never changes its target; promotion and supersession remain separate, human-authorized operations.

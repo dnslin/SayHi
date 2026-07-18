@@ -5,7 +5,10 @@ import {
   bindPhaseExecution,
 } from "./execution.js";
 import { validateDomainValue } from "./validation.js";
-import { validateContractRecord } from "./record-contracts.js";
+import {
+  isKnowledgeCandidateStatus,
+  validateContractRecord,
+} from "./record-contracts.js";
 import {
   diagnoseManagedProject,
   initializeManagedProject,
@@ -19,7 +22,6 @@ import {
 } from "./spec.js";
 import {
   createKnowledgeCandidate,
-  isKnowledgeCandidateStatus,
   listKnowledgeCandidates,
   readKnowledgeCandidate,
   reviewKnowledgeCandidate,
@@ -73,6 +75,7 @@ import {
 
 export {
   RECORD_CONTRACT_VERSION,
+  isKnowledgeCandidateStatus,
   validateContractRecord,
 } from "./record-contracts.js";
 export type {
@@ -118,7 +121,6 @@ export type { KnowledgeCandidateContent } from "./knowledge-candidate.js";
 export {
   KNOWLEDGE_CONTRACT_VERSION,
   createKnowledgeCandidate,
-  isKnowledgeCandidateStatus,
   listKnowledgeCandidates,
   readKnowledgeCandidate,
   reviewKnowledgeCandidate,

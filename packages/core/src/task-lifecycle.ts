@@ -1406,6 +1406,38 @@ export async function readDurableTask(
       })
     : loaded;
 }
+
+export function readAcceptedTaskEvidenceReferences(
+  state: WorkflowState,
+): ReadonlySet<string> {
+  const references = new Set<string>();
+  for (const event of state.events) {
+    for (const gate of event.gates) {
+      for (const evidence of gate.evidence) {
+        references.add(evidence.reference);
+      }
+    }
+    if (
+      event.type === "phase_execution_result_accepted" &&
+      isEvidenceResult(event.result)
+    ) {
+      for (const reference of event.result.evidence) {
+        references.add(reference);
+      }
+    }
+  }
+  return references;
+}
+
+function isEvidenceResult(
+  value: unknown,
+): value is Readonly<{ evidence: readonly string[] }> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const evidence = (value as Readonly<Record<string, unknown>>).evidence;
+  return Array.isArray(evidence) && evidence.every((reference) => typeof reference === "string");
+}
 export async function listDurableTasks(
   request: ListDurableTasksRequest,
 ): Promise<ListDurableTasksResult> {
