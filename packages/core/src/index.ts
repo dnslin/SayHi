@@ -198,6 +198,8 @@ export type {
   InitiativeReadinessContextState,
 } from "./initiative-readiness.js";
 
+export type { InitiativeRepairNode } from "./initiative-integration.js";
+
 export {
   InitiativeExecutionScheduler,
   InitiativeReadWriteBarrier,
@@ -210,6 +212,9 @@ export type {
   InitiativeScheduleRequest,
   InitiativeScheduleResult,
   InitiativeWriterOwner,
+  InitiativeIntegrationExecution,
+  InitiativeIntegrationOutcome,
+  InitiativeIntegrationResult,
 } from "./initiative-scheduler.js";
 
 export type { ContractIdentity } from "./identity.js";
@@ -300,6 +305,9 @@ export type {
   DependencyGraphEdge,
   DependencyGraphEdgeType,
   DependencyGraphNode,
+  InitiativeRepairContext,
+  InitiativeRepairFailureKind,
+
   GateAcceptance,
   GateEvidence,
   GateEvidenceKind,
@@ -360,6 +368,7 @@ export {
   adoptDurableTaskBaseline,
   createDurableTask,
   createDurableTaskHandoff,
+  createDurableInitiativeRepairs,
   completeDurableQuickResult,
   diagnoseDurableTasks,
   listDurableTasks,
@@ -393,6 +402,8 @@ export type {
   InitiativeGraphFileSystem,
   InitiativeReadinessFileSystem,
   ContextManifestFileSystem,
+  CreateDurableInitiativeRepairsRequest,
+  CreateDurableInitiativeRepairsResult,
   InspectDurableContextManifestRequest,
   InspectDurableContextManifestResult,
   InitiativeGraphNodeInspection,

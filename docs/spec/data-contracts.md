@@ -392,6 +392,8 @@ Secrets and excessive raw output MUST be redacted or stored in local diagnostic 
 
 `supersedes` edges retain replaced nodes; they do not delete historical Tasks. Readiness is derived and SHOULD NOT be persisted as an independent source of truth.
 
+Ordinary Build nodes omit `repair` and `repairIntent`. A graph-visible Repair node retains the failed Integration context in `repair`: `failureKind` is `conflict` or `acceptance-failed`, `summary` is non-empty, and `evidence` contains at least one typed Evidence reference. Its `repairIntent` retains the child Build Task's non-empty goals and independently verifiable acceptance criteria. Repair creation also creates the matching durable child Build Task with the Initiative as `parentTaskId`. The Repair node has explicit `blocks` edges from its completed prerequisite Build nodes; a later graph revision retains both the original nodes and their Events.
+
 ## 13. External Reference
 
 ```json
@@ -491,5 +493,6 @@ Engine-owned content that does not match the installed base is locally modified 
 - JSON snapshots are written to a same-directory temporary file, flushed where supported, and atomically renamed.
 - Event append occurs before Projection replacement.
 - Multi-file update operations create a staged plan and operation journal under local runtime.
+- Initiative Repair creation stages `.sayhi/.runtime/initiative-repair-operation.json` through `prepared`, `graph-revised`, and `completed`; recovery uses the accepted graph Event to finish any missing child Build Task.
 - On restart, Core determines whether to finish a safe atomic replacement, replay accepted Events, or require recovery.
 - Recovery MUST NOT infer successful external side effects without observing them through the adapter.

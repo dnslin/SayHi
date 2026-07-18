@@ -5,6 +5,8 @@ import type {
   DependencyGraphEdge,
   DependencyGraphEdgeType,
   DependencyGraphNode,
+  InitiativeRepairContext,
+  TaskIntent,
 } from "./workflow.js";
 
 export const DEPENDENCY_GRAPH_CONTRACT_VERSION = 1 as const;
@@ -178,6 +180,20 @@ function validateReadableDependencyGraph(
     }
     edges.push(edge);
   }
+  for (let index = 0; index < graph.nodes.length; index += 1) {
+    const node = graph.nodes[index] as DependencyGraphNode;
+    if (
+      node.repair !== undefined &&
+      !edges.some((edge) => edge.type === "blocks" && edge.to === node.taskId)
+    ) {
+      return invalidGraph(
+        `$.graph.nodes[${index}].repair`,
+        "Dependency Graph Repair nodes must have an explicit blocking predecessor.",
+        "Add blocks edges from the completed Build nodes that constrain the Repair.",
+      );
+    }
+  }
+
 
   const cycleTaskId = findCycleTaskId(nodeOrder, edges);
   if (cycleTaskId !== null) {
@@ -271,6 +287,121 @@ function validateNode(
     );
     if (resourceFailure !== null) {
       return resourceFailure;
+    }
+  }
+  const repairFailure = validateRepairContext(value.repair, `${path}.repair`);
+  if (repairFailure !== null) {
+    return repairFailure;
+  }
+  const repairIntentFailure = validateRepairTaskIntent(
+    value.repair,
+    value.repairIntent,
+    path,
+  );
+  if (repairIntentFailure !== null) {
+    return repairIntentFailure;
+  }
+
+
+  return null;
+}
+
+function validateRepairContext(
+  value: unknown,
+  path: string,
+): DependencyGraphValidationFailure | null {
+  if (value === undefined) {
+    return null;
+  }
+  if (!isUnknownRecord(value)) {
+    return invalidGraph(
+      path,
+      "Dependency Graph Repair context must be a readable object.",
+      "Provide failureKind, summary, and evidence for the Repair node.",
+    );
+  }
+  if (value.failureKind !== "conflict" && value.failureKind !== "acceptance-failed") {
+    return invalidGraph(
+      `${path}.failureKind`,
+      "Dependency Graph Repair context must identify a conflict or failed acceptance.",
+      "Use conflict or acceptance-failed for the Repair failure kind.",
+    );
+  }
+  if (typeof value.summary !== "string" || value.summary.trim().length === 0) {
+    return invalidGraph(
+      `${path}.summary`,
+      "Dependency Graph Repair context summary must be non-empty.",
+      "Record the integration failure that the Repair node addresses.",
+    );
+  }
+  if (!Array.isArray(value.evidence) || value.evidence.length === 0) {
+    return invalidGraph(
+      `${path}.evidence`,
+      "Dependency Graph Repair context must retain at least one evidence reference.",
+      "Reference the conflict or failed acceptance evidence for the Repair node.",
+    );
+  }
+  for (let index = 0; index < value.evidence.length; index += 1) {
+    const evidence = value.evidence[index];
+    if (
+      !isUnknownRecord(evidence) ||
+      (evidence.kind !== "human-approval" &&
+        evidence.kind !== "validation" &&
+        evidence.kind !== "review" &&
+        evidence.kind !== "workflow") ||
+      typeof evidence.reference !== "string" ||
+      evidence.reference.trim().length === 0
+    ) {
+      return invalidGraph(
+        `${path}.evidence[${index}]`,
+        "Dependency Graph Repair evidence must be a typed non-empty reference.",
+        "Provide Gate Evidence that identifies the failed Integration result.",
+      );
+    }
+  }
+  return null;
+}
+
+function validateRepairTaskIntent(
+  repair: unknown,
+  value: unknown,
+  nodePath: string,
+): DependencyGraphValidationFailure | null {
+  if (repair === undefined && value === undefined) {
+    return null;
+  }
+  if (repair === undefined || value === undefined) {
+    return invalidGraph(
+      `${nodePath}.${repair === undefined ? "repair" : "repairIntent"}`,
+      "Dependency Graph Repair nodes must retain both failure context and Repair Task intent.",
+      "Provide matching repair and repairIntent values for each Repair node.",
+    );
+  }
+  if (!isUnknownRecord(value)) {
+    return invalidGraph(
+      `${nodePath}.repairIntent`,
+      "Dependency Graph Repair Task intent must be a readable object.",
+      "Provide goals, nonGoals, and acceptanceCriteria for the Repair Build Task.",
+    );
+  }
+  const fields = ["goals", "nonGoals", "acceptanceCriteria"] as const;
+  for (const field of fields) {
+    const entries = value[field];
+    if (
+      !Array.isArray(entries) ||
+      entries.some(
+        (entry) => typeof entry !== "string" || entry.trim().length === 0,
+      ) ||
+      ((field === "goals" || field === "acceptanceCriteria") &&
+        entries.length === 0)
+    ) {
+      return invalidGraph(
+        `${nodePath}.repairIntent.${field}`,
+        `Dependency Graph Repair Task intent ${field} must contain valid text${
+          field === "goals" || field === "acceptanceCriteria" ? " and cannot be empty" : ""
+        }.`,
+        "Provide independently verifiable Repair Build Task intent.",
+      );
     }
   }
   return null;
@@ -451,6 +582,14 @@ function copyDependencyGraph(graph: DependencyGraph): DependencyGraph {
             schemas: copyStrings(node.resources.schemas),
             locks: copyStrings(node.resources.locks),
           }),
+          ...(node.repair === undefined
+            ? {}
+            : { repair: copyRepairContext(node.repair) }),
+          ...(node.repairIntent === undefined
+            ? {}
+            : { repairIntent: copyTaskIntent(node.repairIntent) }),
+
+
         }),
       ),
     ),
@@ -465,6 +604,26 @@ function copyDependencyGraph(graph: DependencyGraph): DependencyGraph {
       ),
     ),
     updatedByEvent: graph.updatedByEvent,
+  });
+}
+
+function copyRepairContext(context: InitiativeRepairContext): InitiativeRepairContext {
+  return Object.freeze({
+    failureKind: context.failureKind,
+    summary: context.summary,
+    evidence: Object.freeze(
+      context.evidence.map((evidence) =>
+        Object.freeze({ kind: evidence.kind, reference: evidence.reference }),
+      ),
+    ),
+  });
+}
+
+function copyTaskIntent(intent: TaskIntent): TaskIntent {
+  return Object.freeze({
+    goals: copyStrings(intent.goals),
+    nonGoals: copyStrings(intent.nonGoals),
+    acceptanceCriteria: copyStrings(intent.acceptanceCriteria),
   });
 }
 
