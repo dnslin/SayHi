@@ -5,7 +5,10 @@ import {
   bindPhaseExecution,
 } from "./execution.js";
 import { validateDomainValue } from "./validation.js";
-import { validateContractRecord } from "./record-contracts.js";
+import {
+  isKnowledgeCandidateStatus,
+  validateContractRecord,
+} from "./record-contracts.js";
 import {
   diagnoseManagedProject,
   initializeManagedProject,
@@ -17,6 +20,12 @@ import {
   readSpec,
   validateSpecs,
 } from "./spec.js";
+import {
+  createKnowledgeCandidate,
+  listKnowledgeCandidates,
+  readKnowledgeCandidate,
+  reviewKnowledgeCandidate,
+} from "./knowledge.js";
 import {
   readRouteDefinition,
   readGateEvidenceKinds,
@@ -66,6 +75,7 @@ import {
 
 export {
   RECORD_CONTRACT_VERSION,
+  isKnowledgeCandidateStatus,
   validateContractRecord,
 } from "./record-contracts.js";
 export type {
@@ -92,6 +102,8 @@ export type {
   KnowledgeCandidateRecord,
   KnowledgeCandidateStatus,
   KnowledgeConfidence,
+  KnowledgeCandidateReview,
+  KnowledgeReviewDisposition,
   InstalledProjectVersions,
   LeaseKind,
   LeaseOwner,
@@ -104,6 +116,32 @@ export type {
   SkillLockRecord,
   SkillUpstreamIdentity,
 } from "./record-contracts.js";
+export { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
+export type { KnowledgeCandidateContent } from "./knowledge-candidate.js";
+export {
+  KNOWLEDGE_CONTRACT_VERSION,
+  createKnowledgeCandidate,
+  listKnowledgeCandidates,
+  readKnowledgeCandidate,
+  reviewKnowledgeCandidate,
+} from "./knowledge.js";
+export type {
+  CreateKnowledgeCandidateRequest,
+  CreateKnowledgeCandidateResult,
+  KnowledgeCandidateCreationDisposition,
+  KnowledgeCandidateDiagnostic,
+  KnowledgeCandidateDiagnosticCode,
+  KnowledgeCandidateDisposition,
+  KnowledgeCandidateDraft,
+  KnowledgeCandidateFileSystem,
+  ListedKnowledgeCandidate,
+  ListKnowledgeCandidatesRequest,
+  ListKnowledgeCandidatesResult,
+  ReadKnowledgeCandidateRequest,
+  ReadKnowledgeCandidateResult,
+  ReviewKnowledgeCandidateRequest,
+  ReviewKnowledgeCandidateResult,
+} from "./knowledge.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -498,6 +536,10 @@ export interface CoreContract {
   readonly listSpecs: typeof listSpecs;
   readonly readSpec: typeof readSpec;
   readonly validateSpecs: typeof validateSpecs;
+  readonly createKnowledgeCandidate: typeof createKnowledgeCandidate;
+  readonly listKnowledgeCandidates: typeof listKnowledgeCandidates;
+  readonly readKnowledgeCandidate: typeof readKnowledgeCandidate;
+  readonly reviewKnowledgeCandidate: typeof reviewKnowledgeCandidate;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -561,6 +603,10 @@ export const coreContract: CoreContract = Object.freeze({
   listSpecs,
   readSpec,
   validateSpecs,
+  createKnowledgeCandidate,
+  listKnowledgeCandidates,
+  readKnowledgeCandidate,
+  reviewKnowledgeCandidate,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,

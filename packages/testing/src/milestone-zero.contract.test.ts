@@ -6,7 +6,7 @@ import {
   validateCliDependencyGraph,
   validateCliDomainValue,
 } from "@dnslin/sayhi-cli";
-import { coreContract } from "@dnslin/sayhi-core";
+import { coreContract, hashKnowledgeCandidateContent } from "@dnslin/sayhi-core";
 import {
   validateOmpContractRecord,
   validateOmpDependencyGraph,
@@ -191,8 +191,19 @@ const knowledgeCandidate = {
   confidence: "high",
   proposedAction: "update-spec",
   target: "docs/spec/acceptance.md",
+  contentHash: hashKnowledgeCandidateContent({
+    type: "convention",
+    statement: "Milestone contracts interoperate through shared Core validation.",
+    scope: ["packages/testing/**"],
+    confidence: "high",
+    proposedAction: "update-spec",
+    target: "docs/spec/acceptance.md",
+  }),
+  targetIdentity: null,
   status: "pending",
   createdBy: "RESULT-7",
+  createdAt: "2026-07-18T10:00:00Z",
+  review: null,
 } as const;
 
 const skillLock = {

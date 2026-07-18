@@ -13,6 +13,7 @@ import {
   planManagedProjectUninstall,
   planManagedProjectUpdate,
   recoverManagedProjectOperation,
+  isKnowledgeCandidateStatus,
   type ApplyManagedProjectPlanResult,
   type ContractIdentity,
   type DiagnoseManagedProjectResult,
@@ -31,6 +32,8 @@ import {
   type WorkflowState,
   type InitiativeGraphRevision,
   type TaskBaselineFileSystem,
+  type KnowledgeCandidateStatus,
+  type KnowledgeReviewDisposition,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -195,6 +198,21 @@ interface ParsedPlanArguments {
 }
 type PlanArgumentResult = ParsedPlanArguments | InvalidCliArguments;
 
+type KnowledgeSubcommand = "list" | "show" | "review";
+interface ParsedKnowledgeArguments {
+  readonly ok: true;
+  readonly command: "knowledge";
+  readonly subcommand: KnowledgeSubcommand;
+  readonly cwd: string;
+  readonly json: boolean;
+  readonly candidateId?: string;
+  readonly status?: KnowledgeCandidateStatus;
+  readonly disposition?: KnowledgeReviewDisposition;
+  readonly reason?: string;
+  readonly reviewer?: string;
+}
+type KnowledgeArgumentResult = ParsedKnowledgeArguments | InvalidCliArguments;
+
 interface PlanRecordRequest {
   readonly taskId: string;
   readonly expectedVersion: number;
@@ -305,6 +323,18 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
           2,
           plan.message,
           "Run sayhi plan record, approve, or reject <task-id> --from <request.json>.",
+          args.includes("--json"),
+        );
+  }
+  const knowledge = parseKnowledgeArguments(args);
+  if (knowledge !== null) {
+    return knowledge.ok
+      ? runKnowledgeCli(knowledge)
+      : cliFailure(
+          "knowledge",
+          2,
+          knowledge.message,
+          "Run sayhi knowledge list, show <candidate-id>, or review <candidate-id> --approve|--reject|--request-revision --reason <text>.",
           args.includes("--json"),
         );
   }
@@ -477,6 +507,76 @@ async function runSpecCli(parsed: ParsedSpecArguments): Promise<CliRunResult> {
             parsed.json,
           )
         : cliDomainFailure("spec.validate", result.diagnostics[0], parsed.json);
+    }
+  }
+}
+
+async function runKnowledgeCli(
+  parsed: ParsedKnowledgeArguments,
+): Promise<CliRunResult> {
+  const repositoryRoot = await resolveCliRepositoryRoot(
+    parsed.cwd,
+    `knowledge.${parsed.subcommand}`,
+    parsed.json,
+  );
+  if (typeof repositoryRoot !== "string") {
+    return repositoryRoot;
+  }
+  const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
+  const projectDiagnosis = await coreContract.diagnoseManagedProject({
+    fileSystem,
+    installation: CLI_MANAGED_PROJECT_INSTALLATION,
+  });
+  if (!projectDiagnosis.ok) {
+    return cliProjectDiagnosisFailure(
+      `knowledge.${parsed.subcommand}`,
+      projectDiagnosis,
+      parsed.json,
+    );
+  }
+  switch (parsed.subcommand) {
+    case "list": {
+      const result = await coreContract.listKnowledgeCandidates({
+        fileSystem,
+        ...(parsed.status === undefined ? {} : { status: parsed.status }),
+      });
+      return result.ok
+        ? cliSuccess(
+            "knowledge.list",
+            Object.freeze({ candidates: result.candidates }),
+            parsed.json,
+          )
+        : cliDomainFailure("knowledge.list", result.diagnostics[0], parsed.json);
+    }
+    case "show": {
+      const result = await coreContract.readKnowledgeCandidate({
+        fileSystem,
+        candidateId: parsed.candidateId!,
+      });
+      return result.ok
+        ? cliSuccess(
+            "knowledge.show",
+            Object.freeze({ candidate: result.candidate }),
+            parsed.json,
+          )
+        : cliDomainFailure("knowledge.show", result.diagnostics[0], parsed.json);
+    }
+    case "review": {
+      const result = await coreContract.reviewKnowledgeCandidate({
+        fileSystem,
+        candidateId: parsed.candidateId!,
+        disposition: parsed.disposition!,
+        reviewer: parsed.reviewer!,
+        reason: parsed.reason!,
+        reviewedAt: new Date().toISOString(),
+      });
+      return result.ok
+        ? cliSuccess(
+            "knowledge.review",
+            Object.freeze({ candidate: result.candidate }),
+            parsed.json,
+          )
+        : cliDomainFailure("knowledge.review", result.diagnostics[0], parsed.json);
     }
   }
 }
@@ -2873,6 +2973,143 @@ function leadingCliCommand(args: readonly string[]): string | undefined {
   }
   return undefined;
 }
+
+function parseKnowledgeArguments(args: readonly string[]): KnowledgeArgumentResult | null {
+  if (leadingCliCommand(args) !== "knowledge") {
+    return null;
+  }
+  let cwd = process.cwd();
+  let json = false;
+  let status: KnowledgeCandidateStatus | undefined;
+  let disposition: KnowledgeReviewDisposition | undefined;
+  let reviewer: string | undefined;
+  let reason: string | undefined;
+  let knowledgeCount = 0;
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--json") {
+      json = true;
+      continue;
+    }
+    if (isGlobalPresentationOption(argument)) {
+      continue;
+    }
+    if (
+      argument === "--cwd" ||
+      argument === "--status" ||
+      argument === "--reason" ||
+      argument === "--reviewer"
+    ) {
+      const value = args[index + 1];
+      if (value === undefined || value.startsWith("--")) {
+        return { ok: false, message: `${argument} requires a value.` };
+      }
+      if (argument === "--cwd") {
+        cwd = value;
+      } else if (argument === "--status") {
+        if (status !== undefined) {
+          return { ok: false, message: "Specify --status at most once." };
+        }
+        if (!isKnowledgeCandidateStatus(value)) {
+          return { ok: false, message: "--status is not a supported Knowledge Candidate status." };
+        }
+        status = value;
+      } else if (argument === "--reviewer") {
+        if (reviewer !== undefined) {
+          return { ok: false, message: "Specify --reviewer exactly once." };
+        }
+        reviewer = value;
+      } else if (reason !== undefined) {
+        return { ok: false, message: "Specify --reason exactly once." };
+      } else {
+        reason = value;
+      }
+      index += 1;
+      continue;
+    }
+    if (
+      argument === "--approve" ||
+      argument === "--reject" ||
+      argument === "--request-revision"
+    ) {
+      if (disposition !== undefined) {
+        return { ok: false, message: "Specify exactly one Knowledge review disposition." };
+      }
+      disposition =
+        argument === "--approve"
+          ? "approved"
+          : argument === "--reject"
+            ? "rejected"
+            : "revision-requested";
+      continue;
+    }
+    if (argument === "knowledge") {
+      knowledgeCount += 1;
+      continue;
+    }
+    if (argument.startsWith("--")) {
+      return { ok: false, message: `Unknown argument: ${argument}` };
+    }
+    values.push(argument);
+  }
+  if (knowledgeCount !== 1) {
+    return { ok: false, message: "Specify exactly one knowledge command." };
+  }
+  const [subcommand, candidateId, ...tail] = values;
+  if (subcommand === "list") {
+    return candidateId === undefined &&
+      tail.length === 0 &&
+      disposition === undefined &&
+      reason === undefined &&
+      reviewer === undefined
+      ? {
+          ok: true,
+          command: "knowledge",
+          subcommand,
+          cwd,
+          json,
+          ...(status === undefined ? {} : { status }),
+        }
+      : { ok: false, message: "knowledge list accepts only an optional --status filter." };
+  }
+  if (subcommand === "show") {
+    return candidateId !== undefined &&
+      tail.length === 0 &&
+      status === undefined &&
+      disposition === undefined &&
+      reason === undefined &&
+      reviewer === undefined
+      ? { ok: true, command: "knowledge", subcommand, cwd, json, candidateId }
+      : { ok: false, message: "knowledge show requires exactly one Candidate id." };
+  }
+  if (subcommand === "review") {
+    return candidateId !== undefined &&
+      tail.length === 0 &&
+      status === undefined &&
+      disposition !== undefined &&
+      reviewer !== undefined &&
+      reason !== undefined
+      ? {
+          ok: true,
+          command: "knowledge",
+          subcommand,
+          cwd,
+          json,
+          candidateId,
+          disposition,
+          reviewer,
+          reason,
+        }
+      : {
+          ok: false,
+          message:
+            "knowledge review requires one Candidate id, one review disposition, --reviewer <id>, and --reason <text>.",
+        };
+  }
+  return { ok: false, message: "Knowledge command is not supported." };
+}
+
 
 function parseSpecArguments(args: readonly string[]): SpecArgumentResult | null {
   if (leadingCliCommand(args) !== "spec") {

@@ -175,13 +175,10 @@ Journal commands MUST distinguish committed shared summaries from local machine 
 ```text
 sayhi knowledge list [--status pending]
 sayhi knowledge show <candidate-id>
-sayhi knowledge review <candidate-id>
-sayhi knowledge accept <candidate-id>
-sayhi knowledge reject <candidate-id> --reason <text>
-sayhi knowledge supersede <candidate-id> --by <reference>
+sayhi knowledge review <candidate-id> --approve|--reject|--request-revision --reviewer <id> --reason <text>
 ```
 
-Acceptance presents target diff, conflict analysis, scope, provenance, and affected active manifests before applying changes.
+`knowledge review` records a human decision on the Candidate only. It presents the Candidate provenance and current disposition but never changes its target; promotion and supersession remain separate, human-authorized operations.
 
 ### 4.8 Tracker synchronization
 
