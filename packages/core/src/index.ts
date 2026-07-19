@@ -32,6 +32,7 @@ import {
   projectMarkdownTracker,
   resolveMarkdownTrackerConflict,
 } from "./markdown-tracker.js";
+import { projectTrackerProjection } from "./tracker-projection.js";
 import {
   getGitHubIssueProjectionStatus,
   pullGitHubIssueProjection,
@@ -188,6 +189,26 @@ export type {
   ResolveMarkdownTrackerConflictRequest,
   ResolveMarkdownTrackerConflictResult,
 } from "./markdown-tracker.js";
+export {
+  TRACKER_PROJECTION_CONTRACT_VERSION,
+  projectTrackerProjection,
+} from "./tracker-projection.js";
+export type {
+  ProjectTrackerProjectionRequest,
+  ProjectTrackerProjectionResult,
+  TrackerProjectionAdapter,
+  TrackerProjectionAdapterOutcome,
+  TrackerProjectionConflict,
+  TrackerProjectionDiagnostic,
+  TrackerProjectionDiagnosticCode,
+  TrackerProjectionMapping,
+  TrackerProjectionPendingMutation,
+  TrackerProjectionMutation,
+  TrackerProjectionOperation,
+  TrackerProjectionPayload,
+  TrackerProjectionRemoteResource,
+  TrackerProjectionStore,
+} from "./tracker-projection.js";
 export {
   GITHUB_TRACKER_CONTRACT_VERSION,
   getGitHubIssueProjectionStatus,
@@ -626,6 +647,7 @@ export interface CoreContract {
   readonly projectMarkdownTracker: typeof projectMarkdownTracker;
   readonly projectDeletedMarkdownTrackerTask: typeof projectDeletedMarkdownTrackerTask;
   readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
+  readonly projectTrackerProjection: typeof projectTrackerProjection;
   readonly pushGitHubIssueProjection: typeof pushGitHubIssueProjection;
   readonly pullGitHubIssueProjection: typeof pullGitHubIssueProjection;
   readonly getGitHubIssueProjectionStatus: typeof getGitHubIssueProjectionStatus;
@@ -702,6 +724,7 @@ export const coreContract: CoreContract = Object.freeze({
   projectMarkdownTracker,
   projectDeletedMarkdownTrackerTask,
   resolveMarkdownTrackerConflict,
+  projectTrackerProjection,
   pushGitHubIssueProjection,
   pullGitHubIssueProjection,
   getGitHubIssueProjectionStatus,
