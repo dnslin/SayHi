@@ -354,35 +354,37 @@ test("Tracker projection reconciles a matching remote edit without a pending loc
   assert.equal(adapter.updateCalls, 1);
 });
 
-test("Tracker projection reports concurrent edits and conditional-write conflicts without mutating local authority", async () => {
-  const store = new MemoryTrackerProjectionStore();
-  const adapter = new MemoryTrackerProjectionAdapter("gitlab");
-  const createdState = startTrackerTask();
-  await coreContract.projectTrackerProjection({ store, adapter, state: createdState });
-  const updatedState = advanceTrackerTask(createdState, "active", "implement", "CONCURRENT");
+for (const adapterId of ["gitlab", "custom:team-tracker"] as const) {
+  test(`${adapterId} projection reports concurrent edits and conditional-write conflicts without mutating local authority`, async () => {
+    const store = new MemoryTrackerProjectionStore();
+    const adapter = new MemoryTrackerProjectionAdapter(adapterId);
+    const createdState = startTrackerTask();
+    await coreContract.projectTrackerProjection({ store, adapter, state: createdState });
+    const updatedState = advanceTrackerTask(createdState, "active", "implement", "CONCURRENT");
 
-  adapter.editRemotely("sayhi-task:TASK-TRACKER-33");
-  const concurrent = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
-  assert.equal(concurrent.disposition, "reconciliation-required");
-  if (concurrent.disposition !== "reconciliation-required") {
-    return;
-  }
-  assert.equal(concurrent.conflict.adapterId, "gitlab");
-  assert.equal(concurrent.conflict.observedVersion, "remote-edit");
-  assert.equal(adapter.updateCalls, 0);
-  assert.equal(updatedState.projection.phase, "implement");
+    adapter.editRemotely("sayhi-task:TASK-TRACKER-33");
+    const concurrent = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
+    assert.equal(concurrent.disposition, "reconciliation-required");
+    if (concurrent.disposition !== "reconciliation-required") {
+      return;
+    }
+    assert.equal(concurrent.conflict.adapterId, adapterId);
+    assert.equal(concurrent.conflict.observedVersion, "remote-edit");
+    assert.equal(adapter.updateCalls, 0);
+    assert.equal(updatedState.projection.phase, "implement");
 
-  adapter.records.set("sayhi-task:TASK-TRACKER-33", {
-    ...adapter.records.get("sayhi-task:TASK-TRACKER-33")!,
-    version: store.mapping!.observedVersion,
-    authorityIdentity: store.mapping!.authorityIdentity,
+    adapter.records.set("sayhi-task:TASK-TRACKER-33", {
+      ...adapter.records.get("sayhi-task:TASK-TRACKER-33")!,
+      version: store.mapping!.observedVersion,
+      authorityIdentity: store.mapping!.authorityIdentity,
+    });
+    adapter.conflictOnNextUpdate = true;
+    const raced = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
+    assert.equal(raced.disposition, "reconciliation-required");
+    assert.equal(adapter.updateCalls, 1);
+    assert.equal(store.mapping?.observedVersion, "1");
   });
-  adapter.conflictOnNextUpdate = true;
-  const raced = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
-  assert.equal(raced.disposition, "reconciliation-required");
-  assert.equal(adapter.updateCalls, 1);
-  assert.equal(store.mapping?.observedVersion, "1");
-});
+}
 
 test("Tracker projection reports authentication and unsupported archive outcomes as recoverable diagnostics", async () => {
   const authenticationStore = new MemoryTrackerProjectionStore();

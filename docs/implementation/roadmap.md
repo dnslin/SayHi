@@ -160,7 +160,7 @@ No Agent can promote knowledge directly, provenance remains traversable, credent
 
 ### Exit Gate evidence
 
-**Satisfied for issue #34’s Milestone 4 scope:** `npm run test:milestone-4` builds the workspace and runs 37 contract tests. The suite proves completed-Task Evidence provenance, exact user approval, preserved Candidate records, promotion, and Context Manifest staleness; then exercises Markdown, GitHub, GitLab, and custom Tracker projections through idempotent retries and recoverable concurrent-edit conflicts without changing local Workflow authority.
+**Satisfied for issue #34’s Milestone 4 scope:** `npm run test:milestone-4` builds the workspace and runs 38 contract tests. The suite proves completed-Task Evidence provenance, exact user approval, preserved Candidate records, promotion, and Context Manifest staleness; then exercises Markdown, GitHub, GitLab, and custom Tracker projections through idempotent retries and recoverable concurrent-edit conflicts without changing local Workflow authority.
 
 ### Primary risks
 
