@@ -201,6 +201,32 @@ test("Core recovers a GitHub Issue mapping after an unknown create outcome witho
     assert.equal(retried.state.events.at(-1)?.type, "tracker_synchronized");
   }
 });
+test("Core rejects a reused GitHub synchronization idempotency key with different intent", async () => {
+  const tracker = new MemoryGitHubTracker();
+  const event = eventMetadata("REUSED", "2026-07-19T12:00:01Z");
+  const created = await coreContract.pushGitHubIssueProjection({
+    state: startState(),
+    tracker,
+    event,
+  });
+  assert.equal(created.disposition, "created");
+  if (created.disposition !== "created") {
+    return;
+  }
+
+  const reused = await coreContract.pullGitHubIssueProjection({
+    state: created.state,
+    tracker,
+    event,
+  });
+  assert.equal(reused.disposition, "diagnostic");
+  if (reused.disposition === "diagnostic") {
+    assert.equal(reused.diagnostic.code, "github.idempotency_conflict");
+    assert.equal(reused.state, created.state);
+  }
+  assert.equal(tracker.readCalls, 0);
+});
+
 
 
 

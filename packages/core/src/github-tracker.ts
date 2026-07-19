@@ -1,6 +1,7 @@
-import { hashCanonicalJson, type ContractIdentity } from "./identity.js";
+import { hashCanonicalJson, stableJson, type ContractIdentity } from "./identity.js";
 import {
   recordTrackerSynchronization,
+  replayWorkflowEvents,
   type RecordTrackerSynchronizationResult,
   type TrackerReference,
   type TrackerSynchronizationChange,
@@ -171,7 +172,11 @@ export type GitHubIssueProjectionStatusResult =
 export async function pushGitHubIssueProjection(
   request: PushGitHubIssueProjectionRequest,
 ): Promise<GitHubIssueProjectionResult> {
-  const repeated = repeatedSynchronization(request.state, request.event);
+  const repeated = repeatedSynchronization(request.state, request.event, [
+    "created",
+    "updated",
+    "observed",
+  ]);
   if (repeated !== null) {
     return repeated;
   }
@@ -287,7 +292,10 @@ export async function getGitHubIssueProjectionStatus(
 export async function pullGitHubIssueProjection(
   request: PullGitHubIssueProjectionRequest,
 ): Promise<GitHubIssueProjectionResult> {
-  const repeated = repeatedSynchronization(request.state, request.event);
+  const repeated = repeatedSynchronization(request.state, request.event, [
+    "observed",
+    "external_closed",
+  ]);
   if (repeated !== null) {
     return repeated;
   }
@@ -326,7 +334,9 @@ export async function pullGitHubIssueProjection(
 export async function resolveGitHubIssueProjectionConflict(
   request: ResolveGitHubIssueProjectionConflictRequest,
 ): Promise<GitHubIssueProjectionResult> {
-  const repeated = repeatedSynchronization(request.state, request.event);
+  const repeated = repeatedSynchronization(request.state, request.event, [
+    request.resolution === "use-local" ? "resolved_local" : "resolved_remote",
+  ]);
   if (repeated !== null) {
     return repeated;
   }
@@ -403,20 +413,34 @@ export async function resolveGitHubIssueProjectionConflict(
 function repeatedSynchronization(
   state: WorkflowState,
   event: WorkflowEventMetadata,
+  acceptedChanges: readonly TrackerSynchronizationChange[],
 ): GitHubIssueProjectionResult | null {
-  const repeated = state.events.find(
+  const repeatedIndex = state.events.findIndex(
     (candidate) => candidate.idempotencyKey === event.idempotencyKey,
   );
-  if (repeated === undefined) {
+  if (repeatedIndex === -1) {
     return null;
   }
-  if (repeated.type === "tracker_synchronized" && repeated.reference.adapter === "github") {
+  const repeated = state.events[repeatedIndex]!;
+  const replayed = replayWorkflowEvents(state.events);
+  if (
+    repeatedIndex === state.events.length - 1 &&
+    repeated.type === "tracker_synchronized" &&
+    repeated.reference.adapter === "github" &&
+    acceptedChanges.includes(repeated.change) &&
+    repeated.reason === event.reason &&
+    repeated.actor.kind === event.actor.kind &&
+    repeated.actor.id === event.actor.id &&
+    repeated.actor.sessionRef === event.actor.sessionRef &&
+    replayed.ok &&
+    stableJson(replayed.state.projection) === stableJson(state.projection)
+  ) {
     return Object.freeze({ disposition: "unchanged", state });
   }
   return withDiagnostic(state, {
     code: "github.idempotency_conflict",
-    message: "The synchronization idempotency key is already bound to another local Event.",
-    remediation: "Retry this synchronization with the original Event material or allocate a new idempotency key.",
+    message: "The synchronization idempotency key is already bound to different or stale Tracker synchronization material.",
+    remediation: "Reload the local Task and retry the original operation with its matching Event, or allocate a new idempotency key.",
     recoverable: true,
   });
 }
