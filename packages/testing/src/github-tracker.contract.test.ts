@@ -433,6 +433,31 @@ test("Core treats a closed GitHub Issue with edited projection content as a sync
   assert.equal(pulled.disposition, "sync-conflict");
   assert.equal(pulled.state, created.state);
 });
+test("Core reports a recoverable diagnostic when GitHub status finds a deleted Issue", async () => {
+  const tracker = new MemoryGitHubTracker();
+  const created = await coreContract.pushGitHubIssueProjection({
+    state: startState(),
+    tracker,
+    event: eventMetadata("CREATE", "2026-07-19T12:00:01Z"),
+  });
+  assert.equal(created.disposition, "created");
+  if (created.disposition !== "created") {
+    return;
+  }
+  tracker.issue = null;
+
+  const status = await coreContract.getGitHubIssueProjectionStatus({
+    state: created.state,
+    tracker,
+  });
+  assert.equal(status.disposition, "diagnostic");
+  if (status.disposition === "diagnostic") {
+    assert.equal(status.diagnostic.code, "github.issue_deleted");
+    assert.equal(status.diagnostic.recoverable, true);
+    assert.equal(status.state, created.state);
+  }
+});
+
 
 
 test("Core returns recoverable diagnostics for GitHub permission, rate-limit, and deletion outcomes", async () => {

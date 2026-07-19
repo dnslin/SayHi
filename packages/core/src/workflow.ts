@@ -19,6 +19,7 @@ import {
 
 
 import { isRepositoryRelativePath } from "./repository-path.js";
+import { isCredentialFreeAbsoluteUri } from "./tracker-utils.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
   isIdentifier,
@@ -4830,25 +4831,6 @@ function isTrackerReference(value: unknown): value is TrackerReference {
     isTimestamp(value.lastObservedAt)
   );
 }
-function isCredentialFreeAbsoluteUri(value: unknown): value is string {
-  if (typeof value !== "string") {
-    return false;
-  }
-  try {
-    const uri = new URL(value);
-    return (
-      (uri.protocol === "http:" || uri.protocol === "https:") &&
-      uri.username.length === 0 &&
-      uri.password.length === 0 &&
-      uri.search.length === 0 &&
-      uri.hash.length === 0
-    );
-  } catch {
-    return false;
-  }
-}
-
-
 function invalidRequest(path: string, message: string): WorkflowDiagnostic {
   return diagnostic(
     "workflow.request.invalid",

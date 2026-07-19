@@ -1,5 +1,9 @@
 import { hashCanonicalJson, stableJson, type ContractIdentity } from "./identity.js";
 import {
+  escapeTrackerInlineText as inline,
+  isCredentialFreeAbsoluteUri,
+} from "./tracker-utils.js";
+import {
   recordTrackerSynchronization,
   replayWorkflowEvents,
   type RecordTrackerSynchronizationResult,
@@ -157,7 +161,6 @@ export type GitHubIssueProjectionStatusResult =
       readonly issue: GitHubIssue;
     }>
   | Readonly<{ readonly disposition: "not-mapped"; readonly state: WorkflowState }>
-  | Readonly<{ readonly disposition: "deleted"; readonly state: WorkflowState }>
   | Readonly<{
       readonly disposition: "sync-conflict";
       readonly state: WorkflowState;
@@ -226,9 +229,6 @@ export async function pushGitHubIssueProjection(
         recoverable: true,
       });
     }
-    if (status.disposition === "deleted") {
-      return withDiagnostic(request.state, issueDeletedDiagnostic());
-    }
     if (status.disposition === "diagnostic") {
       return withDiagnostic(request.state, status.diagnostic);
     }
@@ -286,7 +286,11 @@ export async function getGitHubIssueProjectionStatus(
     });
   }
   if (read.issue === null) {
-    return Object.freeze({ disposition: "deleted", state: request.state });
+    return Object.freeze({
+      disposition: "diagnostic",
+      state: request.state,
+      diagnostic: issueDeletedDiagnostic(),
+    });
   }
   const identity = issueIdentity(read.issue);
   if (identity !== reference.identity) {
@@ -340,9 +344,6 @@ export async function pullGitHubIssueProjection(
       remediation: "Push the Task projection first or explicitly establish its GitHub Issue mapping.",
       recoverable: true,
     });
-  }
-  if (status.disposition === "deleted") {
-    return withDiagnostic(request.state, issueDeletedDiagnostic());
   }
   if (status.disposition === "diagnostic") {
     return withDiagnostic(request.state, status.diagnostic);
@@ -831,23 +832,6 @@ function isGitHubIssue(value: unknown): value is GitHubIssue {
   );
 }
 
-function isCredentialFreeAbsoluteUri(value: unknown): value is string {
-  if (typeof value !== "string") {
-    return false;
-  }
-  try {
-    const uri = new URL(value);
-    return (
-      (uri.protocol === "http:" || uri.protocol === "https:") &&
-      uri.username.length === 0 &&
-      uri.password.length === 0 &&
-      uri.search.length === 0 &&
-      uri.hash.length === 0
-    );
-  } catch {
-    return false;
-  }
-}
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -855,14 +839,4 @@ function isNonEmptyString(value: unknown): value is string {
 
 function freezeIssue(issue: GitHubIssue): GitHubIssue {
   return Object.freeze({ ...issue });
-}
-
-
-
-function inline(value: string): string {
-  return value
-    .replace(/[\r\n]+/gu, " ")
-    .replace(/<!--/gu, "&lt;!--")
-    .replace(/-->/gu, "--&gt;")
-    .replace(/`/gu, "\\`");
 }
