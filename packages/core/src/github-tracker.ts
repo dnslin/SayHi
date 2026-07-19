@@ -213,7 +213,10 @@ export async function pushGitHubIssueProjection(
     return recordSynchronization(request, created.issue, "created");
   }
 
-  if (reference.identity === projectionIdentity(projection)) {
+  if (
+    reference.identity === projectionIdentity(projection) &&
+    reference.observedState === projection.state
+  ) {
     const status = await getGitHubIssueProjectionStatus(request);
     if (status.disposition === "not-mapped") {
       return withDiagnostic(request.state, {

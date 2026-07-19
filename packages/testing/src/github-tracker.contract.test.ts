@@ -405,6 +405,13 @@ test("Core records external GitHub closure without completing the local Task", a
   });
   assert.equal(repeated.disposition, "unchanged");
   assert.equal(repeated.state.events.length, pulled.state.events.length);
+  const reopened = await coreContract.pushGitHubIssueProjection({
+    state: pulled.state,
+    tracker,
+    event: eventMetadata("PUSH-REOPEN", "2026-07-19T12:04:00Z"),
+  });
+  assert.equal(reopened.disposition, "updated");
+  assert.equal(tracker.issue?.state, "open");
 });
 test("Core treats a closed GitHub Issue with edited projection content as a sync conflict", async () => {
   const tracker = new MemoryGitHubTracker();
