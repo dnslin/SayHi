@@ -36,6 +36,7 @@ export interface GitHubIssueReference {
   readonly externalId: string;
   readonly observedVersion: string;
 }
+export type GitHubIssueConflictResolution = "use-local" | "keep-observed";
 
 export type GitHubIssueReadResult =
   | Readonly<{ readonly kind: "found"; readonly issue: GitHubIssue }>
@@ -82,6 +83,18 @@ export interface PullGitHubIssueProjectionRequest {
   readonly tracker: GitHubTrackerPort;
   readonly event: WorkflowEventMetadata;
 }
+export interface GetGitHubIssueProjectionStatusRequest {
+  readonly state: WorkflowState;
+  readonly tracker: GitHubTrackerPort;
+}
+
+export interface ResolveGitHubIssueProjectionConflictRequest {
+  readonly state: WorkflowState;
+  readonly tracker: GitHubTrackerPort;
+  readonly conflict: GitHubIssueSyncConflict;
+  readonly resolution: GitHubIssueConflictResolution;
+  readonly event: WorkflowEventMetadata;
+}
 
 export interface GitHubIssueSyncConflict {
   readonly expectedVersion: string | null;
@@ -97,7 +110,8 @@ export type GitHubTrackerDiagnosticCode =
   | "github.not_mapped"
   | "github.invalid_response"
   | "github.idempotency_conflict"
-  | "github.local_state_stale";
+  | "github.local_state_stale"
+  | "github.resolution_not_authorized";
 
 export interface GitHubTrackerDiagnostic {
   readonly code: GitHubTrackerDiagnosticCode;
@@ -118,7 +132,31 @@ export type GitHubIssueProjectionResult =
       readonly state: WorkflowState;
       readonly event: TrackerSynchronizedEvent;
     }>
+  | Readonly<{
+      readonly disposition: "resolved-local" | "resolved-remote";
+      readonly state: WorkflowState;
+      readonly event: TrackerSynchronizedEvent;
+    }>
   | Readonly<{ readonly disposition: "unchanged"; readonly state: WorkflowState }>
+  | Readonly<{
+      readonly disposition: "sync-conflict";
+      readonly state: WorkflowState;
+      readonly conflict: GitHubIssueSyncConflict;
+    }>
+  | Readonly<{
+      readonly disposition: "diagnostic";
+      readonly state: WorkflowState;
+      readonly diagnostic: GitHubTrackerDiagnostic;
+    }>;
+export type GitHubIssueProjectionStatusResult =
+  | Readonly<{
+      readonly disposition: "current" | "remote-version-changed" | "external-closed";
+      readonly state: WorkflowState;
+      readonly reference: TrackerReference;
+      readonly issue: GitHubIssue;
+    }>
+  | Readonly<{ readonly disposition: "not-mapped"; readonly state: WorkflowState }>
+  | Readonly<{ readonly disposition: "deleted"; readonly state: WorkflowState }>
   | Readonly<{
       readonly disposition: "sync-conflict";
       readonly state: WorkflowState;
@@ -195,6 +233,57 @@ export async function pushGitHubIssueProjection(
   return recordSynchronization(request, updated.issue, "updated");
 }
 
+export async function getGitHubIssueProjectionStatus(
+  request: GetGitHubIssueProjectionStatusRequest,
+): Promise<GitHubIssueProjectionStatusResult> {
+  const reference = latestGitHubReference(request.state);
+  if (reference === undefined) {
+    return Object.freeze({ disposition: "not-mapped", state: request.state });
+  }
+  const read = await readIssue(request.tracker, reference);
+  if (read.kind === "diagnostic") {
+    return Object.freeze({
+      disposition: "diagnostic",
+      state: request.state,
+      diagnostic: read.diagnostic,
+    });
+  }
+  if (read.issue === null) {
+    return Object.freeze({ disposition: "deleted", state: request.state });
+  }
+  const identity = issueIdentity(read.issue);
+  if (read.issue.state === "closed") {
+    return Object.freeze({
+      disposition:
+        identity === reference.identity && read.issue.version === reference.observedVersion
+          ? "current"
+          : "external-closed",
+      state: request.state,
+      reference,
+      issue: read.issue,
+    });
+  }
+  if (identity !== reference.identity) {
+    return Object.freeze({
+      disposition: "sync-conflict",
+      state: request.state,
+      conflict: Object.freeze({
+        expectedVersion: reference.observedVersion,
+        observed: read.issue,
+        desired: renderGitHubIssueProjection(request.state),
+      }),
+    });
+  }
+  return Object.freeze({
+    disposition:
+      read.issue.version === reference.observedVersion
+        ? "current"
+        : "remote-version-changed",
+    state: request.state,
+    reference,
+    issue: read.issue,
+  });
+}
 export async function pullGitHubIssueProjection(
   request: PullGitHubIssueProjectionRequest,
 ): Promise<GitHubIssueProjectionResult> {
@@ -203,8 +292,8 @@ export async function pullGitHubIssueProjection(
     return repeated;
   }
 
-  const reference = latestGitHubReference(request.state);
-  if (reference === undefined) {
+  const status = await getGitHubIssueProjectionStatus(request);
+  if (status.disposition === "not-mapped") {
     return withDiagnostic(request.state, {
       code: "github.not_mapped",
       message: "The local Task has no mapped GitHub Issue to pull.",
@@ -212,37 +301,103 @@ export async function pullGitHubIssueProjection(
       recoverable: true,
     });
   }
-
-  const read = await readIssue(request.tracker, reference);
-  if (read.kind === "diagnostic") {
-    return withDiagnostic(request.state, read.diagnostic);
-  }
-  if (read.issue === null) {
+  if (status.disposition === "deleted") {
     return withDiagnostic(request.state, issueDeletedDiagnostic());
   }
-
-  const observedIdentity = issueIdentity(read.issue);
-  if (read.issue.state === "closed") {
-    if (
-      observedIdentity === reference.identity &&
-      read.issue.version === reference.observedVersion
-    ) {
-      return Object.freeze({ disposition: "unchanged", state: request.state });
-    }
-    return recordSynchronization(request, read.issue, "external_closed");
+  if (status.disposition === "diagnostic") {
+    return withDiagnostic(request.state, status.diagnostic);
   }
-  if (observedIdentity !== reference.identity) {
+  if (status.disposition === "sync-conflict") {
+    return Object.freeze({
+      disposition: "sync-conflict",
+      state: request.state,
+      conflict: status.conflict,
+    });
+  }
+  if (status.disposition === "current") {
+    return Object.freeze({ disposition: "unchanged", state: request.state });
+  }
+  return recordSynchronization(
+    request,
+    status.issue,
+    status.disposition === "external-closed" ? "external_closed" : "observed",
+  );
+}
+export async function resolveGitHubIssueProjectionConflict(
+  request: ResolveGitHubIssueProjectionConflictRequest,
+): Promise<GitHubIssueProjectionResult> {
+  const repeated = repeatedSynchronization(request.state, request.event);
+  if (repeated !== null) {
+    return repeated;
+  }
+  if (request.event.actor.kind !== "user") {
+    return withDiagnostic(request.state, {
+      code: "github.resolution_not_authorized",
+      message: "GitHub synchronization conflict resolution requires an attributable user decision.",
+      remediation: "Resubmit the selected resolution with user Event metadata.",
+      recoverable: true,
+    });
+  }
+  const reference = latestGitHubReference(request.state);
+  const desired = renderGitHubIssueProjection(request.state);
+  if (
+    reference === undefined ||
+    request.conflict.expectedVersion !== reference.observedVersion ||
+    projectionIdentity(request.conflict.desired) !== projectionIdentity(desired) ||
+    !isGitHubIssue(request.conflict.observed) ||
+    request.conflict.observed.externalId !== reference.externalId
+  ) {
+    return withDiagnostic(request.state, {
+      code: "github.local_state_stale",
+      message: "The supplied GitHub conflict no longer matches the mapped local Task state.",
+      remediation: "Reload GitHub Issue status and resolve the current conflict with a new user Event.",
+      recoverable: true,
+    });
+  }
+  const current = await readIssue(request.tracker, reference);
+  if (current.kind === "diagnostic") {
+    return withDiagnostic(request.state, current.diagnostic);
+  }
+  if (current.issue === null) {
+    return withDiagnostic(request.state, issueDeletedDiagnostic());
+  }
+  if (
+    current.issue.version !== request.conflict.observed.version ||
+    issueIdentity(current.issue) !== issueIdentity(request.conflict.observed)
+  ) {
     return conflict(
       request.state,
       reference.observedVersion,
-      read.issue,
-      renderGitHubIssueProjection(request.state),
+      current.issue,
+      desired,
     );
   }
-  if (read.issue.version === reference.observedVersion) {
-    return Object.freeze({ disposition: "unchanged", state: request.state });
+  if (request.resolution === "keep-observed") {
+    return recordSynchronization(request, current.issue, "resolved_remote");
   }
-  return recordSynchronization(request, read.issue, "observed");
+  const updated = await updateIssue(
+    request.tracker,
+    Object.freeze({
+      ...reference,
+      observedVersion: current.issue.version,
+      identity: issueIdentity(current.issue),
+    }),
+    desired,
+    request.event.idempotencyKey,
+  );
+  if (updated.kind === "diagnostic") {
+    return withDiagnostic(request.state, updated.diagnostic);
+  }
+  if (updated.conflict !== null) {
+    return conflict(request.state, current.issue.version, updated.conflict, desired);
+  }
+  if (updated.issue === null) {
+    return withDiagnostic(request.state, issueDeletedDiagnostic());
+  }
+  if (issueIdentity(updated.issue) !== projectionIdentity(desired)) {
+    return conflict(request.state, current.issue.version, updated.issue, desired);
+  }
+  return recordSynchronization(request, updated.issue, "resolved_local");
 }
 
 function repeatedSynchronization(
@@ -378,7 +533,10 @@ async function updateIssue(
 }
 
 function recordSynchronization(
-  request: PushGitHubIssueProjectionRequest | PullGitHubIssueProjectionRequest,
+  request:
+    | PushGitHubIssueProjectionRequest
+    | PullGitHubIssueProjectionRequest
+    | ResolveGitHubIssueProjectionConflictRequest,
   issue: GitHubIssue,
   change: TrackerSynchronizationChange,
 ): GitHubIssueProjectionResult {
@@ -407,6 +565,13 @@ function successFromRecorded(
   if (change === "external_closed") {
     return Object.freeze({
       disposition: "external-closed",
+      state: recorded.state,
+      event: recorded.event,
+    });
+  }
+  if (change === "resolved_local" || change === "resolved_remote") {
+    return Object.freeze({
+      disposition: change === "resolved_local" ? "resolved-local" : "resolved-remote",
       state: recorded.state,
       event: recorded.event,
     });
@@ -602,7 +767,13 @@ function isCredentialFreeAbsoluteUri(value: unknown): value is string {
   }
   try {
     const uri = new URL(value);
-    return uri.username.length === 0 && uri.password.length === 0;
+    return (
+      (uri.protocol === "http:" || uri.protocol === "https:") &&
+      uri.username.length === 0 &&
+      uri.password.length === 0 &&
+      uri.search.length === 0 &&
+      uri.hash.length === 0
+    );
   } catch {
     return false;
   }

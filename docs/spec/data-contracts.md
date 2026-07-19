@@ -191,6 +191,9 @@ Representative Event types include task creation, Route classification, Route es
 - `external_closed` records a remotely closed Issue without completing, archiving, or otherwise transitioning the local Task.
 - Core records a Tracker Event only after the remote operation is confirmed. Permission denial, rate limiting, an unknown outcome, deleted Issue, or version conflict leaves local Event history unchanged and returns a recoverable diagnostic.
 - A remote body, title, or state change that conflicts with the mapped content identity is data-only conflict material; it cannot alter local Task state without an accepted local Event.
+- `status` is read-only. An explicit conflict resolution requires user-attributed Event metadata: `resolved_local` conditionally reapplies the local projection against the observed remote version, while `resolved_remote` records the confirmed remote reference without changing local Task state. Event history retains the prior mapped version and the user-selected resolution.
+- Persisted Tracker reference URIs permit only HTTP(S) origin and path: userinfo, query, and fragment content are rejected so tokens and other secrets cannot enter Events or Projections.
+
 
 
 ## 6. Context Manifest

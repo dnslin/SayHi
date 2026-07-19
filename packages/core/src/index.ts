@@ -33,8 +33,10 @@ import {
   resolveMarkdownTrackerConflict,
 } from "./markdown-tracker.js";
 import {
+  getGitHubIssueProjectionStatus,
   pullGitHubIssueProjection,
   pushGitHubIssueProjection,
+  resolveGitHubIssueProjectionConflict,
 } from "./github-tracker.js";
 import {
   readRouteDefinition,
@@ -188,14 +190,19 @@ export type {
 } from "./markdown-tracker.js";
 export {
   GITHUB_TRACKER_CONTRACT_VERSION,
+  getGitHubIssueProjectionStatus,
   pullGitHubIssueProjection,
   pushGitHubIssueProjection,
+  resolveGitHubIssueProjectionConflict,
 } from "./github-tracker.js";
 export type {
   GitHubIssue,
+  GetGitHubIssueProjectionStatusRequest,
+  GitHubIssueConflictResolution,
   GitHubIssueMutationResult,
   GitHubIssueProjection,
   GitHubIssueProjectionResult,
+  GitHubIssueProjectionStatusResult,
   GitHubIssueReadResult,
   GitHubIssueReference,
   GitHubIssueState,
@@ -204,6 +211,7 @@ export type {
   GitHubTrackerDiagnosticCode,
   GitHubTrackerFailureCode,
   GitHubTrackerPort,
+  ResolveGitHubIssueProjectionConflictRequest,
   PullGitHubIssueProjectionRequest,
   PushGitHubIssueProjectionRequest,
 } from "./github-tracker.js";
@@ -620,6 +628,8 @@ export interface CoreContract {
   readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
   readonly pushGitHubIssueProjection: typeof pushGitHubIssueProjection;
   readonly pullGitHubIssueProjection: typeof pullGitHubIssueProjection;
+  readonly getGitHubIssueProjectionStatus: typeof getGitHubIssueProjectionStatus;
+  readonly resolveGitHubIssueProjectionConflict: typeof resolveGitHubIssueProjectionConflict;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -694,6 +704,8 @@ export const coreContract: CoreContract = Object.freeze({
   resolveMarkdownTrackerConflict,
   pushGitHubIssueProjection,
   pullGitHubIssueProjection,
+  getGitHubIssueProjectionStatus,
+  resolveGitHubIssueProjectionConflict,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,

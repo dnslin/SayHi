@@ -272,6 +272,30 @@ test("Core reports concurrent GitHub projection edits without replacing local Ta
   assert.equal(conflict.state.projection.phase, "explore");
   assert.equal(conflict.state.events.length, local.events.length);
   assert.equal(tracker.issue?.title, "Manual GitHub title");
+  const status = await coreContract.getGitHubIssueProjectionStatus({
+    state: local,
+    tracker,
+  });
+  assert.equal(status.disposition, "sync-conflict");
+  if (status.disposition !== "sync-conflict") {
+    return;
+  }
+  const resolved = await coreContract.resolveGitHubIssueProjectionConflict({
+    state: local,
+    tracker,
+    conflict: status.conflict,
+    resolution: "use-local",
+    event: {
+      ...eventMetadata("RESOLVE", "2026-07-19T12:02:00Z"),
+      actor: { kind: "user", id: "maintainer", sessionRef: "session-32" },
+    },
+  });
+  assert.equal(resolved.disposition, "resolved-local");
+  if (resolved.disposition === "resolved-local") {
+    assert.equal(resolved.event.change, "resolved_local");
+    assert.match(tracker.issue?.body ?? "", /- Phase: `explore`/u);
+    assert.notEqual(tracker.issue?.title, "Manual GitHub title");
+  }
 });
 
 test("Core records external GitHub closure without completing the local Task", async () => {
@@ -342,6 +366,26 @@ test("Core returns recoverable diagnostics for GitHub permission, rate-limit, an
   }
 
   tracker.failure = null;
+  const issue = tracker.issue;
+  assert.notEqual(issue, null);
+  if (issue === null) {
+    return;
+  }
+  tracker.issue = {
+    ...issue,
+    uri: "https://github.com/dnslin/sayhi/issues/42?access_token=secret",
+  };
+  const unsafeUri = await coreContract.pullGitHubIssueProjection({
+    state: created.state,
+    tracker,
+    event: eventMetadata("PULL-UNSAFE-URI", "2026-07-19T12:03:30Z"),
+  });
+  assert.equal(unsafeUri.disposition, "diagnostic");
+  if (unsafeUri.disposition === "diagnostic") {
+    assert.equal(unsafeUri.diagnostic.code, "github.invalid_response");
+    assert.equal(unsafeUri.state, created.state);
+  }
+
   tracker.issue = null;
   const deleted = await coreContract.pullGitHubIssueProjection({
     state: created.state,

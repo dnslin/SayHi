@@ -295,7 +295,9 @@ export type TrackerSynchronizationChange =
   | "created"
   | "updated"
   | "observed"
-  | "external_closed";
+  | "external_closed"
+  | "resolved_local"
+  | "resolved_remote";
 export interface TrackerReference {
   readonly id: string;
   readonly adapter: string;
@@ -2568,7 +2570,20 @@ function validateTrackerSynchronizationRequest(
       "Tracker synchronization requires a credential-free, versioned external reference.",
     );
   }
-  return validateEventMetadata(request.event, "$.event");
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return eventDiagnostic;
+  }
+  if (
+    (request.change === "resolved_local" || request.change === "resolved_remote") &&
+    request.event.actor.kind !== "user"
+  ) {
+    return invalidRequest(
+      "$.event.actor.kind",
+      "Tracker conflict resolution must be attributable to a user.",
+    );
+  }
+  return null;
 }
 function validateBuildPlanChangeRequest(
   state: WorkflowState,
@@ -4788,7 +4803,9 @@ function isTrackerSynchronizationChange(
     value === "created" ||
     value === "updated" ||
     value === "observed" ||
-    value === "external_closed"
+    value === "external_closed" ||
+    value === "resolved_local" ||
+    value === "resolved_remote"
   );
 }
 function isTrackerReference(value: unknown): value is TrackerReference {
@@ -4816,7 +4833,13 @@ function isCredentialFreeAbsoluteUri(value: unknown): value is string {
   }
   try {
     const uri = new URL(value);
-    return uri.username.length === 0 && uri.password.length === 0;
+    return (
+      (uri.protocol === "http:" || uri.protocol === "https:") &&
+      uri.username.length === 0 &&
+      uri.password.length === 0 &&
+      uri.search.length === 0 &&
+      uri.hash.length === 0
+    );
   } catch {
     return false;
   }
