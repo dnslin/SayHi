@@ -334,6 +334,7 @@ Standards Review and Spec Review Capability Contracts MUST have `read-only` repo
 For an active Build Phase, Core accepts a `phase_execution_dispatched` Workflow Event that binds the exact approved Plan identity to the complete dispatch binding, including Context Manifest, Phase Agent Capability Contract, and ordered locked Skill identities. Core accepts at most one result for that dispatch as a `phase_execution_result_accepted` Event.
 
 On resume, Core MUST load the bound Plan evidence and revalidate the live Context Manifest, Capability Contract, and Skill materials against the durable binding before work continues or an accepted result returns. A changed or missing Plan, Context, Agent capability, or Skill MUST append a same-Phase Block Event using caller-supplied Event metadata and return a review-required disposition with its actionable diagnostic. When every identity is unchanged and a result is already accepted, resume returns that result and MUST NOT dispatch the Phase Agent again.
+A successful Phase dispatch holds an opaque runtime shared-checkout Reader Lease scoped to its dispatch ID before it returns ready. Promotion and every other shared-checkout Writer MUST wait for all such leases to end. Recording an accepted Phase result releases its exact Lease after validation. Resume and recovery MUST supply the exact Lease as an attributable handoff that the caller has stopped the prior Phase Agent; a missing or mismatched Lease MUST fail without reclaiming an active Reader.
 
 ## 11. Evidence
 
@@ -437,6 +438,8 @@ Local state changes based on an External Reference require a local Event. Remote
 ```
 
 `contentHash` covers the proposed knowledge content, while `taskId`, `evidence`, and `createdBy` retain provenance. `targetIdentity` snapshots an existing target or is `null` when the target was absent. Any later target appearance, removal, type change, or content change makes the Candidate stale and requires revision. Human review changes only the Candidate status to `accepted`, `rejected`, or `revision-requested` and records reviewer, reason, and timestamp; it MUST NOT change the target. A later human-authorized promotion Event may change Approved knowledge, record promotion provenance, and invalidate affected Context Manifests.
+
+A Promotion Event is an immutable record containing an attributable `user` Event, the requested `candidateHash`, a complete Candidate snapshot (including source Task, Evidence, and review), the target's prior and new content identities, and the exact active Context Manifests bound to that target. Core accepts it only when the snapshot Candidate remains `accepted`, its review is `approved`, and the supplied hash equals its immutable `contentHash`; it never rewrites the Candidate. A later Promotion Event records the prior target Promotion Event ids in `supersedes`. Core stages the record and replacement content in `.sayhi/.runtime/knowledge-promotion.json` before mutation; recovery observes the target's before or after identity before finishing the approval registry and immutable Event. The V1 adapters promote `update-spec` Candidates under `.sayhi/spec/`, `update-adr` Candidates under `docs/adr/`, `update-domain` Candidates targeting `CONTEXT.md`, and `update-runbook` Candidates under `docs/runbooks/`.
 
 ## 15. Skill Lock
 

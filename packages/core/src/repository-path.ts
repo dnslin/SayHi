@@ -8,3 +8,10 @@ export function isRepositoryRelativePath(value: unknown): value is string {
     !value.split("/").includes("..")
   );
 }
+
+export function canonicalRepositoryRelativePath(path: string): string {
+  return path
+    .split("/")
+    .filter((segment) => segment.length > 0 && segment !== ".")
+    .join("/");
+}

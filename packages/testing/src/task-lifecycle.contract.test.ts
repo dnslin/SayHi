@@ -24,6 +24,8 @@ import {
   type WorkflowLifecycle,
   type WorkflowPhase,
   type WorkflowState,
+  type TaskWriter,
+  type SharedCheckoutReaderLease,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -66,6 +68,7 @@ class MemoryTaskLifecycleFileSystem implements TaskArchiveFileSystem {
   #failNextWritePath: string | null = null;
   #failNextMove = false;
   readonly #lockTails = new Map<string, Promise<void>>();
+  readonly #readerLeases = new Map<string, string>();
 
   failNextWrite(path: string): void {
     this.#failNextWritePath = path;
@@ -159,6 +162,59 @@ class MemoryTaskLifecycleFileSystem implements TaskArchiveFileSystem {
       this.files.set(`${target}${path.slice(source.length)}`, content);
     }
   }
+  async withWriterMutationLock<Result>(
+    operation: (writer: TaskWriter) => Promise<Result>,
+  ): Promise<Result> {
+    return operation({ writeFile: (path, content) => this.writeFile(path, content) });
+  }
+
+  async acquireSharedCheckoutReaderLease(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<void> {
+    const existing = this.#readerLeases.get(lease.dispatchId);
+    if (existing !== undefined && existing !== lease.token) {
+      throw new Error("Reader Lease ownership changed.");
+    }
+    this.#readerLeases.set(lease.dispatchId, lease.token);
+  }
+  async acquireSharedCheckoutReaderLeaseFromWriter(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<void> {
+    await this.acquireSharedCheckoutReaderLease(lease);
+  }
+
+  async assertSharedCheckoutReaderLease(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<void> {
+    const existing = this.#readerLeases.get(lease.dispatchId);
+    if (existing === undefined) {
+      throw new Error("Reader Lease is missing.");
+    }
+    if (existing !== lease.token) {
+      throw new Error("Reader Lease ownership changed.");
+    }
+  }
+
+  async releaseSharedCheckoutReaderLease(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<void> {
+    await this.assertSharedCheckoutReaderLease(lease);
+    this.#readerLeases.delete(lease.dispatchId);
+  }
+  async releaseSharedCheckoutReaderLeaseIfPresent(
+    lease: SharedCheckoutReaderLease,
+  ): Promise<boolean> {
+    const existing = this.#readerLeases.get(lease.dispatchId);
+    if (existing === undefined) {
+      return false;
+    }
+    if (existing !== lease.token) {
+      throw new Error("Reader Lease ownership changed.");
+    }
+    this.#readerLeases.delete(lease.dispatchId);
+    return true;
+  }
+
 
   async withTaskMutationLock<Result>(
     path: string,
@@ -1379,6 +1435,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    readerLease: prepared.readerLease,
     blockEvent: resumeBlockEvent("READY", "2026-07-17T10:01:45Z"),
   });
   assert.equal(resumed.ok, true);
@@ -1408,6 +1465,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
   const accepted = await coreContract.recordDurablePhaseExecutionResult({
     fileSystem,
     taskId: TASK_ID,
+    readerLease: prepared.readerLease,
     result,
     event: taskLifecycleEventMetadata(
       TASK_FIXTURE,
@@ -1419,11 +1477,33 @@ test("Build resume returns an accepted Agent result without dispatching it again
   if (!accepted.ok) {
     return;
   }
+  await fileSystem.acquireSharedCheckoutReaderLease(prepared.readerLease);
+  const retried = await coreContract.recordDurablePhaseExecutionResult({
+    fileSystem,
+    taskId: TASK_ID,
+    readerLease: prepared.readerLease,
+    result,
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "PHASE-RESULT-ACCEPTED",
+      "2026-07-17T10:02:00Z",
+    ),
+  });
+  if (!retried.ok) {
+    assert.fail(retried.diagnostics[0]?.message ?? "Accepted result retry failed");
+  }
+  assert.equal(retried.ok, true);
+  await assert.rejects(
+    fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease),
+    /missing/u,
+  );
+  await fileSystem.acquireSharedCheckoutReaderLease(prepared.readerLease);
 
   const completed = await coreContract.resumeDurablePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    readerLease: prepared.readerLease,
     blockEvent: resumeBlockEvent("COMPLETED", "2026-07-17T10:02:15Z"),
   });
   assert.equal(completed.ok, true);
@@ -1433,6 +1513,10 @@ test("Build resume returns an accepted Agent result without dispatching it again
   assert.equal(completed.status, "completed");
   assert.deepEqual(completed.result, result);
   assert.equal(completed.state.events.length, accepted.state.events.length);
+  await assert.rejects(
+    fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease),
+    /missing/u,
+  );
 
   const drifted = await coreContract.resumeDurablePhaseExecution({
     fileSystem,
@@ -1446,6 +1530,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
         },
       ],
     },
+    readerLease: prepared.readerLease,
     blockEvent: resumeBlockEvent("DRIFTED", "2026-07-17T10:02:30Z"),
   });
   assert.equal(drifted.ok, true);
@@ -1474,6 +1559,7 @@ test("Build resume rejects modified approved Plan evidence", async () => {
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    readerLease: prepared.readerLease,
     blockEvent: resumeBlockEvent("PLAN", "2026-07-17T10:02:45Z"),
   });
   assert.equal(resumed.ok, true);
@@ -1490,6 +1576,7 @@ test("Build dispatch rejects a mismatched Plan Manifest outside Implement", asyn
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "PHASE-REVIEW-IMPLEMENTED",
     "2026-07-17T10:01:45Z",
   );
@@ -1579,6 +1666,7 @@ test("Build dispatch rejects an Agent for a different active Phase", async () =>
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "PHASE-CROSS-PHASE-IMPLEMENTED",
     "2026-07-17T10:01:45Z",
   );
@@ -1657,6 +1745,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
   const accepted = await coreContract.recordDurablePhaseExecutionResult({
     fileSystem,
     taskId: TASK_ID,
+    readerLease: prepared.readerLease,
     result,
     event: taskLifecycleEventMetadata(
       TASK_FIXTURE,
@@ -1741,6 +1830,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    readerLease: prepared.readerLease,
     blockEvent: resumeBlockEvent("REPAIR", "2026-07-17T10:02:45Z"),
   });
   assert.equal(resumed.ok, false);
@@ -1751,6 +1841,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
   const stale = await coreContract.recordDurablePhaseExecutionResult({
     fileSystem,
     taskId: TASK_ID,
+    readerLease: prepared.readerLease,
     result,
     event: taskLifecycleEventMetadata(
       TASK_FIXTURE,
@@ -1788,6 +1879,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
+    readerLease: fresh.readerLease,
     blockEvent: resumeBlockEvent("RESTARTED", "2026-07-17T10:03:30Z"),
   });
   assert.equal(restarted.ok, true);
@@ -1840,6 +1932,7 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
       fileSystem,
       taskId: TASK_ID,
       materials: driftCase.mutate(prepared.materials),
+      readerLease: prepared.readerLease,
       blockEvent: resumeBlockEvent(
         `DRIFT-${driftCase.name.replaceAll(" ", "-")}`,
         "2026-07-17T10:02:30Z",
@@ -1850,17 +1943,29 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
       assert.equal(resumed.status, "blocked", driftCase.name);
       assert.equal(resumed.diagnostics[0]?.code, driftCase.code);
       assert.equal(resumed.reviewRequired, true);
+      if (resumed.status === "blocked") {
+        assert.deepEqual(resumed.readerLease, prepared.readerLease);
+        await fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease);
+      }
     }
   }
 });
 test("Build cannot enter Review before an accepted Implementation result", async () => {
   const fileSystem = new MemoryTaskLifecycleFileSystem();
-  await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-21-IMPLEMENT-GATE");
-  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  const prepared = await dispatchApprovedBuildPhase(
+    fileSystem,
+    "DISPATCH-21-IMPLEMENT-GATE",
+  );
+  const recovered = await recoverDurableTask({
+    fileSystem,
+    taskId: TASK_ID,
+    readerLease: prepared.readerLease,
+  });
   assert.equal(recovered.ok, true);
   if (!recovered.ok) {
     return;
   }
+  await fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease);
 
   const rejected = await advanceDurableTask({
     fileSystem,
@@ -1887,6 +1992,7 @@ test("Build cannot finish Review before both review axes accept it", async () =>
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "REVIEW-GATE-IMPLEMENTED",
     "2026-07-17T10:04:15Z",
   );
@@ -1936,6 +2042,7 @@ test("Build enters Repair only for blocking Review findings", async () => {
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "REPAIR-GATE-IMPLEMENTED",
     "2026-07-17T10:05:00Z",
   );
@@ -2081,6 +2188,7 @@ test("Build Review dispatch requires the Implementation final fingerprint", asyn
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "REVIEW-FINGERPRINT-IMPLEMENTED",
     "2026-07-17T10:07:15Z",
   );
@@ -2149,6 +2257,7 @@ test("Build blocks when configured Review repair attempts are exhausted", async 
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "REPAIR-EXHAUSTED-IMPLEMENTED",
     "2026-07-17T10:08:15Z",
   );
@@ -2250,6 +2359,7 @@ test("durable Build rejects a mismatched Review result before appending it", asy
   await recordSucceededImplementation(
     fileSystem,
     prepared.execution,
+    prepared.readerLease,
     "REVIEW-INVALID-EVIDENCE-IMPLEMENTED",
     "2026-07-17T10:09:30Z",
   );
@@ -2292,8 +2402,9 @@ test("durable Build rejects a mismatched Review result before appending it", asy
     "REVIEW-INVALID-EVIDENCE-STANDARDS",
     "2026-07-17T10:10:00Z",
   );
-  await assert.rejects(
-    recordReviewResult(
+  let failedReaderLease: SharedCheckoutReaderLease | undefined;
+  try {
+    await recordReviewResult(
       fileSystem,
       prepared,
       state,
@@ -2312,10 +2423,29 @@ test("durable Build rejects a mismatched Review result before appending it", asy
       "REVIEW-INVALID-EVIDENCE-SPEC",
       "2026-07-17T10:10:15Z",
       `sha256:${"e".repeat(64)}`,
-    ),
-    /Build Review results must assess the same frozen Implementation fingerprint/,
-  );
-  const after = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+    );
+    assert.fail("Mismatched Review result unexpectedly succeeded.");
+  } catch (error) {
+    assert.match(
+      error instanceof Error ? error.message : "",
+      /Build Review results must assess the same frozen Implementation fingerprint/,
+    );
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "readerLease" in error &&
+      typeof error.readerLease === "object" &&
+      error.readerLease !== null
+    ) {
+      failedReaderLease = error.readerLease as SharedCheckoutReaderLease;
+    }
+  }
+  assert.ok(failedReaderLease);
+  const after = await recoverDurableTask({
+    fileSystem,
+    taskId: TASK_ID,
+    readerLease: failedReaderLease,
+  });
   assert.equal(after.ok, true);
   if (after.ok) {
     assert.equal(after.state.projection.lifecycle, "active");
@@ -2331,17 +2461,14 @@ test("Bound Writer blocks invalid capability material with a deterministic Event
     fileSystem,
     "DISPATCH-21-BOUND-WRITER",
   );
-  const before = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
-  assert.equal(before.ok, true);
-  if (!before.ok) {
-    return;
-  }
+  const before = Object.freeze({ state: prepared.state });
   let entered = false;
   const blocked = await coreContract.withBoundDurableTaskWriter({
     fileSystem: fileSystem as unknown as Parameters<
       typeof coreContract.withBoundDurableTaskWriter
     >[0]["fileSystem"],
     taskId: TASK_ID,
+    readerLease: prepared.readerLease,
     materials: {
       ...prepared.materials,
       agentContract: {
@@ -2358,7 +2485,11 @@ test("Bound Writer blocks invalid capability material with a deterministic Event
     assert.equal(blocked.diagnostics[0]?.code, "execution.agent_invalid");
   }
   assert.equal(entered, false);
-  const recovered = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  const recovered = await recoverDurableTask({
+    fileSystem,
+    taskId: TASK_ID,
+    readerLease: prepared.readerLease,
+  });
   assert.equal(recovered.ok, true);
   if (!recovered.ok) {
     return;
@@ -2375,12 +2506,14 @@ test("Bound Writer blocks invalid capability material with a deterministic Event
 async function recordSucceededImplementation(
   fileSystem: MemoryTaskLifecycleFileSystem,
   execution: BindPhaseExecutionRequest,
+  readerLease: SharedCheckoutReaderLease,
   suffix: string,
   occurredAt: string,
 ): Promise<void> {
   const accepted = await coreContract.recordDurablePhaseExecutionResult({
     fileSystem,
     taskId: TASK_ID,
+    readerLease,
     result: {
       schemaVersion: 1,
       dispatchId: execution.dispatch.dispatchId,
@@ -2593,5 +2726,7 @@ async function dispatchApprovedBuildPhase(
       agentContract: execution.agentContract,
       skills: execution.skills,
     },
+    state: dispatched.state,
+    readerLease: dispatched.readerLease,
   };
 }

@@ -547,10 +547,32 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
   if (!dispatched.ok) {
     assert.fail(dispatched.diagnostics[0]?.message ?? "Implementation dispatch failed");
   }
+  let writerEntered = false;
+  const blockedWriter = fileSystem.withWriterMutationLock(async () => {
+    writerEntered = true;
+  });
+  await delay(25);
+  assert.equal(writerEntered, false);
+  await fileSystem.releaseSharedCheckoutReaderLease(dispatched.readerLease);
+  await blockedWriter;
+  assert.equal(writerEntered, true);
+  const missingLease = await withBoundDurableTaskWriter({
+    fileSystem,
+    taskId: TASK_ID,
+    materials,
+    readerLease: dispatched.readerLease,
+    operation: async () => undefined,
+  });
+  assert.equal(missingLease.ok, false);
+  if (!missingLease.ok) {
+    assert.equal(missingLease.diagnostics[0]?.code, "task_lifecycle.io_failed");
+  }
+  await fileSystem.acquireSharedCheckoutReaderLease(dispatched.readerLease);
   const outOfScope = await withBoundDurableTaskWriter({
     fileSystem,
     taskId: TASK_ID,
     materials,
+    readerLease: dispatched.readerLease,
     operation: async (writer) => {
       await writer.writeFile("README.md", "outside approved scope\n");
     },
@@ -559,11 +581,13 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
   if (!outOfScope.ok) {
     assert.equal(outOfScope.diagnostics[0]?.code, "task_lifecycle.writer.scope");
   }
+  await fileSystem.assertSharedCheckoutReaderLease(dispatched.readerLease);
   await assert.rejects(readFile(join(repository, "README.md"), "utf8"));
   const admitted = await withBoundDurableTaskWriter({
     fileSystem,
     taskId: TASK_ID,
     materials,
+    readerLease: dispatched.readerLease,
     operation: async (writer) => {
       await writer.writeFile("packages/core/admitted.ts", "export {};\n");
     },
@@ -581,11 +605,41 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
     "Drifted implementation context.\n",
     "utf8",
   );
+  const staleDispatch = await dispatchDurablePhaseExecution({
+    fileSystem,
+    planIdentity: recorded.plan.identity,
+    execution: {
+      contractVersion: 1,
+      dispatch: {
+        schemaVersion: 1,
+        dispatchId: "WRITER-SEAL-STALE-DISPATCH",
+        taskId: TASK_ID,
+        expectedTaskVersion: dispatched.state.projection.version,
+        phase: "implement",
+        agentRole: "implementation",
+        baseFingerprint: `sha256:${"d".repeat(64)}`,
+        requestedAt: "2026-07-15T10:05:45Z",
+        contextManifestIdentity: recorded.plan.contextManifestIdentity,
+        agentContractIdentity: IMPLEMENTATION_AGENT.contractIdentity,
+      },
+      ...materials,
+    },
+    event: taskLifecycleEventMetadata(
+      TASK_FIXTURE,
+      "WRITER-SEAL-STALE-DISPATCH",
+      "2026-07-15T10:05:50Z",
+    ),
+  });
+  assert.equal(staleDispatch.ok, false);
+  if (!staleDispatch.ok) {
+    assert.equal(staleDispatch.diagnostics[0]?.code, "build_plan.context_stale");
+  }
   let staleWriterEntered = false;
   const staleWriter = await withBoundDurableTaskWriter({
     fileSystem,
     taskId: TASK_ID,
     materials,
+    readerLease: dispatched.readerLease,
     operation: async (writer) => {
       staleWriterEntered = true;
       await writer.writeFile("packages/core/after-drift.ts", "export {};\n");
@@ -599,7 +653,19 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
   await assert.rejects(
     readFile(join(repository, "packages", "core", "after-drift.ts"), "utf8"),
   );
-  const replanned = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  const unfencedRecovery = await recoverDurableTask({ fileSystem, taskId: TASK_ID });
+  assert.equal(unfencedRecovery.ok, false);
+  if (!unfencedRecovery.ok) {
+    assert.match(
+      unfencedRecovery.diagnostics[0]?.message ?? "",
+      /fenced Reader Lease/u,
+    );
+  }
+  const replanned = await recoverDurableTask({
+    fileSystem,
+    taskId: TASK_ID,
+    readerLease: dispatched.readerLease,
+  });
   assert.equal(replanned.ok, true);
   if (replanned.ok) {
     assert.equal(replanned.state.projection.phase, "plan");
@@ -1085,6 +1151,33 @@ test("Node Writer serializes concurrent mutation attempts", async (t) => {
   const rejected = results.find((result) => !result.ok);
   assert.ok(rejected && !rejected.ok);
   assert.equal(rejected.diagnostics[0]?.code, "task_lifecycle.baseline.drift");
+});
+
+test("Node reader leases admit a read wave and reject a stale lease token", async (t) => {
+  const { repository, fileSystem } = await createTaskRepository();
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  const first = Object.freeze({ dispatchId: "DISPATCH-READER-FIRST", token: "token-first" });
+  const second = Object.freeze({ dispatchId: "DISPATCH-READER-SECOND", token: "token-second" });
+  await Promise.all([
+    fileSystem.acquireSharedCheckoutReaderLease(first),
+    fileSystem.acquireSharedCheckoutReaderLease(second),
+  ]);
+  let writerEntered = false;
+  const writer = fileSystem.withWriterMutationLock(async () => {
+    writerEntered = true;
+  });
+  await delay(25);
+  assert.equal(writerEntered, false);
+  await assert.rejects(
+    fileSystem.releaseSharedCheckoutReaderLease({ ...first, token: "stale-token" }),
+    /ownership changed/u,
+  );
+  await fileSystem.releaseSharedCheckoutReaderLease(first);
+  await delay(25);
+  assert.equal(writerEntered, false);
+  await fileSystem.releaseSharedCheckoutReaderLease(second);
+  await writer;
+  assert.equal(writerEntered, true);
 });
 
 test("Node Writer never recovers a lock from PID liveness alone", async (t) => {

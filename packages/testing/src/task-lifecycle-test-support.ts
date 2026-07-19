@@ -8,7 +8,7 @@ import {
   recordDurableBuildPlan,
   dispatchDurablePhaseExecution,
   recordDurablePhaseExecutionResult,
-  type ContextManifestFileSystem,
+  type PhaseExecutionFileSystem,
   type AgentResultOutcome,
   type BindPhaseExecutionRequest,
   type ContractIdentity,
@@ -251,7 +251,7 @@ export function taskLifecycleTransition(
 
 export async function recordTestPhaseResult(
   request: Readonly<{
-    fileSystem: ContextManifestFileSystem;
+    fileSystem: PhaseExecutionFileSystem;
     fixture: TaskLifecycleFixture;
     planIdentity: ContractIdentity;
     contextManifestIdentity: ContractIdentity;
@@ -300,6 +300,7 @@ export async function recordTestPhaseResult(
   const result = await recordDurablePhaseExecutionResult({
     fileSystem: request.fileSystem,
     taskId: request.fixture.taskId,
+    readerLease: dispatched.readerLease,
     result: {
       schemaVersion: 1,
       dispatchId: dispatched.binding.dispatchId,
@@ -327,13 +328,16 @@ export async function recordTestPhaseResult(
     ),
   });
   if (!result.ok) {
-    throw new Error(result.diagnostics[0]?.message ?? "Phase result failed");
+    throw Object.assign(
+      new Error(result.diagnostics[0]?.message ?? "Phase result failed"),
+      { readerLease: dispatched.readerLease },
+    );
   }
   return result.state;
 }
 
 export async function createCompletedDurableTask(
-  fileSystem: ContextManifestFileSystem,
+  fileSystem: PhaseExecutionFileSystem,
   fixture: TaskLifecycleFixture,
   createdAt: string,
   transitionedAt: string,
@@ -349,7 +353,7 @@ export async function createCompletedDurableTask(
 }
 
 export async function completeDurableTask(
-  fileSystem: ContextManifestFileSystem,
+  fileSystem: PhaseExecutionFileSystem,
   fixture: TaskLifecycleFixture,
   initialState: WorkflowState,
   transitionedAt: string,
