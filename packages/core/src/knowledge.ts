@@ -661,11 +661,29 @@ async function prepareKnowledgeDirectories(
   return null;
 }
 
+export type RepositoryTargetIdentity =
+  | Readonly<{ kind: "file"; identity: ContentHash }>
+  | Readonly<{ kind: Exclude<ManagedProjectPathKind, "file">; identity: null }>;
+
+export async function readRepositoryTargetIdentity(
+  fileSystem: KnowledgeCandidateFileSystem,
+  target: string,
+): Promise<RepositoryTargetIdentity> {
+  const entry = await fileSystem.inspectRepositoryPath(target);
+  if (entry.kind !== "file") {
+    return Object.freeze({ kind: entry.kind, identity: null });
+  }
+  return Object.freeze({
+    kind: "file",
+    identity: hashTextContent(await fileSystem.readRepositoryFile(target)),
+  });
+}
+
 async function readTargetIdentity(
   fileSystem: KnowledgeCandidateFileSystem,
   target: string,
 ): Promise<Readonly<{ ok: true; identity: ContentHash | null }> | KnowledgeCandidateFailure> {
-  const entry = await fileSystem.inspectRepositoryPath(target);
+  const entry = await readRepositoryTargetIdentity(fileSystem, target);
   if (entry.kind === "missing") {
     return Object.freeze({ ok: true, identity: null });
   }
@@ -677,7 +695,7 @@ async function readTargetIdentity(
       "Choose a new target or repair the existing target path.",
     );
   }
-  return Object.freeze({ ok: true, identity: hashTextContent(await fileSystem.readRepositoryFile(target)) });
+  return Object.freeze({ ok: true, identity: entry.identity });
 }
 
 async function candidateDisposition(
