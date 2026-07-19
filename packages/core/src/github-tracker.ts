@@ -214,7 +214,36 @@ export async function pushGitHubIssueProjection(
   }
 
   if (reference.identity === projectionIdentity(projection)) {
-    return Object.freeze({ disposition: "unchanged", state: request.state });
+    const status = await getGitHubIssueProjectionStatus(request);
+    if (status.disposition === "not-mapped") {
+      return withDiagnostic(request.state, {
+        code: "github.local_state_stale",
+        message: "The mapped GitHub Issue reference disappeared before projection status could be confirmed.",
+        remediation: "Reload Task state and establish the current GitHub Issue mapping before retrying.",
+        recoverable: true,
+      });
+    }
+    if (status.disposition === "deleted") {
+      return withDiagnostic(request.state, issueDeletedDiagnostic());
+    }
+    if (status.disposition === "diagnostic") {
+      return withDiagnostic(request.state, status.diagnostic);
+    }
+    if (status.disposition === "sync-conflict") {
+      return Object.freeze({
+        disposition: "sync-conflict",
+        state: request.state,
+        conflict: status.conflict,
+      });
+    }
+    if (status.disposition === "current") {
+      return Object.freeze({ disposition: "unchanged", state: request.state });
+    }
+    return recordSynchronization(
+      request,
+      status.issue,
+      status.disposition === "external-closed" ? "external_closed" : "observed",
+    );
   }
 
   const updated = await updateIssue(
@@ -257,17 +286,6 @@ export async function getGitHubIssueProjectionStatus(
     return Object.freeze({ disposition: "deleted", state: request.state });
   }
   const identity = issueIdentity(read.issue);
-  if (read.issue.state === "closed") {
-    return Object.freeze({
-      disposition:
-        identity === reference.identity && read.issue.version === reference.observedVersion
-          ? "current"
-          : "external-closed",
-      state: request.state,
-      reference,
-      issue: read.issue,
-    });
-  }
   if (identity !== reference.identity) {
     return Object.freeze({
       disposition: "sync-conflict",
@@ -277,6 +295,17 @@ export async function getGitHubIssueProjectionStatus(
         observed: read.issue,
         desired: renderGitHubIssueProjection(request.state),
       }),
+    });
+  }
+  if (
+    read.issue.state === "closed" &&
+    reference.observedState !== "closed"
+  ) {
+    return Object.freeze({
+      disposition: "external-closed",
+      state: request.state,
+      reference,
+      issue: read.issue,
     });
   }
   return Object.freeze({
@@ -351,11 +380,13 @@ export async function resolveGitHubIssueProjectionConflict(
   const reference = latestGitHubReference(request.state);
   const desired = renderGitHubIssueProjection(request.state);
   if (
-    reference === undefined ||
-    request.conflict.expectedVersion !== reference.observedVersion ||
-    projectionIdentity(request.conflict.desired) !== projectionIdentity(desired) ||
     !isGitHubIssue(request.conflict.observed) ||
-    request.conflict.observed.externalId !== reference.externalId
+    projectionIdentity(request.conflict.desired) !== projectionIdentity(desired) ||
+    (reference === undefined
+      ? request.conflict.expectedVersion !== null
+      : request.conflict.expectedVersion !== reference.observedVersion) ||
+    (reference !== undefined &&
+      request.conflict.observed.externalId !== reference.externalId)
   ) {
     return withDiagnostic(request.state, {
       code: "github.local_state_stale",
@@ -364,7 +395,14 @@ export async function resolveGitHubIssueProjectionConflict(
       recoverable: true,
     });
   }
-  const current = await readIssue(request.tracker, reference);
+  const observedReference =
+    reference ??
+    referenceFor(
+      request.state.projection.id,
+      request.conflict.observed,
+      request.event.occurredAt,
+    );
+  const current = await readIssue(request.tracker, observedReference);
   if (current.kind === "diagnostic") {
     return withDiagnostic(request.state, current.diagnostic);
   }
@@ -377,7 +415,7 @@ export async function resolveGitHubIssueProjectionConflict(
   ) {
     return conflict(
       request.state,
-      reference.observedVersion,
+      observedReference.observedVersion,
       current.issue,
       desired,
     );
@@ -388,7 +426,7 @@ export async function resolveGitHubIssueProjectionConflict(
   const updated = await updateIssue(
     request.tracker,
     Object.freeze({
-      ...reference,
+      ...observedReference,
       observedVersion: current.issue.version,
       identity: issueIdentity(current.issue),
     }),
@@ -701,6 +739,14 @@ function issueDeletedDiagnostic(): GitHubTrackerDiagnostic {
 
 function renderGitHubIssueProjection(state: WorkflowState): GitHubIssueProjection {
   const { projection } = state;
+  let latestAuthorityEvent = state.events[0]!;
+  for (let index = state.events.length - 1; index >= 0; index -= 1) {
+    const event = state.events[index]!;
+    if (event.type !== "tracker_synchronized") {
+      latestAuthorityEvent = event;
+      break;
+    }
+  }
   const lines = [
     `<!-- sayhi-task:${encodeURIComponent(projection.id)} -->`,
     `# ${inline(projection.id)} — ${inline(projection.title)}`,
@@ -709,8 +755,8 @@ function renderGitHubIssueProjection(state: WorkflowState): GitHubIssueProjectio
     `- Lifecycle: \`${projection.lifecycle}\``,
     `- Phase: \`${projection.phase}\``,
     `- Step: \`${inline(projection.step)}\``,
-    `- Version: ${projection.version}`,
-    `- Updated: \`${inline(projection.updatedAt)}\``,
+    `- Version: ${latestAuthorityEvent.sequence}`,
+    `- Updated: \`${inline(latestAuthorityEvent.occurredAt)}\``,
   ];
   if (projection.lifecycle === "blocked") {
     lines.push("- Blockers:");
@@ -752,6 +798,7 @@ function referenceFor(taskId: string, issue: GitHubIssue, observedAt: string): T
     uri: issue.uri,
     externalId: issue.externalId,
     observedVersion: issue.version,
+    observedState: issue.state,
     role: "projection",
     identity: issueIdentity(issue),
     lastObservedAt: observedAt,
@@ -759,15 +806,11 @@ function referenceFor(taskId: string, issue: GitHubIssue, observedAt: string): T
 }
 
 function projectionIdentity(projection: GitHubIssueProjection): ContractIdentity {
-  return hashCanonicalJson(projection);
+  return hashCanonicalJson({ title: projection.title, body: projection.body });
 }
 
 function issueIdentity(issue: GitHubIssue): ContractIdentity {
-  return projectionIdentity({
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-  });
+  return hashCanonicalJson({ title: issue.title, body: issue.body });
 }
 
 function isGitHubIssue(value: unknown): value is GitHubIssue {

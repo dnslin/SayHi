@@ -304,6 +304,7 @@ export interface TrackerReference {
   readonly uri: string;
   readonly externalId: string;
   readonly observedVersion: string;
+  readonly observedState?: string;
   readonly role: string;
   readonly identity: ContractIdentity;
   readonly lastObservedAt: string;
@@ -4821,6 +4822,8 @@ function isTrackerReference(value: unknown): value is TrackerReference {
     value.externalId.length > 0 &&
     typeof value.observedVersion === "string" &&
     value.observedVersion.length > 0 &&
+    (value.observedState === undefined ||
+      (typeof value.observedState === "string" && value.observedState.length > 0)) &&
     typeof value.role === "string" &&
     value.role.length > 0 &&
     isContractIdentity(value.identity) &&

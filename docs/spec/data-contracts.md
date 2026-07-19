@@ -185,7 +185,7 @@ The manifest does not contain credentials, machine-specific absolute paths, or s
 Representative Event types include task creation, Route classification, Route escalation, artifact registration, context freeze, Gate acceptance, Phase transition, blocker creation/resolution, graph revision, Agent dispatch/result acceptance, review waiver, commit recording, external sync observation, knowledge decision, completion, cancellation, and archive.
 ### 5.2 Tracker synchronization
 
-`tracker_synchronized` records an explicit local observation of a Tracker projection. It preserves the current Task lifecycle, Phase, Step, blockers, and Route while advancing the Event sequence and Projection version. Its `reference` carries a credential-free URI, adapter, external ID, remote observed-version, role, content identity, and observation timestamp.
+`tracker_synchronized` records an explicit local observation of a Tracker projection. It preserves the current Task lifecycle, Phase, Step, blockers, and Route while advancing the Event sequence and Projection version. Its `reference` carries a credential-free URI, adapter, external ID, remote observed-version and state, role, content identity, and observation timestamp.
 
 - `created`, `updated`, and `observed` record a mapped projection after the remote adapter confirms its versioned result.
 - `external_closed` records a remotely closed Issue without completing, archiving, or otherwise transitioning the local Task.

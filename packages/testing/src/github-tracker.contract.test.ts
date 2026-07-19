@@ -254,6 +254,13 @@ test("Core creates and conditionally updates one mapped GitHub Issue without ret
   assert.equal(retried.disposition, "unchanged");
   assert.equal(tracker.createCalls, 1);
   assert.equal(retried.state.events.length, created.state.events.length);
+  const checked = await coreContract.pushGitHubIssueProjection({
+    state: created.state,
+    tracker,
+    event: eventMetadata("STATUS", "2026-07-19T12:00:30Z"),
+  });
+  assert.equal(checked.disposition, "unchanged");
+  assert.equal(tracker.readCalls, 1);
 
   const updated = await coreContract.pushGitHubIssueProjection({
     state: advanceToExplore(created.state),
@@ -323,6 +330,46 @@ test("Core reports concurrent GitHub projection edits without replacing local Ta
     assert.notEqual(tracker.issue?.title, "Manual GitHub title");
   }
 });
+test("Core resolves an initially unmapped GitHub projection conflict", async () => {
+  const tracker = new MemoryGitHubTracker();
+  const seeded = await coreContract.pushGitHubIssueProjection({
+    state: startState(),
+    tracker,
+    event: eventMetadata("SEED", "2026-07-19T12:00:01Z"),
+  });
+  assert.equal(seeded.disposition, "created");
+  if (seeded.disposition !== "created") {
+    return;
+  }
+  tracker.changeRemote({ title: "Pre-existing manual GitHub title" });
+  const unmapped = startState();
+  const conflict = await coreContract.pushGitHubIssueProjection({
+    state: unmapped,
+    tracker,
+    event: eventMetadata("DISCOVER", "2026-07-19T12:01:00Z"),
+  });
+  assert.equal(conflict.disposition, "sync-conflict");
+  if (conflict.disposition !== "sync-conflict") {
+    return;
+  }
+  assert.equal(conflict.conflict.expectedVersion, null);
+
+  const resolved = await coreContract.resolveGitHubIssueProjectionConflict({
+    state: unmapped,
+    tracker,
+    conflict: conflict.conflict,
+    resolution: "keep-observed",
+    event: {
+      ...eventMetadata("DISCOVER-RESOLVE", "2026-07-19T12:02:00Z"),
+      actor: { kind: "user", id: "maintainer", sessionRef: "session-32" },
+    },
+  });
+  assert.equal(resolved.disposition, "resolved-remote");
+  if (resolved.disposition === "resolved-remote") {
+    assert.deepEqual(resolved.state.projection.externalReferences, ["github-TASK-GITHUB-32"]);
+  }
+});
+
 
 test("Core records external GitHub closure without completing the local Task", async () => {
   const tracker = new MemoryGitHubTracker();
@@ -359,6 +406,27 @@ test("Core records external GitHub closure without completing the local Task", a
   assert.equal(repeated.disposition, "unchanged");
   assert.equal(repeated.state.events.length, pulled.state.events.length);
 });
+test("Core treats a closed GitHub Issue with edited projection content as a sync conflict", async () => {
+  const tracker = new MemoryGitHubTracker();
+  const created = await coreContract.pushGitHubIssueProjection({
+    state: startState(),
+    tracker,
+    event: eventMetadata("CREATE", "2026-07-19T12:00:01Z"),
+  });
+  assert.equal(created.disposition, "created");
+  if (created.disposition !== "created") {
+    return;
+  }
+  tracker.changeRemote({ state: "closed", title: "Closed and manually edited" });
+  const pulled = await coreContract.pullGitHubIssueProjection({
+    state: created.state,
+    tracker,
+    event: eventMetadata("PULL-CLOSED-CONFLICT", "2026-07-19T12:02:00Z"),
+  });
+  assert.equal(pulled.disposition, "sync-conflict");
+  assert.equal(pulled.state, created.state);
+});
+
 
 test("Core returns recoverable diagnostics for GitHub permission, rate-limit, and deletion outcomes", async () => {
   const tracker = new MemoryGitHubTracker();
@@ -413,6 +481,17 @@ test("Core returns recoverable diagnostics for GitHub permission, rate-limit, an
   }
 
   tracker.issue = null;
+  const deletedPush = await coreContract.pushGitHubIssueProjection({
+    state: created.state,
+    tracker,
+    event: eventMetadata("PUSH-DELETED", "2026-07-19T12:03:45Z"),
+  });
+  assert.equal(deletedPush.disposition, "diagnostic");
+  if (deletedPush.disposition === "diagnostic") {
+    assert.equal(deletedPush.diagnostic.code, "github.issue_deleted");
+    assert.equal(deletedPush.state, created.state);
+  }
+
   const deleted = await coreContract.pullGitHubIssueProjection({
     state: created.state,
     tracker,
