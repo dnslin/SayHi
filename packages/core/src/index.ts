@@ -33,6 +33,10 @@ import {
   resolveMarkdownTrackerConflict,
 } from "./markdown-tracker.js";
 import {
+  pullGitHubIssueProjection,
+  pushGitHubIssueProjection,
+} from "./github-tracker.js";
+import {
   readRouteDefinition,
   readGateEvidenceKinds,
   adoptWorkflowBaseline,
@@ -44,6 +48,7 @@ import {
   transitionWorkflow,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   reviseInitiativeGraph,
 } from "./workflow.js";
 import {
@@ -181,6 +186,27 @@ export type {
   ResolveMarkdownTrackerConflictRequest,
   ResolveMarkdownTrackerConflictResult,
 } from "./markdown-tracker.js";
+export {
+  GITHUB_TRACKER_CONTRACT_VERSION,
+  pullGitHubIssueProjection,
+  pushGitHubIssueProjection,
+} from "./github-tracker.js";
+export type {
+  GitHubIssue,
+  GitHubIssueMutationResult,
+  GitHubIssueProjection,
+  GitHubIssueProjectionResult,
+  GitHubIssueReadResult,
+  GitHubIssueReference,
+  GitHubIssueState,
+  GitHubIssueSyncConflict,
+  GitHubTrackerDiagnostic,
+  GitHubTrackerDiagnosticCode,
+  GitHubTrackerFailureCode,
+  GitHubTrackerPort,
+  PullGitHubIssueProjectionRequest,
+  PushGitHubIssueProjectionRequest,
+} from "./github-tracker.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -375,6 +401,7 @@ export {
   recordContextManifestChange,
   recordBuildPlanChange,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   reviseInitiativeGraph,
 } from "./workflow.js";
 export type {
@@ -404,6 +431,11 @@ export type {
   RecordContextManifestChangeResult,
   RecordBuildPlanChangeRequest,
   RecordBuildPlanChangeResult,
+  RecordTrackerSynchronizationRequest,
+  RecordTrackerSynchronizationResult,
+  TrackerReference,
+  TrackerSynchronizationChange,
+  TrackerSynchronizedEvent,
   ReviseInitiativeGraphRequest,
   ReviseInitiativeGraphResult,
   BaselineAdoptedPath,
@@ -586,6 +618,8 @@ export interface CoreContract {
   readonly projectMarkdownTracker: typeof projectMarkdownTracker;
   readonly projectDeletedMarkdownTrackerTask: typeof projectDeletedMarkdownTrackerTask;
   readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
+  readonly pushGitHubIssueProjection: typeof pushGitHubIssueProjection;
+  readonly pullGitHubIssueProjection: typeof pullGitHubIssueProjection;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -599,6 +633,7 @@ export interface CoreContract {
   readonly reviseInitiativeGraph: typeof reviseInitiativeGraph;
   readonly recordPhaseExecutionDispatch: typeof recordPhaseExecutionDispatch;
   readonly recordPhaseExecutionResult: typeof recordPhaseExecutionResult;
+  readonly recordTrackerSynchronization: typeof recordTrackerSynchronization;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly readDurableQuickResult: typeof readDurableQuickResult;
@@ -657,6 +692,8 @@ export const coreContract: CoreContract = Object.freeze({
   projectMarkdownTracker,
   projectDeletedMarkdownTrackerTask,
   resolveMarkdownTrackerConflict,
+  pushGitHubIssueProjection,
+  pullGitHubIssueProjection,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
@@ -670,6 +707,7 @@ export const coreContract: CoreContract = Object.freeze({
   reviseInitiativeGraph,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   createDurableTask,
   createDurableTaskHandoff,
   readDurableQuickResult,
