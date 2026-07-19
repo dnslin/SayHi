@@ -195,6 +195,7 @@ export type {
   TrackerProjectionDiagnostic,
   TrackerProjectionDiagnosticCode,
   TrackerProjectionMapping,
+  TrackerProjectionPendingMutation,
   TrackerProjectionMutation,
   TrackerProjectionOperation,
   TrackerProjectionPayload,

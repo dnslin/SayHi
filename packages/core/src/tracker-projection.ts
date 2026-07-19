@@ -7,6 +7,7 @@ export const TRACKER_PROJECTION_CONTRACT_VERSION = 1 as const;
 export type TrackerProjectionOperation = "lookup" | "create" | "update" | "archive";
 
 type TrackerProjectionMutationOperation = Exclude<TrackerProjectionOperation, "lookup">;
+type TrackerProjectionPendingMutationOperation = Exclude<TrackerProjectionMutationOperation, "create">;
 
 export type TrackerProjectionDiagnosticCode =
   | "tracker.adapter-mismatch"
@@ -14,7 +15,8 @@ export type TrackerProjectionDiagnosticCode =
   | "tracker.mapping-unavailable"
   | "tracker.operation-uncertain"
   | "tracker.operation-unsupported"
-  | "tracker.resource-missing";
+  | "tracker.resource-missing"
+  | "tracker.resource-uri-invalid";
 
 export interface TrackerProjectionPayload {
   readonly key: string;
@@ -43,6 +45,11 @@ export interface TrackerProjectionMutation {
   readonly resource: TrackerProjectionRemoteResource;
   readonly expectedVersion: string;
   readonly payload: TrackerProjectionPayload;
+}
+
+export interface TrackerProjectionPendingMutation {
+  readonly authorityIdentity: ContentHash;
+  readonly operation: TrackerProjectionPendingMutationOperation;
 }
 
 export type TrackerProjectionAdapterOutcome =
@@ -74,6 +81,7 @@ export interface TrackerProjectionMapping {
   readonly uri: string;
   readonly observedVersion: string;
   readonly authorityIdentity: ContentHash;
+  readonly pendingMutation: TrackerProjectionPendingMutation | null;
 }
 
 export interface TrackerProjectionStore {
@@ -123,7 +131,7 @@ export async function projectTrackerProjection(
 ): Promise<ProjectTrackerProjectionResult> {
   const payload = payloadFor(request.state);
   const mapping = await readMapping(request.store, payload.taskId, request.adapter.adapterId);
-  if (isResult(mapping)) {
+  if (isProjectionResult(mapping)) {
     return mapping;
   }
   if (mapping !== null && mapping.adapterId !== request.adapter.adapterId) {
@@ -140,7 +148,7 @@ export async function projectTrackerProjection(
     "lookup",
     () => request.adapter.lookupProjection(payload.key),
   );
-  if (isResult(lookup)) {
+  if (isProjectionResult(lookup)) {
     return lookup;
   }
   if (mapping === null) {
@@ -157,24 +165,41 @@ export async function projectTrackerProjection(
   if (lookup.kind !== "resource") {
     return outcomeResult(request.adapter.adapterId, "lookup", lookup, mapping, payload);
   }
-  if (sameHash(lookup.resource.authorityIdentity, payload.authorityIdentity)) {
-    const observed = await persistResourceMapping(
-      request.store,
-      request.adapter.adapterId,
-      payload.taskId,
-      lookup.resource,
-      "lookup",
-    );
-    if (isResult(observed)) {
-      return observed;
+  const operation = payload.archived ? "archive" : "update";
+  const pendingMutation = mapping.pendingMutation ?? null;
+  const resourceMatchesMapping = sameHash(
+    lookup.resource.authorityIdentity,
+    mapping.authorityIdentity,
+  );
+  const resourceMatchesPayload = sameHash(
+    lookup.resource.authorityIdentity,
+    payload.authorityIdentity,
+  );
+  if (resourceMatchesPayload) {
+    if (
+      (pendingMutation === null && resourceMatchesMapping) ||
+      pendingMutationMatches(pendingMutation, payload, operation)
+    ) {
+      const observed = await persistResourceMapping(
+        request.store,
+        request.adapter.adapterId,
+        payload.taskId,
+        lookup.resource,
+        "lookup",
+      );
+      if (isProjectionResult(observed)) {
+        return observed;
+      }
+      return Object.freeze({ disposition: "unchanged", mapping: observed });
     }
-    return Object.freeze({ disposition: "unchanged", mapping: observed });
-  }
-  if (!sameHash(lookup.resource.authorityIdentity, mapping.authorityIdentity)) {
     return reconciliationRequired(mapping, lookup.resource.version, lookup.resource.authorityIdentity, payload);
   }
-
-  const operation = payload.archived ? "archive" : "update";
+  if (
+    !resourceMatchesMapping ||
+    (pendingMutation !== null && !pendingMutationMatches(pendingMutation, payload, operation))
+  ) {
+    return reconciliationRequired(mapping, lookup.resource.version, lookup.resource.authorityIdentity, payload);
+  }
   if (!request.adapter.capabilities[operation]) {
     return recoveryRequired(
       request.adapter.adapterId,
@@ -182,6 +207,17 @@ export async function projectTrackerProjection(
       "tracker.operation-unsupported",
       `Configure an adapter that supports ${operation} before retrying.`,
     );
+  }
+  if (pendingMutation === null) {
+    const pending = await persistMapping(
+      request.store,
+      mappingWithPendingMutation(mapping, payload, operation),
+      request.adapter.adapterId,
+      operation,
+    );
+    if (pending !== undefined) {
+      return pending;
+    }
   }
   const mutation: TrackerProjectionMutation = Object.freeze({
     resource: lookup.resource,
@@ -196,10 +232,21 @@ export async function projectTrackerProjection(
         ? request.adapter.archiveProjection(mutation)
         : request.adapter.updateProjection(mutation),
   );
-  if (isResult(outcome)) {
+  if (isProjectionResult(outcome)) {
     return outcome;
   }
   if (outcome.kind !== "resource") {
+    if (outcome.kind !== "uncertain") {
+      const cleared = await persistMapping(
+        request.store,
+        mappingWithoutPendingMutation(mapping),
+        request.adapter.adapterId,
+        operation,
+      );
+      if (cleared !== undefined) {
+        return cleared;
+      }
+    }
     return outcomeResult(request.adapter.adapterId, operation, outcome, mapping, payload);
   }
   if (!sameHash(outcome.resource.authorityIdentity, payload.authorityIdentity)) {
@@ -212,7 +259,7 @@ export async function projectTrackerProjection(
     outcome.resource,
     operation,
   );
-  if (isResult(updated)) {
+  if (isProjectionResult(updated)) {
     return updated;
   }
   return Object.freeze({
@@ -237,7 +284,7 @@ async function projectUnmappedTask(
       lookup.resource,
       "lookup",
     );
-    if (isResult(adopted)) {
+    if (isProjectionResult(adopted)) {
       return adopted;
     }
     return Object.freeze({ disposition: "unchanged", mapping: adopted });
@@ -258,7 +305,7 @@ async function projectUnmappedTask(
     "create",
     () => request.adapter.createProjection(payload),
   );
-  if (isResult(created)) {
+  if (isProjectionResult(created)) {
     return created;
   }
   if (created.kind !== "resource") {
@@ -274,7 +321,7 @@ async function projectUnmappedTask(
     created.resource,
     "create",
   );
-  if (isResult(mapping)) {
+  if (isProjectionResult(mapping)) {
     return mapping;
   }
   return Object.freeze({ disposition: "created", mapping });
@@ -315,6 +362,7 @@ function mappingFor(
     uri: resource.uri,
     observedVersion: resource.version,
     authorityIdentity: freezeHash(resource.authorityIdentity),
+    pendingMutation: null,
   });
 }
 
@@ -361,9 +409,61 @@ async function persistResourceMapping(
   resource: TrackerProjectionRemoteResource,
   operation: TrackerProjectionOperation,
 ): Promise<TrackerProjectionMapping | ProjectTrackerProjectionResult> {
+  if (!isCredentialFreeUri(resource.uri)) {
+    return recoveryRequired(
+      adapterId,
+      operation,
+      "tracker.resource-uri-invalid",
+      "Configure the adapter to return an absolute URI without embedded credentials.",
+    );
+  }
   const mapping = mappingFor(adapterId, taskId, resource);
   const failure = await persistMapping(store, mapping, adapterId, operation);
   return failure ?? mapping;
+}
+
+function mappingWithPendingMutation(
+  mapping: TrackerProjectionMapping,
+  payload: TrackerProjectionPayload,
+  operation: TrackerProjectionPendingMutationOperation,
+): TrackerProjectionMapping {
+  return Object.freeze({
+    ...mapping,
+    authorityIdentity: freezeHash(mapping.authorityIdentity),
+    pendingMutation: Object.freeze({
+      authorityIdentity: freezeHash(payload.authorityIdentity),
+      operation,
+    }),
+  });
+}
+
+function mappingWithoutPendingMutation(mapping: TrackerProjectionMapping): TrackerProjectionMapping {
+  return Object.freeze({
+    ...mapping,
+    authorityIdentity: freezeHash(mapping.authorityIdentity),
+    pendingMutation: null,
+  });
+}
+
+function pendingMutationMatches(
+  pendingMutation: TrackerProjectionPendingMutation | null,
+  payload: TrackerProjectionPayload,
+  operation: TrackerProjectionPendingMutationOperation,
+): boolean {
+  return (
+    pendingMutation !== null &&
+    pendingMutation.operation === operation &&
+    sameHash(pendingMutation.authorityIdentity, payload.authorityIdentity)
+  );
+}
+
+function isCredentialFreeUri(value: string): boolean {
+  try {
+    const uri = new URL(value);
+    return uri.username.length === 0 && uri.password.length === 0;
+  } catch {
+    return false;
+  }
 }
 
 async function callAdapter(
@@ -458,7 +558,7 @@ function recoveryRequired(
   });
 }
 
-function isResult(value: unknown): value is ProjectTrackerProjectionResult {
+function isProjectionResult(value: unknown): value is ProjectTrackerProjectionResult {
   return typeof value === "object" && value !== null && "disposition" in value;
 }
 

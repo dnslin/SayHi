@@ -76,6 +76,7 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
   authenticationFailure = false;
   conflictOnNextUpdate = false;
   archiveSupported = true;
+  resourceUri: string | null = null;
 
   constructor(adapterId: string) {
     this.adapterId = adapterId;
@@ -179,7 +180,7 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
   private resourceFor(payload: TrackerProjectionPayload, version: string): TrackerProjectionRemoteResource {
     return {
       externalId: `remote-${payload.taskId}`,
-      uri: `https://tracker.example.test/${payload.taskId}`,
+      uri: this.resourceUri ?? `https://tracker.example.test/${payload.taskId}`,
       version,
       authorityIdentity: payload.authorityIdentity,
       archived: payload.archived,
@@ -336,6 +337,23 @@ test("Tracker projection retries uncertain updates and archives without duplicat
   assert.equal(adapter.archiveCalls, 1);
 });
 
+test("Tracker projection reconciles a matching remote edit without a pending local mutation", async () => {
+  const store = new MemoryTrackerProjectionStore();
+  const adapter = new MemoryTrackerProjectionAdapter("gitlab");
+  const createdState = startTrackerTask();
+  await coreContract.projectTrackerProjection({ store, adapter, state: createdState });
+  const updatedState = advanceTrackerTask(createdState, "active", "implement", "MANUAL-MATCH");
+
+  adapter.updateIsUncertain = true;
+  const uncertain = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
+  assert.equal(uncertain.disposition, "recovery-required");
+  store.mapping = { ...store.mapping!, pendingMutation: null } as TrackerProjectionMapping;
+
+  const retried = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
+  assert.equal(retried.disposition, "reconciliation-required");
+  assert.equal(adapter.updateCalls, 1);
+});
+
 test("Tracker projection reports concurrent edits and conditional-write conflicts without mutating local authority", async () => {
   const store = new MemoryTrackerProjectionStore();
   const adapter = new MemoryTrackerProjectionAdapter("gitlab");
@@ -399,4 +417,23 @@ test("Tracker projection reports authentication and unsupported archive outcomes
   }
   assert.equal(unsupported.diagnostic.code, "tracker.operation-unsupported");
   assert.equal(unsupported.diagnostic.operation, "archive");
+});
+
+test("Tracker projection rejects a credentialed remote URI before persisting its mapping", async () => {
+  const store = new MemoryTrackerProjectionStore();
+  const adapter = new MemoryTrackerProjectionAdapter("gitlab");
+  adapter.resourceUri = "https://token@example.test/TASK-TRACKER-33";
+
+  const result = await coreContract.projectTrackerProjection({
+    store,
+    adapter,
+    state: startTrackerTask(),
+  });
+
+  assert.equal(result.disposition, "recovery-required");
+  if (result.disposition !== "recovery-required") {
+    return;
+  }
+  assert.equal(result.diagnostic.code, "tracker.resource-uri-invalid");
+  assert.equal(store.mapping, null);
 });
