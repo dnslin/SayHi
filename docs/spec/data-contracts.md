@@ -183,6 +183,18 @@ The manifest does not contain credentials, machine-specific absolute paths, or s
 - Repair tools MUST append corrective administrative Events rather than edit accepted history.
 
 Representative Event types include task creation, Route classification, Route escalation, artifact registration, context freeze, Gate acceptance, Phase transition, blocker creation/resolution, graph revision, Agent dispatch/result acceptance, review waiver, commit recording, external sync observation, knowledge decision, completion, cancellation, and archive.
+### 5.2 Tracker synchronization
+
+`tracker_synchronized` records an explicit local observation of a Tracker projection. It preserves the current Task lifecycle, Phase, Step, blockers, and Route while advancing the Event sequence and Projection version. Its `reference` carries a credential-free URI, adapter, external ID, remote observed-version and state, role, content identity, and observation timestamp.
+
+- `created`, `updated`, and `observed` record a mapped projection after the remote adapter confirms its versioned result.
+- `external_closed` records a remotely closed Issue without completing, archiving, or otherwise transitioning the local Task.
+- Core records a Tracker Event only after the remote operation is confirmed. Permission denial, rate limiting, an unknown outcome, deleted Issue, or version conflict leaves local Event history unchanged and returns a recoverable diagnostic.
+- A remote body, title, or state change that conflicts with the mapped content identity is data-only conflict material; it cannot alter local Task state without an accepted local Event.
+- `status` is read-only. An explicit conflict resolution requires user-attributed Event metadata: `resolved_local` conditionally reapplies the local projection against the observed remote version, while `resolved_remote` records the confirmed remote reference without changing local Task state. Event history retains the prior mapped version and the user-selected resolution.
+- Persisted Tracker reference URIs permit only HTTP(S) origin and path: userinfo, query, and fragment content are rejected so tokens and other secrets cannot enter Events or Projections.
+
+
 
 ## 6. Context Manifest
 

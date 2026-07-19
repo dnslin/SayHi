@@ -34,6 +34,12 @@ import {
 } from "./markdown-tracker.js";
 import { projectTrackerProjection } from "./tracker-projection.js";
 import {
+  getGitHubIssueProjectionStatus,
+  pullGitHubIssueProjection,
+  pushGitHubIssueProjection,
+  resolveGitHubIssueProjectionConflict,
+} from "./github-tracker.js";
+import {
   readRouteDefinition,
   readGateEvidenceKinds,
   adoptWorkflowBaseline,
@@ -45,6 +51,7 @@ import {
   transitionWorkflow,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   reviseInitiativeGraph,
 } from "./workflow.js";
 import {
@@ -202,6 +209,33 @@ export type {
   TrackerProjectionRemoteResource,
   TrackerProjectionStore,
 } from "./tracker-projection.js";
+export {
+  GITHUB_TRACKER_CONTRACT_VERSION,
+  getGitHubIssueProjectionStatus,
+  pullGitHubIssueProjection,
+  pushGitHubIssueProjection,
+  resolveGitHubIssueProjectionConflict,
+} from "./github-tracker.js";
+export type {
+  GitHubIssue,
+  GetGitHubIssueProjectionStatusRequest,
+  GitHubIssueConflictResolution,
+  GitHubIssueMutationResult,
+  GitHubIssueProjection,
+  GitHubIssueProjectionResult,
+  GitHubIssueProjectionStatusResult,
+  GitHubIssueReadResult,
+  GitHubIssueReference,
+  GitHubIssueState,
+  GitHubIssueSyncConflict,
+  GitHubTrackerDiagnostic,
+  GitHubTrackerDiagnosticCode,
+  GitHubTrackerFailureCode,
+  GitHubTrackerPort,
+  ResolveGitHubIssueProjectionConflictRequest,
+  PullGitHubIssueProjectionRequest,
+  PushGitHubIssueProjectionRequest,
+} from "./github-tracker.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -396,6 +430,7 @@ export {
   recordContextManifestChange,
   recordBuildPlanChange,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   reviseInitiativeGraph,
 } from "./workflow.js";
 export type {
@@ -425,6 +460,11 @@ export type {
   RecordContextManifestChangeResult,
   RecordBuildPlanChangeRequest,
   RecordBuildPlanChangeResult,
+  RecordTrackerSynchronizationRequest,
+  RecordTrackerSynchronizationResult,
+  TrackerReference,
+  TrackerSynchronizationChange,
+  TrackerSynchronizedEvent,
   ReviseInitiativeGraphRequest,
   ReviseInitiativeGraphResult,
   BaselineAdoptedPath,
@@ -608,6 +648,10 @@ export interface CoreContract {
   readonly projectDeletedMarkdownTrackerTask: typeof projectDeletedMarkdownTrackerTask;
   readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
   readonly projectTrackerProjection: typeof projectTrackerProjection;
+  readonly pushGitHubIssueProjection: typeof pushGitHubIssueProjection;
+  readonly pullGitHubIssueProjection: typeof pullGitHubIssueProjection;
+  readonly getGitHubIssueProjectionStatus: typeof getGitHubIssueProjectionStatus;
+  readonly resolveGitHubIssueProjectionConflict: typeof resolveGitHubIssueProjectionConflict;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -621,6 +665,7 @@ export interface CoreContract {
   readonly reviseInitiativeGraph: typeof reviseInitiativeGraph;
   readonly recordPhaseExecutionDispatch: typeof recordPhaseExecutionDispatch;
   readonly recordPhaseExecutionResult: typeof recordPhaseExecutionResult;
+  readonly recordTrackerSynchronization: typeof recordTrackerSynchronization;
   readonly createDurableTask: typeof createDurableTask;
   readonly createDurableTaskHandoff: typeof createDurableTaskHandoff;
   readonly readDurableQuickResult: typeof readDurableQuickResult;
@@ -680,6 +725,10 @@ export const coreContract: CoreContract = Object.freeze({
   projectDeletedMarkdownTrackerTask,
   resolveMarkdownTrackerConflict,
   projectTrackerProjection,
+  pushGitHubIssueProjection,
+  pullGitHubIssueProjection,
+  getGitHubIssueProjectionStatus,
+  resolveGitHubIssueProjectionConflict,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
@@ -693,6 +742,7 @@ export const coreContract: CoreContract = Object.freeze({
   reviseInitiativeGraph,
   recordPhaseExecutionDispatch,
   recordPhaseExecutionResult,
+  recordTrackerSynchronization,
   createDurableTask,
   createDurableTaskHandoff,
   readDurableQuickResult,
