@@ -158,6 +158,10 @@ Extract candidates from a completed Task, reject one, accept one into a scoped S
 
 No Agent can promote knowledge directly, provenance remains traversable, credentials do not enter durable artifacts, and local Task state stays authoritative.
 
+### Exit Gate evidence
+
+**Satisfied for issue #34’s Milestone 4 scope:** `npm run test:milestone-4` builds the workspace and runs 37 contract tests. The suite proves completed-Task Evidence provenance, exact user approval, preserved Candidate records, promotion, and Context Manifest staleness; then exercises Markdown, GitHub, GitLab, and custom Tracker projections through idempotent retries and recoverable concurrent-edit conflicts without changing local Workflow authority.
+
 ### Primary risks
 
 - proposed knowledge is noisy;
