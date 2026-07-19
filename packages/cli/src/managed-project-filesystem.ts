@@ -45,50 +45,17 @@ export class NodeManagedProjectFileSystem
   }
 
   async inspect(path: string): Promise<Readonly<{ kind: ManagedProjectPathKind }>> {
-    const target = this.#resolveManagedPath(path);
-    try {
-      const entry = await lstat(target);
-      if (entry.isSymbolicLink()) {
-        return { kind: "symlink" };
-      }
-      if (entry.isFile()) {
-        return { kind: "file" };
-      }
-      if (entry.isDirectory()) {
-        return { kind: "directory" };
-      }
-      return { kind: "other" };
-    } catch (error) {
-      if (isNotFound(error)) {
-        return { kind: "missing" };
-      }
-      throw error;
-    }
+    return this.#inspectPath(this.#resolveManagedPath(path));
   }
 
   async inspectRepositoryPath(
     path: string,
   ): Promise<Readonly<{ kind: ManagedProjectPathKind }>> {
-    const target = this.#resolveRepositoryPath(path);
-    try {
-      const entry = await lstat(target);
-      if (entry.isSymbolicLink()) {
-        return { kind: "symlink" };
-      }
-      if (entry.isFile()) {
-        await this.#resolveReadableRepositoryPath(path);
-        return { kind: "file" };
-      }
-      if (entry.isDirectory()) {
-        return { kind: "directory" };
-      }
-      return { kind: "other" };
-    } catch (error) {
-      if (isNotFound(error)) {
-        return { kind: "missing" };
-      }
-      throw error;
+    const entry = await this.#inspectPath(this.#resolveRepositoryPath(path));
+    if (entry.kind === "file") {
+      await this.#resolveReadableRepositoryPath(path);
     }
+    return entry;
   }
 
   async listDirectory(path: string) {
@@ -513,6 +480,27 @@ export class NodeManagedProjectFileSystem
     }
     await rm(marker);
     return true;
+  }
+
+  async #inspectPath(target: string): Promise<Readonly<{ kind: ManagedProjectPathKind }>> {
+    try {
+      const entry = await lstat(target);
+      if (entry.isSymbolicLink()) {
+        return { kind: "symlink" };
+      }
+      if (entry.isFile()) {
+        return { kind: "file" };
+      }
+      if (entry.isDirectory()) {
+        return { kind: "directory" };
+      }
+      return { kind: "other" };
+    } catch (error) {
+      if (isNotFound(error)) {
+        return { kind: "missing" };
+      }
+      throw error;
+    }
   }
 
   #readerLeasesDirectory(): string {

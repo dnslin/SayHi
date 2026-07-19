@@ -8,6 +8,7 @@ import {
 } from "./identity.js";
 import {
   readKnowledgeCandidate,
+  readRepositoryTargetIdentity,
   type KnowledgeCandidateFileSystem,
 } from "./knowledge.js";
 import {
@@ -497,7 +498,7 @@ async function readTargetIdentity(
   fileSystem: KnowledgePromotionFileSystem,
   target: string,
 ): Promise<Readonly<{ ok: true; identity: ContentHash | null }> | KnowledgePromotionFailure> {
-  const entry = await fileSystem.inspectRepositoryPath(target);
+  const entry = await readRepositoryTargetIdentity(fileSystem, target);
   if (entry.kind === "missing") {
     return Object.freeze({ ok: true, identity: null });
   }
@@ -509,10 +510,7 @@ async function readTargetIdentity(
       "Restore a regular target file or choose a supported shared knowledge path.",
     );
   }
-  return Object.freeze({
-    ok: true,
-    identity: hashTextContent(await fileSystem.readRepositoryFile(target)),
-  });
+  return Object.freeze({ ok: true, identity: entry.identity });
 }
 
 async function findAffectedContexts(
