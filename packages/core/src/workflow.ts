@@ -19,6 +19,7 @@ import {
 
 
 import { isRepositoryRelativePath } from "./repository-path.js";
+import { isCredentialFreeAbsoluteUri } from "./tracker-utils.js";
 import {
   DURABLE_RECORD_SCHEMA_VERSION,
   isIdentifier,
@@ -291,6 +292,30 @@ export interface PhaseExecutionResultAcceptedEvent extends WorkflowEventBase {
   readonly from: WorkflowPosition;
   readonly result: unknown;
 }
+export type TrackerSynchronizationChange =
+  | "created"
+  | "updated"
+  | "observed"
+  | "external_closed"
+  | "resolved_local"
+  | "resolved_remote";
+export interface TrackerReference {
+  readonly id: string;
+  readonly adapter: string;
+  readonly uri: string;
+  readonly externalId: string;
+  readonly observedVersion: string;
+  readonly observedState?: string;
+  readonly role: string;
+  readonly identity: ContractIdentity;
+  readonly lastObservedAt: string;
+}
+export interface TrackerSynchronizedEvent extends WorkflowEventBase {
+  readonly type: "tracker_synchronized";
+  readonly from: WorkflowPosition;
+  readonly change: TrackerSynchronizationChange;
+  readonly reference: TrackerReference;
+}
 
 
 
@@ -303,7 +328,8 @@ export type WorkflowEvent =
   | BuildPlanChangedEvent
   | InitiativeGraphRevisedEvent
   | PhaseExecutionDispatchedEvent
-  | PhaseExecutionResultAcceptedEvent;
+  | PhaseExecutionResultAcceptedEvent
+  | TrackerSynchronizedEvent;
 
 export interface WorkflowState {
   readonly events: readonly WorkflowEvent[];
@@ -390,6 +416,14 @@ export interface RecordPhaseExecutionResultRequest {
   readonly taskId: string;
   readonly expectedVersion: number;
   readonly result: unknown;
+  readonly event: WorkflowEventMetadata;
+}
+export interface RecordTrackerSynchronizationRequest {
+  readonly contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+  readonly taskId: string;
+  readonly expectedVersion: number;
+  readonly change: TrackerSynchronizationChange;
+  readonly reference: TrackerReference;
   readonly event: WorkflowEventMetadata;
 }
 
@@ -535,6 +569,19 @@ export type RecordPhaseExecutionResultResult =
       contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
       state: WorkflowState;
       event: PhaseExecutionResultAcceptedEvent;
+    }>
+  | Readonly<{
+      ok: false;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      diagnostics: readonly WorkflowDiagnostic[];
+    }>;
+export type RecordTrackerSynchronizationResult =
+  | Readonly<{
+      ok: true;
+      contractVersion: typeof WORKFLOW_CONTRACT_VERSION;
+      state: WorkflowState;
+      event: TrackerSynchronizedEvent;
     }>
   | Readonly<{
       ok: false;
@@ -1457,6 +1504,84 @@ export function recordPhaseExecutionResult(
     event,
   });
 }
+export function recordTrackerSynchronization(
+  state: WorkflowState,
+  request: RecordTrackerSynchronizationRequest,
+): RecordTrackerSynchronizationResult {
+  const stateIsConsistent = stateMatchesAcceptedHistory(state);
+  const repeatedEvent = state.events.find(
+    (event) => event.idempotencyKey === request.event.idempotencyKey,
+  );
+  if (
+    repeatedEvent !== undefined &&
+    request.contractVersion === WORKFLOW_CONTRACT_VERSION &&
+    request.taskId === state.projection.id &&
+    stateIsConsistent
+  ) {
+    if (
+      repeatedEvent.type === "tracker_synchronized" &&
+      matchesTrackerSynchronizationIntent(repeatedEvent, request)
+    ) {
+      return Object.freeze({
+        ok: true,
+        contractVersion: WORKFLOW_CONTRACT_VERSION,
+        state,
+        event: repeatedEvent,
+      });
+    }
+    return trackerSynchronizationFailure(
+      state,
+      diagnostic(
+        "workflow.event.idempotency_conflict",
+        "$.event.idempotencyKey",
+        "Idempotency key was already accepted for different Tracker synchronization material.",
+        "Reuse a key only for an identical retry, or submit a new stable key.",
+      ),
+    );
+  }
+  const requestDiagnostic = validateTrackerSynchronizationRequest(
+    state,
+    request,
+    stateIsConsistent,
+  );
+  if (requestDiagnostic !== null) {
+    return trackerSynchronizationFailure(state, requestDiagnostic);
+  }
+  const tail = state.events[state.events.length - 1]!;
+  const position = positionOf(state.projection);
+  const unsignedEvent = {
+    schemaVersion: DURABLE_RECORD_SCHEMA_VERSION,
+    eventId: request.event.eventId,
+    taskId: state.projection.id,
+    route: state.projection.route,
+    sequence: state.projection.version + 1,
+    previousChainDigest: tail.chainDigest,
+    type: "tracker_synchronized" as const,
+    from: freezePosition(position),
+    to: freezePosition(position),
+    actor: copyActor(request.event.actor),
+    outcome: "accepted" as const,
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(state.projection.blockers),
+    initiativeGraph: null,
+    reason: request.event.reason,
+    idempotencyKey: request.event.idempotencyKey,
+    occurredAt: request.event.occurredAt,
+    change: request.change,
+    reference: Object.freeze({ ...request.reference }),
+  };
+  const event = Object.freeze({
+    ...unsignedEvent,
+    chainDigest: digestEvent(unsignedEvent),
+  });
+  const projection = projectTrackerSynchronizedEvent(state.projection, event);
+  return Object.freeze({
+    ok: true,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state: freezeState([...state.events, event], projection),
+    event,
+  });
+}
 
 
 export function replayWorkflowEvents(
@@ -1646,6 +1771,22 @@ export function replayWorkflowEvents(
       }
       const event = copyContextManifestChangedEvent(sourceEvent);
       projection = projectContextManifestChangedEvent(projection, event);
+      acceptedEvents.push(event);
+      continue;
+    }
+    if (projection !== null && sourceEvent.type === "tracker_synchronized") {
+      if (!isTrackerSynchronizationEventEnvelope(sourceEvent, projection)) {
+        return replayFailure(
+          diagnostic(
+            "workflow.event.invalid",
+            `$[${index}]`,
+            "Tracker synchronization must preserve the accepted Workflow position and reference a valid external Tracker.",
+            "Restore the accepted Tracker synchronization Event without Workflow transition data.",
+          ),
+        );
+      }
+      const event = copyTrackerSynchronizedEvent(sourceEvent);
+      projection = projectTrackerSynchronizedEvent(projection, event);
       acceptedEvents.push(event);
       continue;
     }
@@ -2384,6 +2525,67 @@ function validateContextManifestChangeRequest(
     return invalidRequest("$.change", "Context Manifest change kind is not supported.");
   }
   return validateEventMetadata(request.event, "$.event");
+}
+function validateTrackerSynchronizationRequest(
+  state: WorkflowState,
+  request: RecordTrackerSynchronizationRequest,
+  stateIsConsistent: boolean,
+): WorkflowDiagnostic | null {
+  if (request.contractVersion !== WORKFLOW_CONTRACT_VERSION) {
+    return diagnostic(
+      "workflow.contract_version.unsupported",
+      "$.contractVersion",
+      "Workflow contract version is not supported.",
+      `Set contractVersion to ${WORKFLOW_CONTRACT_VERSION} and retry.`,
+    );
+  }
+  if (request.taskId !== state.projection.id) {
+    return diagnostic(
+      "workflow.task.mismatch",
+      "$.taskId",
+      "Tracker synchronization Task id does not match the current Projection.",
+      "Reload the intended Task and submit its stable id.",
+    );
+  }
+  if (!stateIsConsistent) {
+    return diagnostic(
+      "workflow.state.inconsistent",
+      "$.state",
+      "Task Projection or accepted Workflow Event history is inconsistent.",
+      "Rebuild the Projection from a complete valid Event stream before mutation.",
+    );
+  }
+  if (request.expectedVersion !== state.projection.version) {
+    return diagnostic(
+      "workflow.version.stale",
+      "$.expectedVersion",
+      `Expected Task version ${request.expectedVersion} does not match current version ${state.projection.version}.`,
+      "Reload the current Projection and retry Tracker synchronization.",
+    );
+  }
+  if (!isTrackerSynchronizationChange(request.change)) {
+    return invalidRequest("$.change", "Tracker synchronization change kind is not supported.");
+  }
+  if (!isTrackerReference(request.reference)) {
+    return invalidRequest(
+      "$.reference",
+      "Tracker synchronization requires a credential-free, versioned external reference.",
+    );
+  }
+  const eventDiagnostic = validateEventMetadata(request.event, "$.event");
+  if (eventDiagnostic !== null) {
+    return eventDiagnostic;
+  }
+  if (
+    (request.change === "resolved_local" || request.change === "resolved_remote") &&
+    request.event.actor.kind !== "user"
+  ) {
+    return invalidRequest(
+      "$.event.actor.kind",
+      "Tracker conflict resolution must be attributable to a user.",
+    );
+  }
+  return null;
 }
 function validateBuildPlanChangeRequest(
   state: WorkflowState,
@@ -3256,6 +3458,21 @@ function matchesPhaseExecutionResultIntent(
     event.actor.sessionRef === request.event.actor.sessionRef
   );
 }
+function matchesTrackerSynchronizationIntent(
+  event: TrackerSynchronizedEvent,
+  request: RecordTrackerSynchronizationRequest,
+): boolean {
+  return (
+    event.taskId === request.taskId &&
+    event.sequence === request.expectedVersion + 1 &&
+    event.change === request.change &&
+    stableJson(event.reference) === stableJson(request.reference) &&
+    event.reason === request.event.reason &&
+    event.actor.kind === request.event.actor.kind &&
+    event.actor.id === request.event.actor.id &&
+    event.actor.sessionRef === request.event.actor.sessionRef
+  );
+}
 
 function isPhaseExecutionEventEnvelope(
   event: PhaseExecutionDispatchedEvent | PhaseExecutionResultAcceptedEvent,
@@ -3266,6 +3483,20 @@ function isPhaseExecutionEventEnvelope(
     event.route === "build" &&
     projection.route === "build" &&
     projection.lifecycle === "active" &&
+    positionsEqual(event.from, positionOf(projection)) &&
+    positionsEqual(event.to, positionOf(projection)) &&
+    event.gates.length === 0 &&
+    event.initiativeGraph === null &&
+    stableJson(event.blockers) === stableJson(projection.blockers)
+  );
+}
+function isTrackerSynchronizationEventEnvelope(
+  event: TrackerSynchronizedEvent,
+  projection: TaskProjection,
+): boolean {
+  return (
+    event.taskId === projection.id &&
+    event.route === projection.route &&
     positionsEqual(event.from, positionOf(projection)) &&
     positionsEqual(event.to, positionOf(projection)) &&
     event.gates.length === 0 &&
@@ -3436,7 +3667,9 @@ function validateReplayEvent(
                     ? !isPhaseExecutionDispatchedEventPayload(event)
                     : event.type === "phase_execution_result_accepted"
                       ? !isPhaseExecutionResultAcceptedEventPayload(event)
-                      : true
+                      : event.type === "tracker_synchronized"
+                        ? !isTrackerSynchronizedEventPayload(event)
+                        : true
   ) {
     return diagnostic(
       "workflow.event.invalid",
@@ -3582,6 +3815,16 @@ function isPhaseExecutionResultAcceptedEventPayload(
     isWorkflowPosition(event.from) &&
     positionsEqual(event.from, event.to as WorkflowPosition) &&
     isUnknownRecord(event.result)
+  );
+}
+function isTrackerSynchronizedEventPayload(
+  event: Record<string, unknown>,
+): boolean {
+  return (
+    isWorkflowPosition(event.from) &&
+    positionsEqual(event.from, event.to as WorkflowPosition) &&
+    isTrackerSynchronizationChange(event.change) &&
+    isTrackerReference(event.reference)
   );
 }
 
@@ -4174,6 +4417,21 @@ function projectPhaseExecutionEvent(
     updatedAt: event.occurredAt,
   });
 }
+function projectTrackerSynchronizedEvent(
+  projection: TaskProjection,
+  event: TrackerSynchronizedEvent,
+): TaskProjection {
+  const externalReferences = projection.externalReferences.includes(event.reference.id)
+    ? projection.externalReferences
+    : Object.freeze([...projection.externalReferences, event.reference.id].sort());
+  return Object.freeze({
+    ...projection,
+    version: event.sequence,
+    eventHead: freezeEventHead(event),
+    externalReferences,
+    updatedAt: event.occurredAt,
+  });
+}
 
 
 
@@ -4327,6 +4585,20 @@ function copyPhaseExecutionResultAcceptedEvent(
     result: copyExecutionPayload(event.result),
   });
 }
+function copyTrackerSynchronizedEvent(
+  event: TrackerSynchronizedEvent,
+): TrackerSynchronizedEvent {
+  return Object.freeze({
+    ...event,
+    from: freezePosition(event.from),
+    to: freezePosition(event.to),
+    actor: copyActor(event.actor),
+    gates: Object.freeze([] as GateAcceptance[]),
+    blockers: copyStrings(event.blockers),
+    initiativeGraph: null,
+    reference: Object.freeze({ ...event.reference }),
+  });
+}
 
 function copyExecutionPayload(value: unknown): unknown {
   if (Array.isArray(value)) {
@@ -4457,6 +4729,7 @@ function digestEvent(
     | Omit<InitiativeGraphRevisedEvent, "chainDigest">
     | Omit<PhaseExecutionDispatchedEvent, "chainDigest">
     | Omit<PhaseExecutionResultAcceptedEvent, "chainDigest">
+    | Omit<TrackerSynchronizedEvent, "chainDigest">
     | WorkflowEvent,
 ): string {
   const payload: Record<string, unknown> = {
@@ -4501,6 +4774,9 @@ function digestEvent(
     payload.binding = event.binding;
   } else if (event.type === "phase_execution_result_accepted") {
     payload.result = event.result;
+  } else if (event.type === "tracker_synchronized") {
+    payload.change = event.change;
+    payload.reference = event.reference;
   }
   return hashCanonicalJson(payload);
 }
@@ -4522,8 +4798,39 @@ function isContextManifestChange(value: unknown): value is ContextManifestChange
 function isBuildPlanChange(value: unknown): value is BuildPlanChange {
   return value === "recorded" || value === "rejected";
 }
-
-
+function isTrackerSynchronizationChange(
+  value: unknown,
+): value is TrackerSynchronizationChange {
+  return (
+    value === "created" ||
+    value === "updated" ||
+    value === "observed" ||
+    value === "external_closed" ||
+    value === "resolved_local" ||
+    value === "resolved_remote"
+  );
+}
+function isTrackerReference(value: unknown): value is TrackerReference {
+  if (!isUnknownRecord(value)) {
+    return false;
+  }
+  return (
+    isIdentifier(value.id) &&
+    typeof value.adapter === "string" &&
+    value.adapter.length > 0 &&
+    isCredentialFreeAbsoluteUri(value.uri) &&
+    typeof value.externalId === "string" &&
+    value.externalId.length > 0 &&
+    typeof value.observedVersion === "string" &&
+    value.observedVersion.length > 0 &&
+    (value.observedState === undefined ||
+      (typeof value.observedState === "string" && value.observedState.length > 0)) &&
+    typeof value.role === "string" &&
+    value.role.length > 0 &&
+    isContractIdentity(value.identity) &&
+    isTimestamp(value.lastObservedAt)
+  );
+}
 function invalidRequest(path: string, message: string): WorkflowDiagnostic {
   return diagnostic(
     "workflow.request.invalid",
@@ -4623,6 +4930,17 @@ function phaseExecutionResultFailure(
   state: WorkflowState,
   diagnosticValue: WorkflowDiagnostic,
 ): RecordPhaseExecutionResultResult {
+  return Object.freeze({
+    ok: false,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    state,
+    diagnostics: Object.freeze([diagnosticValue]),
+  });
+}
+function trackerSynchronizationFailure(
+  state: WorkflowState,
+  diagnosticValue: WorkflowDiagnostic,
+): RecordTrackerSynchronizationResult {
   return Object.freeze({
     ok: false,
     contractVersion: WORKFLOW_CONTRACT_VERSION,

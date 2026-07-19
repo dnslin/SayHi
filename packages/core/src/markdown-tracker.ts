@@ -1,4 +1,5 @@
 import { hashTextContent } from "./context-manifest.js";
+import { escapeTrackerInlineText as inline } from "./tracker-utils.js";
 import type { ContentHash } from "./validation.js";
 import type { WorkflowState } from "./workflow.js";
 
@@ -471,13 +472,6 @@ function taskMarkerEnd(taskId: string): string {
   return `<!-- /sayhi-tracker:task ${encodeURIComponent(taskId)} -->`;
 }
 
-function inline(value: string): string {
-  return value
-    .replace(/[\r\n]+/gu, " ")
-    .replace(/<!--/gu, "&lt;!--")
-    .replace(/-->/gu, "--&gt;")
-    .replace(/`/gu, "\\`");
-}
 
 function indexesOf(value: string, search: string): readonly number[] {
   const indexes: number[] = [];
