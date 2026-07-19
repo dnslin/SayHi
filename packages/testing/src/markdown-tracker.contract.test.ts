@@ -302,7 +302,7 @@ test("Core reconciles a manual projection edit without changing local Task autho
   }
   assert.match(result.conflict.base, /Project local Tasks to Markdown/u);
   assert.match(result.conflict.observed ?? "", /Manual Tracker title/u);
-  assert.match(result.conflict.incoming, /- Phase: `explore`/u);
+  assert.match(result.conflict.incoming ?? "", /- Phase: `explore`/u);
   assert.equal(store.writes, 1);
 
   const resolved = await coreContract.resolveMarkdownTrackerConflict({
@@ -428,7 +428,7 @@ test("Core preserves the base and observed Markdown when Tracker markers are mal
   }
   assert.match(result.conflict.base, /Project local Tasks to Markdown/u);
   assert.equal(result.conflict.observed, malformedMarkdown);
-  assert.match(result.conflict.incoming, /- Phase: `explore`/u);
+  assert.match(result.conflict.incoming ?? "", /- Phase: `explore`/u);
   assert.equal(store.writes, 1);
   assert.equal(store.snapshot.markdown, malformedMarkdown);
 });
@@ -493,4 +493,65 @@ test("Core renders marker-like Task text as data without corrupting the Tracker"
 
   const retried = await coreContract.projectMarkdownTracker({ store, state: created.state });
   assert.equal(retried.disposition, "unchanged");
+});
+
+test("Core denies local reconciliation when another Task's authority state is unavailable", async () => {
+  const editedTask = coreContract.startWorkflowTask({
+    ...TRACKER_TASK,
+    task: { ...TRACKER_TASK.task, id: "TASK-EDITED" },
+    event: {
+      ...TRACKER_TASK.event,
+      eventId: "EVENT-MARKDOWN-31-EDITED",
+      idempotencyKey: "IDEMPOTENCY-MARKDOWN-31-EDITED",
+    },
+  });
+  const projectedTask = coreContract.startWorkflowTask({
+    ...TRACKER_TASK,
+    task: { ...TRACKER_TASK.task, id: "TASK-PROJECTED" },
+    event: {
+      ...TRACKER_TASK.event,
+      eventId: "EVENT-MARKDOWN-31-PROJECTED",
+      idempotencyKey: "IDEMPOTENCY-MARKDOWN-31-PROJECTED",
+    },
+  });
+  assert.equal(editedTask.ok, true);
+  assert.equal(projectedTask.ok, true);
+  if (!editedTask.ok || !projectedTask.ok) {
+    return;
+  }
+
+  const store = new MemoryMarkdownTrackerStore();
+  await coreContract.projectMarkdownTracker({ store, state: editedTask.state });
+  const advancedEditedTask = advanceTrackerWorkflow(
+    editedTask.state,
+    "active",
+    "explore",
+    "EDITED-UNPROJECTED",
+  );
+  const editedMarkdown = store.snapshot.markdown.replace(
+    "Project local Tasks to Markdown",
+    "Manual Tracker title",
+  );
+  store.snapshot = { ...store.snapshot, markdown: editedMarkdown };
+
+  const conflict = await coreContract.projectMarkdownTracker({
+    store,
+    state: projectedTask.state,
+  });
+  assert.equal(conflict.disposition, "reconciliation-required");
+  if (conflict.disposition !== "reconciliation-required") {
+    return;
+  }
+  assert.equal(conflict.conflict.taskId, editedTask.state.projection.id);
+  assert.equal(conflict.conflict.incoming, null);
+
+  const resolved = await coreContract.resolveMarkdownTrackerConflict({
+    store,
+    conflict: conflict.conflict,
+    resolution: "use-local",
+  });
+  assert.equal(resolved.disposition, "reconciliation-required");
+  assert.equal(store.writes, 1);
+  assert.equal(store.snapshot.markdown, editedMarkdown);
+  assert.equal(advancedEditedTask.projection.phase, "explore");
 });

@@ -40,7 +40,7 @@ export interface MarkdownTrackerConflict {
   readonly taskId: string;
   readonly base: string;
   readonly observed: string | null;
-  readonly incoming: string;
+  readonly incoming: string | null;
   readonly snapshotIdentity: ContentHash;
 }
 
@@ -127,13 +127,14 @@ export async function resolveMarkdownTrackerConflict(
     return currentReconciliationRequired(snapshot, request.conflict);
   }
   const entry = entryFor(snapshot, request.conflict.taskId);
+  const incoming = request.conflict.incoming;
   const expectedContent = renderTrackerEntryContent(snapshot.entries);
   const observed = parsed.hasUntrackedContent
     ? parsed.content
     : entry === undefined
       ? readBlock(parsed.content, request.conflict.taskId)
       : (parsed.blocks.get(request.conflict.taskId) ?? null);
-  const incomingBlock = readBlock(request.conflict.incoming, request.conflict.taskId);
+  const incomingBlock = incoming === null ? null : readBlock(incoming, request.conflict.taskId);
   const isTrackedConflict =
     !parsed.hasUntrackedContent &&
     entry !== undefined &&
@@ -150,6 +151,9 @@ export async function resolveMarkdownTrackerConflict(
     request.conflict.base === expectedContent &&
     request.conflict.observed === parsed.content &&
     incomingBlock !== null;
+  if (request.resolution === "use-local" && incoming === null) {
+    return currentReconciliationRequired(snapshot, request.conflict);
+  }
   if (!isTrackedConflict && !isAdoptableUntrackedConflict && !isRootContentConflict) {
     return currentReconciliationRequired(snapshot, request.conflict);
   }
@@ -163,15 +167,16 @@ export async function resolveMarkdownTrackerConflict(
   const rendered = isRootContentConflict
     ? incomingBlock!
     : request.resolution === "use-local"
-      ? request.conflict.incoming
+      ? incoming!
       : observed!;
   const replacement = freezeEntry({
     taskId: request.conflict.taskId,
     base: rendered,
     baseIdentity: hashTextContent(rendered),
-    authorityIdentity: hashTextContent(
-      isRootContentConflict ? incomingBlock! : request.conflict.incoming,
-    ),
+    authorityIdentity:
+      incoming === null
+        ? (entry?.authorityIdentity ?? hashTextContent(rendered))
+        : hashTextContent(isRootContentConflict ? incomingBlock! : incoming),
   });
   const updated = replaceEntry(snapshot, replacement, parsed);
   await request.store.writeMarkdownTracker(updated);
@@ -236,7 +241,7 @@ async function projectSubject(
       divergent.entry.taskId,
       divergent.entry.base,
       divergent.observed,
-      divergent.entry.taskId === taskId ? incoming : divergent.entry.base,
+      divergent.entry.taskId === taskId ? incoming : null,
     );
   }
 
@@ -389,7 +394,7 @@ function reconciliationRequired(
   taskId: string,
   base: string,
   observed: string | null,
-  incoming: string,
+  incoming: string | null,
 ): Readonly<{ readonly disposition: "reconciliation-required"; readonly conflict: MarkdownTrackerConflict }> {
   return Object.freeze({
     disposition: "reconciliation-required",

@@ -22,7 +22,7 @@ Implement the first Tracker adapter as a deterministic Core operation. It projec
 
 - A Markdown document holds one marker-delimited entry per Task and preserves user text outside the generated entries.
 - A versioned tracker sidecar retains each generated entry's exact base text and SHA-256 identity. This supports a fail-closed three-way reconciliation result containing base, observed local Markdown, and incoming local-authority Markdown.
-- An explicit resolution selects either the local-authority incoming form or the observed Markdown form for one generated entry. A foreign edit to the generated root container may only be explicitly replaced by the local form; preserving it requires moving that text outside the generated container. Neither path mutates Workflow Event history.
+- An explicit resolution selects either the local-authority incoming form or the observed Markdown form for one generated entry. A conflict discovered while projecting a different Task has no current incoming authority variant, so `use-local` is refused until that Task is projected explicitly. A foreign edit to the generated root container may only be explicitly replaced by the local form; preserving it requires moving that text outside the generated container. Neither path mutates Workflow Event history.
 
 ## Verification
 
