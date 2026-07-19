@@ -28,6 +28,11 @@ import {
 } from "./knowledge.js";
 import { promoteKnowledgeCandidate } from "./knowledge-promotion.js";
 import {
+  projectDeletedMarkdownTrackerTask,
+  projectMarkdownTracker,
+  resolveMarkdownTrackerConflict,
+} from "./markdown-tracker.js";
+import {
   readRouteDefinition,
   readGateEvidenceKinds,
   adoptWorkflowBaseline,
@@ -158,6 +163,24 @@ export type {
   PromoteKnowledgeCandidateRequest,
   PromoteKnowledgeCandidateResult,
 } from "./knowledge-promotion.js";
+export {
+  MARKDOWN_TRACKER_CONTRACT_VERSION,
+  projectDeletedMarkdownTrackerTask,
+  projectMarkdownTracker,
+  resolveMarkdownTrackerConflict,
+} from "./markdown-tracker.js";
+export type {
+  MarkdownTrackerConflict,
+  MarkdownTrackerConflictResolution,
+  MarkdownTrackerEntry,
+  MarkdownTrackerSnapshot,
+  MarkdownTrackerStore,
+  ProjectDeletedMarkdownTrackerTaskRequest,
+  ProjectMarkdownTrackerRequest,
+  ProjectMarkdownTrackerResult,
+  ResolveMarkdownTrackerConflictRequest,
+  ResolveMarkdownTrackerConflictResult,
+} from "./markdown-tracker.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -560,6 +583,9 @@ export interface CoreContract {
   readonly readKnowledgeCandidate: typeof readKnowledgeCandidate;
   readonly reviewKnowledgeCandidate: typeof reviewKnowledgeCandidate;
   readonly promoteKnowledgeCandidate: typeof promoteKnowledgeCandidate;
+  readonly projectMarkdownTracker: typeof projectMarkdownTracker;
+  readonly projectDeletedMarkdownTrackerTask: typeof projectDeletedMarkdownTrackerTask;
+  readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -628,6 +654,9 @@ export const coreContract: CoreContract = Object.freeze({
   readKnowledgeCandidate,
   reviewKnowledgeCandidate,
   promoteKnowledgeCandidate,
+  projectMarkdownTracker,
+  projectDeletedMarkdownTrackerTask,
+  resolveMarkdownTrackerConflict,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
