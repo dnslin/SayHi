@@ -32,6 +32,7 @@ import {
   projectMarkdownTracker,
   resolveMarkdownTrackerConflict,
 } from "./markdown-tracker.js";
+import { projectTrackerProjection } from "./tracker-projection.js";
 import {
   readRouteDefinition,
   readGateEvidenceKinds,
@@ -181,6 +182,25 @@ export type {
   ResolveMarkdownTrackerConflictRequest,
   ResolveMarkdownTrackerConflictResult,
 } from "./markdown-tracker.js";
+export {
+  TRACKER_PROJECTION_CONTRACT_VERSION,
+  projectTrackerProjection,
+} from "./tracker-projection.js";
+export type {
+  ProjectTrackerProjectionRequest,
+  ProjectTrackerProjectionResult,
+  TrackerProjectionAdapter,
+  TrackerProjectionAdapterOutcome,
+  TrackerProjectionConflict,
+  TrackerProjectionDiagnostic,
+  TrackerProjectionDiagnosticCode,
+  TrackerProjectionMapping,
+  TrackerProjectionMutation,
+  TrackerProjectionOperation,
+  TrackerProjectionPayload,
+  TrackerProjectionRemoteResource,
+  TrackerProjectionStore,
+} from "./tracker-projection.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -586,6 +606,7 @@ export interface CoreContract {
   readonly projectMarkdownTracker: typeof projectMarkdownTracker;
   readonly projectDeletedMarkdownTrackerTask: typeof projectDeletedMarkdownTrackerTask;
   readonly resolveMarkdownTrackerConflict: typeof resolveMarkdownTrackerConflict;
+  readonly projectTrackerProjection: typeof projectTrackerProjection;
   readonly bindPhaseExecution: typeof bindPhaseExecution;
   readonly authorizePhaseExecution: typeof authorizePhaseExecution;
   readonly readRouteDefinition: typeof readRouteDefinition;
@@ -657,6 +678,7 @@ export const coreContract: CoreContract = Object.freeze({
   projectMarkdownTracker,
   projectDeletedMarkdownTrackerTask,
   resolveMarkdownTrackerConflict,
+  projectTrackerProjection,
   bindPhaseExecution,
   authorizePhaseExecution,
   readRouteDefinition,
