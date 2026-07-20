@@ -10,15 +10,24 @@ import { fileURLToPath } from "node:url";
 import type { CliJsonEnvelope } from "@dnslin/sayhi-cli";
 import { createHash } from "node:crypto";
 
-import { NodeManagedProjectFileSystem } from "@dnslin/sayhi-cli";
 import {
+  CLI_MANAGED_PROJECT_INSTALLATION,
+  NodeManagedProjectFileSystem,
+} from "@dnslin/sayhi-cli";
+import {
+  applyManagedProjectPlan,
   coreContract,
+  MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
+  planManagedProjectUninstall,
+  planManagedProjectUpdate,
   withDurableTaskWriter,
+  type ApplyManagedProjectPlanResult,
   type ContractIdentity,
   type WorkflowLifecycle,
   type WorkflowPhase,
   type WorkflowState,
 } from "@dnslin/sayhi-core";
+import { readOmpBootstrapContract } from "@dnslin/sayhi-omp";
 
 import {
   IMPLEMENTATION_AGENT,
@@ -547,6 +556,193 @@ test("packaged CLI demonstrates recoverable Foundation state through safe uninst
   await assert.rejects(readFile(runtimeIgnorePath, "utf8"));
   await assert.rejects(readFile(manifestPath, "utf8"));
   await assert.rejects(readFile(ownershipPath, "utf8"));
+});
+
+test("packaged CLI and OMP migrate durable Project Store data", async (t) => {
+  const repository = await createInitializedManagedProject("sayhi-packaged-migration-");
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+  assert.equal(readOmpBootstrapContract().product, "SayHi");
+  await writeTaskRequest(
+    repository,
+    "task-create.json",
+    taskLifecycleStartRequest(FOUNDATION_TASK, "2026-07-20T12:00:00Z"),
+  );
+  const created = await executeCliResult(
+    "task",
+    "create",
+    "--from",
+    "task-create.json",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(created.exitCode, 0);
+
+  const taskDirectory = join(repository, ".sayhi", "tasks", FOUNDATION_TASK.taskId);
+  const eventsPath = join(taskDirectory, "events.jsonl");
+  const projectionPath = join(taskDirectory, "task.json");
+  const provenancePath = join(taskDirectory, "evidence", "provenance.json");
+  const provenance = "{\"source\":\"issue-37\"}\n";
+  await mkdir(dirname(provenancePath), { recursive: true });
+  await writeFile(provenancePath, provenance, "utf8");
+  const eventsBeforeMigration = await readFile(eventsPath, "utf8");
+  const projectionBeforeMigration = await readFile(projectionPath, "utf8");
+  const ownershipBeforeMigration = await readManagedProjectOwnership(repository);
+  await downgradeManagedProjectToLegacyRuntimeTemplate(repository);
+
+  const migration = await executeCliResult(
+    "update",
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(migration.exitCode, 0);
+  assert.equal(
+    await readFile(join(repository, ".sayhi", ".gitignore"), "utf8"),
+    CURRENT_RUNTIME_IGNORE_CONTENT,
+  );
+  const migratedManifest = requireRecord(
+    JSON.parse(await readFile(join(repository, ".sayhi", "manifest.json"), "utf8")),
+    "Project Manifest",
+  );
+  const installedVersions = requireRecord(
+    migratedManifest.installed,
+    "Installed versions",
+  );
+  assert.equal(
+    requireString(installedVersions, "templates"),
+    CLI_MANAGED_PROJECT_INSTALLATION.templates,
+  );
+  assert.equal(await readFile(eventsPath, "utf8"), eventsBeforeMigration);
+  assert.equal(await readFile(projectionPath, "utf8"), projectionBeforeMigration);
+  assert.equal(await readFile(provenancePath, "utf8"), provenance);
+  const continuity = await executeCliResult(
+    "task",
+    "show",
+    FOUNDATION_TASK.taskId,
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(continuity.exitCode, 0);
+  const ownershipAfterMigration = await readManagedProjectOwnership(repository);
+  assert.deepEqual([...ownershipAfterMigration.keys()].sort(), [
+    ".sayhi/.gitignore",
+    ".sayhi/config.yaml",
+  ]);
+  const configBeforeMigration = ownershipBeforeMigration.get(".sayhi/config.yaml");
+  const configAfterMigration = ownershipAfterMigration.get(".sayhi/config.yaml");
+  assert.ok(configBeforeMigration);
+  assert.ok(configAfterMigration);
+  assert.deepEqual(configAfterMigration, configBeforeMigration);
+  const runtimeAfterMigration = ownershipAfterMigration.get(".sayhi/.gitignore");
+  assert.ok(runtimeAfterMigration);
+  assert.equal(
+    requireString(runtimeAfterMigration, "ownershipClass"),
+    "engine-owned",
+  );
+  assert.equal(
+    requireString(runtimeAfterMigration, "generatedSourceVersion"),
+    CLI_MANAGED_PROJECT_INSTALLATION.templates,
+  );
+  const installedBaseIdentity = requireRecord(
+    runtimeAfterMigration.installedBaseIdentity,
+    "Runtime ignore installed base identity",
+  );
+  assert.equal(requireString(installedBaseIdentity, "algorithm"), "sha256-lf-v1");
+  assert.equal(
+    requireString(installedBaseIdentity, "digest"),
+    createHash("sha256").update(CURRENT_RUNTIME_IGNORE_CONTENT, "utf8").digest("hex"),
+  );
+});
+
+test("packaged CLI recovers a failed Project Store update", async (t) => {
+  const repository = await createInitializedManagedProject("sayhi-failed-update-");
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+
+  const userConfig = "schemaVersion: 1\nuserSetting: keep\n";
+  await writeFile(join(repository, ".sayhi", "config.yaml"), userConfig, "utf8");
+  const failingFileSystem = new FailingNodeManagedProjectFileSystem(repository);
+  const updatePlan = await planManagedProjectUpdate({
+    fileSystem: failingFileSystem,
+    installation: CLI_MANAGED_PROJECT_INSTALLATION,
+    files: [
+      {
+        path: ".sayhi/config.yaml",
+        ownershipClass: "user-owned",
+        installedContent: "schemaVersion: 1\n",
+        incomingContent: "schemaVersion: 1\n",
+        generatedSourceVersion: CLI_MANAGED_PROJECT_INSTALLATION.templates,
+        markerIds: [],
+      },
+      {
+        path: ".sayhi/.gitignore",
+        ownershipClass: "engine-owned",
+        installedContent: CURRENT_RUNTIME_IGNORE_CONTENT,
+        incomingContent: CURRENT_RUNTIME_IGNORE_CONTENT,
+        generatedSourceVersion: CLI_MANAGED_PROJECT_INSTALLATION.templates,
+        markerIds: [],
+      },
+    ],
+  });
+  assert.equal(updatePlan.ok, true);
+  if (!updatePlan.ok) {
+    return;
+  }
+  failingFileSystem.failNextWrite(".sayhi/manifest.json");
+  const failedUpdate = await applyManagedProjectPlan({
+    fileSystem: failingFileSystem,
+    plan: updatePlan.plan,
+    timestamp: "2026-07-20T12:01:00Z",
+  });
+  assertManagedProjectOperationFailsRecoverably(failedUpdate);
+  await recoverManagedProjectOperationWithCli(repository, "update");
+  assert.equal(await readFile(join(repository, ".sayhi", "config.yaml"), "utf8"), userConfig);
+});
+
+test("packaged CLI recovers a failed Project Store uninstall without removing User-owned data", async (t) => {
+  const ompAgents = "user-owned OMP agents\n";
+  const ompRules = "user-owned OMP rules\n";
+  const rootAgents = "user-owned root agents\n";
+  const repository = await createInitializedManagedProject(
+    "sayhi-failed-uninstall-",
+    async (project) => {
+      await mkdir(join(project, ".omp"));
+      await writeFile(join(project, ".omp", "AGENTS.md"), ompAgents, "utf8");
+      await writeFile(join(project, ".omp", "RULES.md"), ompRules, "utf8");
+      await writeFile(join(project, "AGENTS.md"), rootAgents, "utf8");
+    },
+  );
+  t.after(async () => rm(repository, { recursive: true, force: true }));
+
+  const userConfig = "schemaVersion: 1\nuserSetting: keep\n";
+  await writeFile(join(repository, ".sayhi", "config.yaml"), userConfig, "utf8");
+  const failingFileSystem = new FailingNodeManagedProjectFileSystem(repository);
+  const uninstallPlan = await planManagedProjectUninstall({
+    fileSystem: failingFileSystem,
+    files: [
+      { path: ".sayhi/config.yaml", installedContent: "schemaVersion: 1\n" },
+      { path: ".sayhi/.gitignore", installedContent: CURRENT_RUNTIME_IGNORE_CONTENT },
+    ],
+  });
+  assert.equal(uninstallPlan.ok, true);
+  if (!uninstallPlan.ok) {
+    return;
+  }
+  failingFileSystem.failNextRemoval(".sayhi/manifest.json");
+  const failedUninstall = await applyManagedProjectPlan({
+    fileSystem: failingFileSystem,
+    plan: uninstallPlan.plan,
+    timestamp: "2026-07-20T12:02:00Z",
+  });
+  assertManagedProjectOperationFailsRecoverably(failedUninstall);
+  await recoverManagedProjectOperationWithCli(repository, "uninstall");
+  assert.equal(await readFile(join(repository, ".sayhi", "config.yaml"), "utf8"), userConfig);
+  assert.equal(await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"), ompAgents);
+  assert.equal(await readFile(join(repository, ".omp", "RULES.md"), "utf8"), ompRules);
+  assert.equal(await readFile(join(repository, "AGENTS.md"), "utf8"), rootAgents);
+  await assert.rejects(readFile(join(repository, ".sayhi", "manifest.json"), "utf8"));
 });
 
 test("packaged CLI creates and inspects a durable Task", async (t) => {
@@ -1792,7 +1988,7 @@ test("Core recovers a committed Task after commit Evidence persistence fails", a
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-commit-recovery-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   await prepareScopedFinishTask(repository);
-  const fileSystem = new FailingCommitEvidenceFileSystem(repository);
+  const fileSystem = new FailingNodeManagedProjectFileSystem(repository);
   const evidencePath = `.sayhi/tasks/${FOUNDATION_TASK.taskId}/evidence/commit.json`;
   fileSystem.failNextWrite(evidencePath);
   const headBefore = await readGitHead(repository);
@@ -2025,19 +2221,32 @@ test("packaged CLI refuses destructive Git requests without changing repository 
   });
   assert.equal(status.stdout, "");
 });
-class FailingCommitEvidenceFileSystem extends NodeManagedProjectFileSystem {
-  #failedPath: string | null = null;
+class FailingNodeManagedProjectFileSystem extends NodeManagedProjectFileSystem {
+  #writeFailure: string | null = null;
+  #removalFailure: string | null = null;
 
   failNextWrite(path: string): void {
-    this.#failedPath = path;
+    this.#writeFailure = path;
+  }
+
+  failNextRemoval(path: string): void {
+    this.#removalFailure = path;
   }
 
   override async writeFile(path: string, content: string): Promise<void> {
-    if (path === this.#failedPath) {
-      this.#failedPath = null;
+    if (path === this.#writeFailure) {
+      this.#writeFailure = null;
       throw new Error(`Injected write failure: ${path}`);
     }
     await super.writeFile(path, content);
+  }
+
+  override async removeFile(path: string): Promise<void> {
+    if (path === this.#removalFailure) {
+      this.#removalFailure = null;
+      throw new Error(`Injected removal failure: ${path}`);
+    }
+    await super.removeFile(path);
   }
 }
 
@@ -2056,6 +2265,7 @@ class FailingArchiveEventFileSystem extends NodeManagedProjectFileSystem {
     await super.appendFile(path, content);
   }
 }
+
 
 async function prepareScopedFinishTask(repository: string): Promise<WorkflowState> {
   await runGit(repository, "init", "--quiet");
@@ -2510,6 +2720,35 @@ async function executeCliResultFor(
   }
 }
 
+function assertManagedProjectOperationFailsRecoverably(
+  result: ApplyManagedProjectPlanResult,
+): void {
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    return;
+  }
+  assert.equal(result.diagnostics[0]?.code, "managed_project.io_failed");
+  assert.match(result.diagnostics[0]?.remediation ?? "", /recover/u);
+}
+
+async function recoverManagedProjectOperationWithCli(
+  repository: string,
+  operation: "update" | "uninstall",
+): Promise<void> {
+  await readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8");
+  const recovered = await executeCliResult(
+    operation,
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(recovered.exitCode, 0);
+  await assert.rejects(
+    readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8"),
+  );
+}
+
 
 async function readGitHead(repository: string): Promise<string> {
   const result = await executeFile("git", ["rev-parse", "HEAD"], {
@@ -2517,6 +2756,72 @@ async function readGitHead(repository: string): Promise<string> {
     windowsHide: true,
   });
   return result.stdout.trim();
+}
+
+async function createInitializedManagedProject(
+  directoryPrefix: string,
+  beforeInitialization?: (repository: string) => Promise<void>,
+): Promise<string> {
+  const repository = await mkdtemp(join(tmpdir(), directoryPrefix));
+  await mkdir(join(repository, ".git"));
+  if (beforeInitialization !== undefined) {
+    await beforeInitialization(repository);
+  }
+  const initialized = await executeCliResult("init", "--cwd", repository, "--json");
+  assert.equal(initialized.exitCode, 0);
+  return repository;
+}
+
+async function downgradeManagedProjectToLegacyRuntimeTemplate(repository: string): Promise<void> {
+  const runtimeIgnorePath = join(repository, ".sayhi", ".gitignore");
+  const ownershipPath = join(repository, ".sayhi", "managed-files.json");
+  const manifestPath = join(repository, ".sayhi", "manifest.json");
+  await writeFile(runtimeIgnorePath, LEGACY_RUNTIME_IGNORE_CONTENT, "utf8");
+
+  const ownership = requireRecord(
+    JSON.parse(await readFile(ownershipPath, "utf8")),
+    "Ownership Manifest",
+  );
+  assert.ok(Array.isArray(ownership.files));
+  const runtimeRecord = ownership.files
+    .map((record) => requireRecord(record, "Ownership record"))
+    .find((record) => record.path === ".sayhi/.gitignore");
+  assert.ok(runtimeRecord);
+  const installedBaseIdentity = requireRecord(
+    runtimeRecord.installedBaseIdentity,
+    "Runtime ignore installed base identity",
+  );
+  installedBaseIdentity.digest = createHash("sha256")
+    .update(LEGACY_RUNTIME_IGNORE_CONTENT)
+    .digest("hex");
+  runtimeRecord.generatedSourceVersion = "0.0.0";
+  await writeFile(ownershipPath, `${JSON.stringify(ownership, null, 2)}\n`, "utf8");
+
+  const manifest = requireRecord(
+    JSON.parse(await readFile(manifestPath, "utf8")),
+    "Project Manifest",
+  );
+  const installed = requireRecord(manifest.installed, "Installed versions");
+  installed.templates = "0.0.0";
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+}
+
+async function readManagedProjectOwnership(
+  repository: string,
+): Promise<ReadonlyMap<string, Record<string, unknown>>> {
+  const ownership = requireRecord(
+    JSON.parse(await readFile(join(repository, ".sayhi", "managed-files.json"), "utf8")),
+    "Ownership Manifest",
+  );
+  assert.ok(Array.isArray(ownership.files));
+  const records = new Map<string, Record<string, unknown>>();
+  for (const value of ownership.files) {
+    const record = requireRecord(value, "Ownership record");
+    const path = requireString(record, "path");
+    assert.equal(records.has(path), false, `Duplicate ownership record: ${path}`);
+    records.set(path, record);
+  }
+  return records;
 }
 
 async function snapshotRepositoryFiles(repository: string): Promise<ReadonlyMap<string, string>> {
