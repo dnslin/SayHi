@@ -2621,12 +2621,40 @@ async function packArtifactPackages(workspace: string): Promise<readonly string[
     Object.entries(PACKAGED_ARTIFACT_DIRECTORIES).map(async ([name, source]) => {
       const staging = join(workspace, "packages", name);
       await mkdir(staging, { recursive: true });
-      await cp(join(source, "package.json"), join(staging, "package.json"));
+      await Promise.all(
+        [
+          "package.json",
+          ...(name === "testing" ? [] : ["LICENSE", "THIRD_PARTY_NOTICES.md"]),
+          ...(name === "omp" ? ["README.md"] : []),
+        ].map(
+          async (file) => cp(join(source, file), join(staging, file)),
+        ),
+      );
       await cp(join(source, "dist"), join(staging, "dist"), { recursive: true });
-      await executeFile(NPM_EXECUTABLE, npmArguments(["pack", "--json"]), {
-        cwd: staging,
-        windowsHide: true,
-      });
+      const packed = await executeFile(
+        NPM_EXECUTABLE,
+        npmArguments(["pack", "--json"]),
+        {
+          cwd: staging,
+          windowsHide: true,
+        },
+      );
+      const packageManifest = JSON.parse(packed.stdout) as readonly {
+        readonly files: readonly Readonly<{ readonly path: string }>[];
+      }[];
+      const packagedPaths = packageManifest[0]?.files.map((file) => file.path);
+      assert.ok(packagedPaths, `Packed ${name} artifact is missing its file manifest.`);
+      if (name !== "testing") {
+        assert.equal(packagedPaths.includes("LICENSE"), true);
+        assert.equal(packagedPaths.includes("THIRD_PARTY_NOTICES.md"), true);
+      }
+      if (name === "omp") {
+        assert.equal(packagedPaths.includes("README.md"), true);
+        assert.equal(
+          packagedPaths.some((path) => path.endsWith(".tsbuildinfo")),
+          false,
+        );
+      }
       const tarball = (await readdir(staging)).find((entry) => entry.endsWith(".tgz"));
       assert.ok(tarball, `Packed ${name} artifact is missing.`);
       return join(staging, tarball);

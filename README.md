@@ -43,6 +43,7 @@ npm run test:contracts
 - [Supply-chain and update specification](./docs/spec/supply-chain.md)
 - [Acceptance criteria](./docs/spec/acceptance.md)
 - [Implementation roadmap](./docs/implementation/roadmap.md)
+- [OMP Marketplace and package installation](./packages/omp-plugin/README.md)
 - [Architecture decisions](./docs/adr/)
 - [Research references](./docs/references.md)
 

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "sayhi",
+  "owner": {
+    "name": "dnslin"
+  },
+  "metadata": {
+    "description": "SayHi coordinated Core, CLI, and OMP release metadata."
+  },
+  "plugins": [
+    {
+      "name": "sayhi",
+      "description": "SayHi release metadata. This release exposes no OMP runtime commands, Agents, hooks, MCP servers, or LSP servers.",
+      "author": {
+        "name": "dnslin"
+      },
+      "homepage": "https://github.com/dnslin/SayHi",
+      "category": "development",
+      "tags": ["workflow", "release-metadata"],
+      "repository": "https://github.com/dnslin/SayHi",
+      "license": "MIT",
+      "source": "./packages/omp-plugin",
+      "commands": [],
+      "agents": [],
+      "hooks": [],
+      "mcpServers": [],
+      "lspServers": []
+    }
+  ]
+}
