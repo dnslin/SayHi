@@ -8,6 +8,10 @@ import {
   type ProjectManifestRecord,
 } from "./record-contracts.js";
 import { hasUnambiguousManagedBlocks } from "./managed-blocks.js";
+import {
+  verifySkillBundleInstallation,
+  type SkillBundle,
+} from "./skill-bundle.js";
 
 export const MANAGED_PROJECT_CONTRACT_VERSION = 1 as const;
 
@@ -58,6 +62,7 @@ export type ManagedProjectDiagnosticCode =
   | "managed_project.corrupt"
   | "managed_project.path_unsafe"
   | "managed_project.file_missing"
+  | "managed_project.skill_bundle_invalid"
   | "managed_project.file_modified"
   | "managed_project.io_failed";
 
@@ -71,6 +76,7 @@ export interface ManagedProjectDiagnostic {
 export interface DiagnoseManagedProjectRequest {
   readonly fileSystem: ManagedProjectFileSystem;
   readonly installation: InstalledProjectVersions;
+  readonly skillBundle: SkillBundle;
 }
 
 type ManagedProjectFailure<
@@ -116,6 +122,10 @@ interface OwnershipManifest {
 export async function initializeManagedProject(
   request: InitializeManagedProjectRequest,
 ): Promise<InitializeManagedProjectResult> {
+  const bundleFailure = installedSkillBundleFailure(request);
+  if (bundleFailure !== null) {
+    return initializationFailure(bundleFailure);
+  }
   try {
     const store = await request.fileSystem.inspect(".sayhi");
     if (store.kind === "directory") {
@@ -205,6 +215,10 @@ export async function initializeManagedProject(
 export async function diagnoseManagedProject(
   request: DiagnoseManagedProjectRequest,
 ): Promise<DiagnoseManagedProjectResult> {
+  const bundleFailure = installedSkillBundleFailure(request);
+  if (bundleFailure !== null) {
+    return bundleFailure;
+  }
   try {
     const store = await request.fileSystem.inspect(".sayhi");
     if (store.kind === "missing") {
@@ -470,6 +484,25 @@ function sameInstallation(
     actual.templates === expected.templates &&
     actual.skillLockDigest.toLowerCase() ===
       expected.skillLockDigest.toLowerCase()
+  );
+}
+
+function installedSkillBundleFailure(
+  request: DiagnoseManagedProjectRequest,
+): ManagedProjectFailure<"corrupt"> | null {
+  const verification = verifySkillBundleInstallation({
+    bundle: request.skillBundle,
+    installation: request.installation,
+  });
+  if (verification.ok) {
+    return null;
+  }
+  const diagnostic = verification.diagnostics[0]!;
+  return corrupt(
+    "managed_project.skill_bundle_invalid",
+    `${PROJECT_MANIFEST_PATH}#installed.skillLockDigest`,
+    diagnostic.message,
+    diagnostic.remediation,
   );
 }
 

@@ -15,6 +15,8 @@ import {
   type WorkflowTransition,
 } from "@dnslin/sayhi-core";
 
+const SKILL_LOCK_IDENTITY = `sha256:${"c".repeat(64)}` as ContractIdentity;
+
 const routeTransitions = {
   quick: [
     transition("active", "triage", "active", "implement", "route"),
@@ -1621,6 +1623,7 @@ test("Core rejects results from superseded Phase dispatches", () => {
     requestedAt: "2026-07-17T10:12:00Z",
     contextManifestIdentity: `sha256:${"a".repeat(64)}`,
     agentContractIdentity: `sha256:${"b".repeat(64)}`,
+    skillLockIdentity: SKILL_LOCK_IDENTITY,
     skillIdentities: [],
   };
   const first = coreContract.recordPhaseExecutionDispatch(state, {
@@ -1824,6 +1827,7 @@ test("replay requires Review dispatches to use the Implementation fingerprint", 
       requestedAt: "2026-07-17T10:10:15Z",
       contextManifestIdentity: `sha256:${"c".repeat(64)}`,
       agentContractIdentity: `sha256:${"b".repeat(64)}`,
+      skillLockIdentity: SKILL_LOCK_IDENTITY,
       skillIdentities: [],
     },
   };
@@ -2581,6 +2585,7 @@ function recordWorkflowAgentResult(
     requestedAt: "2026-07-17T10:00:00Z",
     contextManifestIdentity: `sha256:${"a".repeat(64)}`,
     agentContractIdentity: `sha256:${"b".repeat(64)}`,
+    skillLockIdentity: SKILL_LOCK_IDENTITY,
     skillIdentities: [],
   };
   const dispatched = coreContract.recordPhaseExecutionDispatch(state, {

@@ -8,6 +8,7 @@ import {
   validateContractRecord,
   type AgentResultRecord,
 } from "./record-contracts.js";
+import { verifySkillBundle, type SkillBundle } from "./skill-bundle.js";
 import {
   contentMatchesIdentity,
   validateContextManifestEntries,
@@ -115,6 +116,7 @@ export interface PhaseExecutionMaterials {
   readonly currentContext: readonly CurrentContextContent[];
   readonly agentContract: PhaseAgentContract;
   readonly skills: readonly SkillMaterial[];
+  readonly skillBundle: SkillBundle;
 }
 
 export interface BindPhaseExecutionRequest extends PhaseExecutionMaterials {
@@ -138,6 +140,7 @@ export interface PhaseExecutionBinding {
   readonly requestedAt: string;
   readonly contextManifestIdentity: ContractIdentity;
   readonly agentContractIdentity: ContractIdentity;
+  readonly skillLockIdentity: ContractIdentity;
   readonly skillIdentities: readonly BoundSkillIdentity[];
 }
 
@@ -145,7 +148,11 @@ export function parsePhaseExecutionBinding(
   value: unknown,
 ): PhaseExecutionBinding | null {
   try {
-    if (!isUnknownRecord(value) || !Array.isArray(value.skillIdentities)) {
+    if (
+      !isUnknownRecord(value) ||
+      !Array.isArray(value.skillIdentities) ||
+      !isContractIdentity(value.skillLockIdentity)
+    ) {
       return null;
     }
     const dispatch = {
@@ -197,6 +204,7 @@ export function parsePhaseExecutionBinding(
       requestedAt: dispatch.requestedAt,
       contextManifestIdentity: dispatch.contextManifestIdentity,
       agentContractIdentity: dispatch.agentContractIdentity,
+      skillLockIdentity: value.skillLockIdentity,
       skillIdentities: Object.freeze(skillIdentities),
     });
   } catch {
@@ -354,6 +362,7 @@ function bindReadablePhaseExecution(
     requestedAt: request.dispatch.requestedAt,
     contextManifestIdentity: request.dispatch.contextManifestIdentity,
     agentContractIdentity: request.dispatch.agentContractIdentity,
+    skillLockIdentity: skillsResult.skillLockIdentity,
     skillIdentities: skillsResult.skillIdentities,
   });
   return Object.freeze({
@@ -424,9 +433,19 @@ function authorizeReadablePhaseExecution(
     currentContext: request.currentContext,
     agentContract: request.agentContract,
     skills: request.skills,
+    skillBundle: request.skillBundle,
   });
   if (!rebound.ok) {
     return rebound;
+  }
+
+  if (rebound.binding.skillLockIdentity !== binding.skillLockIdentity) {
+    return failure(
+      "execution.skill_invalid",
+      "$.binding.skillLockIdentity",
+      "Effective Skill Bundle Lock does not match the Phase execution binding.",
+      "Restore the exact locked Skill Bundle before requesting a capability.",
+    );
   }
 
   const skillIdentitiesMatch =
@@ -759,12 +778,26 @@ type BindSkillIdentitiesResult =
   | Readonly<{
       ok: true;
       skillIdentities: readonly BoundSkillIdentity[];
+      skillLockIdentity: ContractIdentity;
     }>
   | PhaseExecutionFailure;
 
 function bindSkillIdentities(
   request: BindPhaseExecutionRequest,
 ): BindSkillIdentitiesResult {
+  const bundle = verifySkillBundle(request.skillBundle);
+  if (!bundle.ok) {
+    const diagnostic = bundle.diagnostics[0]!;
+    return failure(
+      "execution.skill_invalid",
+      diagnostic.path === "$"
+        ? "$.skillBundle"
+        : `$.skillBundle${diagnostic.path.slice(1)}`,
+      diagnostic.message,
+      diagnostic.remediation,
+    );
+  }
+
   const materialNames = new Set<string>();
   for (let index = 0; index < request.skills.length; index += 1) {
     const material = request.skills[index];
@@ -798,6 +831,15 @@ function bindSkillIdentities(
         "Restore the locked Skill or regenerate the Agent Capability Contract.",
       );
     }
+    const bundledSkill = bundle.skills.find((candidate) => candidate.name === name);
+    if (bundledSkill === undefined) {
+      return failure(
+        "execution.skill_invalid",
+        `$.agentContract.skills[${index}]`,
+        "A Skill declared by the Phase Agent is absent from the release Skill Bundle.",
+        "Restore the locked Skill Bundle or regenerate the Agent Capability Contract.",
+      );
+    }
     if (
       !validateDomainValue({
         contractVersion: DOMAIN_VALIDATION_CONTRACT_VERSION,
@@ -812,6 +854,19 @@ function bindSkillIdentities(
         "Use a supported SHA-256 content identity with a 64-character hexadecimal digest.",
       );
     }
+    if (
+      skill.identity.algorithm !== bundledSkill.skillFile.identity.algorithm ||
+      skill.identity.digest.toLowerCase() !==
+        bundledSkill.skillFile.identity.digest.toLowerCase()
+    ) {
+      return failure(
+        "execution.skill_invalid",
+        `$.skills[${skillIndex}].identity`,
+        "Effective Skill identity does not match the release Skill Bundle.",
+        "Restore the locked Skill revision before dispatch.",
+      );
+    }
+
     if (
       (typeof skill.content !== "string" &&
         !(skill.content instanceof Uint8Array)) ||
@@ -851,6 +906,7 @@ function bindSkillIdentities(
   return Object.freeze({
     ok: true,
     skillIdentities: Object.freeze(skillIdentities),
+    skillLockIdentity: bundle.lockIdentity,
   });
 }
 

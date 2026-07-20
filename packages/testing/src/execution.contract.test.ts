@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { coreContract } from "@dnslin/sayhi-core";
+import {
+  IMPLEMENTATION_SKILL_MATERIALS,
+  TEST_SKILL_BUNDLE,
+} from "./skill-bundle-test-support.js";
 
 const manifest = [
   {
@@ -100,24 +104,22 @@ const agentContract = {
   overridePolicy: "prompt-body-only",
 } as const;
 
-const skills = [
-  {
-    name: "implement",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-    },
-    content: "implement skill\n",
-  },
-  {
-    name: "tdd",
-    identity: {
-      algorithm: "sha256-lf-v1",
-      digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-    },
-    content: "tdd skill\n",
-  },
-] as const;
+const skills = IMPLEMENTATION_SKILL_MATERIALS;
+const skillBundle = TEST_SKILL_BUNDLE;
+
+function withSkillBundle(request: unknown): unknown {
+  return typeof request === "object" && request !== null && !Array.isArray(request)
+    ? { skillBundle, ...request }
+    : request;
+}
+
+function bindPhaseExecution(request: unknown) {
+  return coreContract["bindPhaseExecution"](withSkillBundle(request) as never);
+}
+
+function authorizePhaseExecution(request: unknown) {
+  return coreContract["authorizePhaseExecution"](withSkillBundle(request) as never);
+}
 
 const dispatch = {
   schemaVersion: 1,
@@ -135,7 +137,7 @@ const dispatch = {
 } as const;
 
 test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identities", () => {
-  const result = coreContract.bindPhaseExecution({
+  const result = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -144,6 +146,10 @@ test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identit
     skills,
   });
 
+  const verifiedBundle = coreContract.verifySkillBundle(skillBundle);
+  if (!verifiedBundle.ok) {
+    assert.fail("Expected the fixture to produce a valid Skill Bundle.");
+  }
   assert.deepEqual(result, {
     ok: true,
     contractVersion: 1,
@@ -158,6 +164,7 @@ test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identit
       requestedAt: dispatch.requestedAt,
       contextManifestIdentity: dispatch.contextManifestIdentity,
       agentContractIdentity: dispatch.agentContractIdentity,
+      skillLockIdentity: verifiedBundle.lockIdentity,
       skillIdentities: skills.map(({ name, identity }) => ({ name, identity })),
     },
   });
@@ -166,6 +173,62 @@ test("Core binds a valid four-tier Manifest to the Phase Agent and Skill identit
   assert.equal(Object.isFrozen(result.binding.skillIdentities), true);
 });
 
+test("Core refuses Phase dispatch when the complete locked Skill bundle is missing a file", () => {
+  const result = bindPhaseExecution({
+    contractVersion: 1,
+    dispatch,
+    manifest,
+    currentContext,
+    agentContract,
+    skills,
+    skillBundle: { ...skillBundle, files: skillBundle.files.slice(1) },
+  } as never);
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0]?.code, "execution.skill_invalid");
+    assert.equal(result.diagnostics[0]?.path, "$.skillBundle.files");
+  }
+});
+
+
+test("Core refuses authorization when an unchanged Skill file set has a substituted Skill Lock", () => {
+  const bound = bindPhaseExecution({
+    contractVersion: 1,
+    dispatch,
+    manifest,
+    currentContext,
+    agentContract,
+    skills,
+  });
+  assert.equal(bound.ok, true);
+  if (!bound.ok) {
+    return;
+  }
+
+  const result = authorizePhaseExecution({
+    contractVersion: 1,
+    binding: bound.binding,
+    manifest,
+    currentContext,
+    agentContract,
+    skills,
+    skillBundle: {
+      ...skillBundle,
+      lock: {
+        ...skillBundle.lock,
+        registry: { ...skillBundle.lock.registry, commit: "f".repeat(40) },
+      },
+    },
+    capability: { kind: "tool", name: "edit" },
+  });
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.diagnostics[0]?.code, "execution.skill_invalid");
+    assert.equal(result.diagnostics[0]?.path, "$.binding.skillLockIdentity");
+  }
+});
 test("Core rejects dispatches without a valid Baseline fingerprint and request time", () => {
   const cases = [
     {
@@ -184,7 +247,7 @@ test("Core rejects dispatches without a valid Baseline fingerprint and request t
 
   for (const invalidCase of cases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch: invalidCase.dispatch as never,
         manifest,
@@ -217,7 +280,7 @@ test("Core rejects instruction authority on Task Context and Untrusted Reference
   );
 
   assert.deepEqual(
-    coreContract.bindPhaseExecution({
+    bindPhaseExecution({
       contractVersion: 1,
       dispatch: {
         ...dispatch,
@@ -274,7 +337,7 @@ test("Core invalidates the binding when required context changes or disappears",
 
   for (const currentContextCase of cases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch,
         manifest,
@@ -297,7 +360,7 @@ test("Core rejects a Manifest entry outside the four Trust Tiers", () => {
   );
 
   assert.deepEqual(
-    coreContract.bindPhaseExecution({
+    bindPhaseExecution({
       contractVersion: 1,
       dispatch: {
         ...dispatch,
@@ -386,7 +449,7 @@ test("Core rejects changed Agent and missing or changed Skill identities", () =>
 
   for (const identityCase of cases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch,
         manifest,
@@ -429,7 +492,7 @@ test("Core rejects a Phase Agent role that mismatches its contract or Phase", ()
 
   for (const roleCase of cases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch: roleCase.dispatch,
         manifest,
@@ -447,7 +510,7 @@ test("Core rejects a Phase Agent role that mismatches its contract or Phase", ()
 });
 
 test("Core authorizes one declared tool and denies an undeclared tool", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -469,7 +532,7 @@ test("Core authorizes one declared tool and denies an undeclared tool", () => {
     skills,
   } as const;
 
-  const allowed = coreContract.authorizePhaseExecution({
+  const allowed = authorizePhaseExecution({
     ...request,
     capability: { kind: "tool", name: "edit" },
   });
@@ -490,7 +553,7 @@ test("Core authorizes one declared tool and denies an undeclared tool", () => {
   assert.equal(Object.isFrozen(allowed.authorization.capability), true);
 
   assert.deepEqual(
-    coreContract.authorizePhaseExecution({
+    authorizePhaseExecution({
       ...request,
       capability: { kind: "tool", name: "write" },
     }),
@@ -512,7 +575,7 @@ test("Core authorizes one declared tool and denies an undeclared tool", () => {
 });
 
 test("Core authorizes repository operations and Skills inside the sealed contract", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -532,7 +595,7 @@ test("Core authorizes repository operations and Skills inside the sealed contrac
   ] as const;
   for (const capability of capabilities) {
     assert.deepEqual(
-      coreContract.authorizePhaseExecution({
+      authorizePhaseExecution({
         contractVersion: 1,
         binding: bound.binding,
         manifest,
@@ -563,7 +626,7 @@ test("Core authorizes only configured network and declared spawn capabilities", 
     network: "configured",
     spawns: ["research"],
   } as const;
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch: {
       ...dispatch,
@@ -586,7 +649,7 @@ test("Core authorizes only configured network and declared spawn capabilities", 
   ] as const;
   for (const capability of capabilities) {
     assert.deepEqual(
-      coreContract.authorizePhaseExecution({
+      authorizePhaseExecution({
         contractVersion: 1,
         binding: bound.binding,
         manifest,
@@ -612,7 +675,7 @@ test("Core authorizes only configured network and declared spawn capabilities", 
 });
 
 test("Core denies every capability outside the Phase Agent contract", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -673,7 +736,7 @@ test("Core denies every capability outside the Phase Agent contract", () => {
 
   for (const deniedCase of cases) {
     assert.deepEqual(
-      coreContract.authorizePhaseExecution({
+      authorizePhaseExecution({
         contractVersion: 1,
         binding: bound.binding,
         manifest,
@@ -696,7 +759,7 @@ test("Core separates validation runner access from repository write access", () 
     ...agentContract,
     repositoryAccess: "read-only-plus-exclusive-validation",
   } as const;
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch: {
       ...dispatch,
@@ -722,7 +785,7 @@ test("Core separates validation runner access from repository write access", () 
     skills,
   } as const;
   assert.deepEqual(
-    coreContract.authorizePhaseExecution({
+    authorizePhaseExecution({
       ...request,
       capability: { kind: "repository", access: "validate" },
     }),
@@ -740,7 +803,7 @@ test("Core separates validation runner access from repository write access", () 
     },
   );
   assert.equal(
-    coreContract.authorizePhaseExecution({
+    authorizePhaseExecution({
       ...request,
       capability: { kind: "repository", access: "write" },
     }).ok,
@@ -749,7 +812,7 @@ test("Core separates validation runner access from repository write access", () 
 });
 
 test("Core revalidates Context, Agent, and Skill identities before authorization", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -811,18 +874,17 @@ test("Core revalidates Context, Agent, and Skill identities before authorization
       ),
       diagnostic: {
         code: "execution.skill_invalid",
-        path: "$.binding.skillIdentities",
+        path: "$.skills[0].identity",
         message:
-          "Effective Skill identities no longer match the Phase execution binding.",
-        remediation:
-          "Restore the bound Skill revisions before requesting a capability.",
+          "Effective Skill identity does not match the release Skill Bundle.",
+        remediation: "Restore the locked Skill revision before dispatch."
       },
     },
   ] as const;
 
   for (const staleCase of cases) {
     assert.deepEqual(
-      coreContract.authorizePhaseExecution({
+      authorizePhaseExecution({
         contractVersion: 1,
         binding: bound.binding,
         manifest,
@@ -853,7 +915,7 @@ test("Core rejects malformed Manifest hashes and Agent capability enums", () => 
       : entry,
   );
   assert.deepEqual(
-    coreContract.bindPhaseExecution({
+    bindPhaseExecution({
       contractVersion: 1,
       dispatch: {
         ...dispatch,
@@ -882,7 +944,7 @@ test("Core rejects malformed Manifest hashes and Agent capability enums", () => 
 
   const invalidAgentContract = { ...agentContract, network: "all" };
   assert.deepEqual(
-    coreContract.bindPhaseExecution({
+    bindPhaseExecution({
       contractVersion: 1,
       dispatch: {
         ...dispatch,
@@ -961,7 +1023,7 @@ test("Core rejects invalid Manifest entry and Agent contract fields", () => {
 
   for (const invalidCase of manifestCases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch: {
           ...dispatch,
@@ -1009,7 +1071,7 @@ test("Core rejects invalid Manifest entry and Agent contract fields", () => {
 
   for (const invalidCase of agentCases) {
     assert.deepEqual(
-      coreContract.bindPhaseExecution({
+      bindPhaseExecution({
         contractVersion: 1,
         dispatch: {
           ...dispatch,
@@ -1031,7 +1093,7 @@ test("Core rejects invalid Manifest entry and Agent contract fields", () => {
 });
 
 test("Core fails closed for an unknown runtime capability kind", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -1045,7 +1107,7 @@ test("Core fails closed for an unknown runtime capability kind", () => {
   }
 
   assert.deepEqual(
-    coreContract.authorizePhaseExecution({
+    authorizePhaseExecution({
       contractVersion: 1,
       binding: bound.binding,
       manifest,
@@ -1072,7 +1134,7 @@ test("Core fails closed for an unknown runtime capability kind", () => {
 
 test("Core returns a structured failure for a malformed binding request", () => {
   for (const request of [null, undefined, 42, "invalid"]) {
-    assert.deepEqual(coreContract.bindPhaseExecution(request as never), {
+    assert.deepEqual(bindPhaseExecution(request as never), {
       ok: false,
       contractVersion: 1,
       diagnostics: [
@@ -1089,7 +1151,7 @@ test("Core returns a structured failure for a malformed binding request", () => 
 });
 
 test("Core returns structured failures for malformed authorization inputs", () => {
-  const bound = coreContract.bindPhaseExecution({
+  const bound = bindPhaseExecution({
     contractVersion: 1,
     dispatch,
     manifest,
@@ -1147,7 +1209,7 @@ test("Core returns structured failures for malformed authorization inputs", () =
 
   for (const authorizationCase of cases) {
     assert.deepEqual(
-      coreContract.authorizePhaseExecution(authorizationCase.request as never),
+      authorizePhaseExecution(authorizationCase.request as never),
       {
         ok: false,
         contractVersion: 1,
@@ -1162,7 +1224,7 @@ test("Core fails closed when binding input cannot be read safely", () => {
   cyclicManifest.push(cyclicManifest);
 
   assert.deepEqual(
-    coreContract.bindPhaseExecution({
+    bindPhaseExecution({
       contractVersion: 1,
       dispatch,
       manifest: cyclicManifest as never,
@@ -1201,7 +1263,7 @@ test("Core rejects Review Agent contracts with write authority", () => {
     promptBaseIdentity: `sha256:${"b".repeat(64)}`,
     overridePolicy: "prompt-body-only",
   } as const;
-  const result = coreContract.bindPhaseExecution({
+  const result = bindPhaseExecution({
     contractVersion: 1,
     dispatch: {
       ...dispatch,

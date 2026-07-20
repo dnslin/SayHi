@@ -19,7 +19,6 @@ import {
   diagnoseDurableTasks,
   decideDurableBuildPlan,
   escalateDurableQuickToBuild,
-  initializeManagedProject,
   freezeDurableContextManifest,
   recoverDurableTask,
   withDurableTaskWriter,
@@ -35,6 +34,9 @@ import {
 import {
   createCompletedDurableTask,
   IMPLEMENTATION_AGENT,
+  TEST_SKILL_BUNDLE,
+  initializeManagedProjectWithTestSkillBundle,
+  TEST_SKILL_LOCK_DIGEST,
   taskLifecycleExploreTransition,
   taskLifecycleEventMetadata,
   taskLifecycleStartRequest,
@@ -59,7 +61,7 @@ const INSTALLATION = {
   ompPlugin: "0.0.0",
   projectSchema: 1,
   templates: "0.1.0",
-  skillLockDigest: `sha256:${"a".repeat(64)}` as ContractIdentity,
+  skillLockDigest: TEST_SKILL_LOCK_DIGEST,
 } as const;
 
 const executeFile = promisify(execFile);
@@ -70,11 +72,12 @@ const TASK_SCOPE = Object.freeze({
   locks: [],
 }) satisfies TaskScope;
 
+
 test("Node filesystem persists and recovers a Task across adapter instances", async (t) => {
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-lifecycle-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   const initialFileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem: initialFileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-10-FILESYSTEM",
@@ -168,7 +171,7 @@ test("Node filesystem archives a completed Task directory idempotently", async (
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-archive-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-13-ARCHIVE",
@@ -244,7 +247,7 @@ test("Node filesystem serializes concurrent Task advances across adapters", asyn
   const repository = await mkdtemp(join(tmpdir(), "sayhi-task-lock-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-10-LOCK",
@@ -518,6 +521,7 @@ test("Writer admits a Build only after its durable approved Plan enters Implemen
     ],
     agentContract: IMPLEMENTATION_AGENT.contract,
     skills: IMPLEMENTATION_AGENT.skills,
+    skillBundle: TEST_SKILL_BUNDLE,
   } as const;
   const dispatched = await dispatchDurablePhaseExecution({
     fileSystem,
@@ -718,7 +722,7 @@ test("Quick result rejects drift after the scoped Writer completes", async (t) =
     "utf8",
   );
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-17-QUICK-DRIFT",
@@ -828,7 +832,7 @@ test("durable Quick escalation recovers an interrupted Projection write without 
   const repository = await mkdtemp(join(tmpdir(), "sayhi-quick-escalation-"));
   t.after(async () => rm(repository, { recursive: true, force: true }));
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-18-QUICK-ESCALATION",
@@ -943,7 +947,7 @@ test("Quick completion repairs its record after an interrupted write", async (t)
     "utf8",
   );
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-17-QUICK-REPAIR",
@@ -1310,7 +1314,7 @@ async function createTaskRepository(route: "build" | "quick" = "build") {
   );
   await writeFile(join(repository, ".gitignore"), "ignored-user.txt\n", "utf8");
   const fileSystem = new NodeManagedProjectFileSystem(repository);
-  const initialized = await initializeManagedProject({
+  const initialized = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     installation: INSTALLATION,
     projectId: "PROJECT-11-BASELINE",

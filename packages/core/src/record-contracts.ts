@@ -586,10 +586,10 @@ function validateSkillLock(
       "registry commit must be an immutable full commit identity.",
     );
   }
-  if (!Array.isArray(record.skills) || record.skills.length === 0) {
+  if (!Array.isArray(record.skills)) {
     return invalidSkillLock(
       "$.record.skills",
-      "skills must contain at least one locked Skill.",
+      "skills must be an array of locked Skills.",
     );
   }
 
