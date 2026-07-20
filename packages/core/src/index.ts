@@ -14,6 +14,10 @@ import {
   verifySkillBundleInstallation,
 } from "./skill-bundle.js";
 import {
+  verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
+} from "./release-artifacts.js";
+import {
   diagnoseManagedProject,
   initializeManagedProject,
 } from "./managed-project.js";
@@ -259,6 +263,28 @@ export type {
   PullGitHubIssueProjectionRequest,
   PushGitHubIssueProjectionRequest,
 } from "./github-tracker.js";
+export {
+  COORDINATED_RELEASE_ARTIFACTS,
+  createCoordinatedReleaseArtifacts,
+  installedProjectVersionsForReleaseArtifacts,
+  RELEASE_ARTIFACT_CONTRACT_VERSION,
+  verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
+} from "./release-artifacts.js";
+export type {
+  CoordinatedReleaseArtifacts,
+  CoordinatedReleaseArtifactsDiagnostic,
+  CoordinatedReleaseArtifactsDiagnosticCode,
+  CreateCoordinatedReleaseArtifactsRequest,
+  CreateCoordinatedReleaseArtifactsResult,
+  ReleaseArtifactCompatibility,
+  ReleaseArtifactCompatibilityInput,
+  ReleaseArtifactMetadata,
+  ReleaseArtifactName,
+  ReleaseArtifactProvenance,
+  ReleaseArtifactVersions,
+  VerifyCoordinatedReleaseArtifactsResult,
+} from "./release-artifacts.js";
 export {
   MANAGED_PROJECT_CONTRACT_VERSION,
   MANAGED_PROJECT_CONFIG_CONTENT,
@@ -657,6 +683,8 @@ export interface CoreContract {
   readonly validateContractRecord: typeof validateContractRecord;
   readonly verifySkillBundle: typeof verifySkillBundle;
   readonly verifySkillBundleInstallation: typeof verifySkillBundleInstallation;
+  readonly verifyCoordinatedReleaseArtifacts: typeof verifyCoordinatedReleaseArtifacts;
+  readonly verifyTrustedCoordinatedReleaseArtifacts: typeof verifyTrustedCoordinatedReleaseArtifacts;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
   readonly initializeManagedProject: typeof initializeManagedProject;
   readonly createSpec: typeof createSpec;
@@ -737,6 +765,8 @@ export const coreContract: CoreContract = Object.freeze({
   validateContractRecord,
   verifySkillBundle,
   verifySkillBundleInstallation,
+  verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
   diagnoseManagedProject,
   initializeManagedProject,
   createSpec,

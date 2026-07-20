@@ -6,6 +6,7 @@ import {
   type ContractRecordValidationResult,
 } from "@dnslin/sayhi-core";
 export {
+  CLI_RELEASE_ARTIFACT,
   CLI_MANAGED_PROJECT_INSTALLATION,
   runCli,
 } from "./run-cli.js";

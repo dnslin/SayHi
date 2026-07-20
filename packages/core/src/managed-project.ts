@@ -9,11 +9,13 @@ import {
 } from "./record-contracts.js";
 import { hasUnambiguousManagedBlocks } from "./managed-blocks.js";
 import {
-  verifySkillBundleInstallation,
-  type SkillBundle,
-} from "./skill-bundle.js";
+  installedProjectVersionsForReleaseArtifacts,
+  MANAGED_PROJECT_CONTRACT_VERSION,
+  verifyTrustedCoordinatedReleaseArtifacts,
+  type CoordinatedReleaseArtifacts,
+} from "./release-artifacts.js";
 
-export const MANAGED_PROJECT_CONTRACT_VERSION = 1 as const;
+export { MANAGED_PROJECT_CONTRACT_VERSION } from "./release-artifacts.js";
 
 export const MANAGED_PROJECT_REQUIRED_DIRECTORIES = Object.freeze([
   ".sayhi",
@@ -63,6 +65,7 @@ export type ManagedProjectDiagnosticCode =
   | "managed_project.path_unsafe"
   | "managed_project.file_missing"
   | "managed_project.skill_bundle_invalid"
+  | "managed_project.release_artifacts_invalid"
   | "managed_project.file_modified"
   | "managed_project.io_failed";
 
@@ -75,8 +78,9 @@ export interface ManagedProjectDiagnostic {
 
 export interface DiagnoseManagedProjectRequest {
   readonly fileSystem: ManagedProjectFileSystem;
-  readonly installation: InstalledProjectVersions;
-  readonly skillBundle: SkillBundle;
+  readonly releaseArtifacts: CoordinatedReleaseArtifacts;
+  /** Selected by the executable; never sourced from project input. */
+  readonly trustedReleaseArtifacts?: CoordinatedReleaseArtifacts;
 }
 
 type ManagedProjectFailure<
@@ -119,12 +123,16 @@ interface OwnershipManifest {
   readonly files: readonly ManagedFileRecord[];
 }
 
+type VerifiedReleaseInstallation =
+  | Readonly<{ ok: true; installation: InstalledProjectVersions }>
+  | Readonly<{ ok: false; failure: ManagedProjectFailure<"corrupt"> }>;
+
 export async function initializeManagedProject(
   request: InitializeManagedProjectRequest,
 ): Promise<InitializeManagedProjectResult> {
-  const bundleFailure = installedSkillBundleFailure(request);
-  if (bundleFailure !== null) {
-    return initializationFailure(bundleFailure);
+  const release = verifiedReleaseInstallation(request);
+  if (!release.ok) {
+    return initializationFailure(release.failure);
   }
   try {
     const store = await request.fileSystem.inspect(".sayhi");
@@ -151,7 +159,7 @@ export async function initializeManagedProject(
       );
     }
 
-    const generated = buildGeneratedProject(request);
+    const generated = buildGeneratedProject(request, release.installation);
     if (!generated.ok) {
       return initializationFailure(generated);
     }
@@ -215,10 +223,11 @@ export async function initializeManagedProject(
 export async function diagnoseManagedProject(
   request: DiagnoseManagedProjectRequest,
 ): Promise<DiagnoseManagedProjectResult> {
-  const bundleFailure = installedSkillBundleFailure(request);
-  if (bundleFailure !== null) {
-    return bundleFailure;
+  const release = verifiedReleaseInstallation(request);
+  if (!release.ok) {
+    return release.failure;
   }
+  const installation = release.installation;
   try {
     const store = await request.fileSystem.inspect(".sayhi");
     if (store.kind === "missing") {
@@ -291,7 +300,7 @@ export async function diagnoseManagedProject(
           );
     }
     const manifest = manifestValidation.record as ProjectManifestRecord;
-    if (!sameInstallation(manifest.installed, request.installation)) {
+    if (!sameInstallation(manifest.installed, installation)) {
       return incompatible(PROJECT_MANIFEST_PATH);
     }
     if (manifest.ownershipManifest !== OWNERSHIP_MANIFEST_PATH) {
@@ -412,6 +421,7 @@ export async function diagnoseManagedProject(
 
 function buildGeneratedProject(
   request: InitializeManagedProjectRequest,
+  installation: InstalledProjectVersions,
 ):
   | Readonly<{ ok: true; files: ReadonlyMap<string, string> }>
   | ManagedProjectFailure<"corrupt"> {
@@ -420,7 +430,7 @@ function buildGeneratedProject(
       schemaVersion: 1,
       path: MANAGED_PROJECT_CONFIG_PATH,
       ownershipClass: "user-owned",
-      generatedSourceVersion: request.installation.templates,
+      generatedSourceVersion: installation.templates,
       markerIds: Object.freeze([]),
     }),
     Object.freeze({
@@ -431,7 +441,7 @@ function buildGeneratedProject(
         algorithm: "sha256-lf-v1",
         digest: hashLf(MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT),
       }),
-      generatedSourceVersion: request.installation.templates,
+      generatedSourceVersion: installation.templates,
       markerIds: Object.freeze([]),
     }),
   ]);
@@ -442,7 +452,7 @@ function buildGeneratedProject(
   const manifest: ProjectManifestRecord = Object.freeze({
     schemaVersion: 1,
     projectId: request.projectId,
-    installed: request.installation,
+    installed: installation,
     initializedAt: request.timestamp,
     updatedAt: request.timestamp,
     ownershipManifest: OWNERSHIP_MANIFEST_PATH,
@@ -487,23 +497,35 @@ function sameInstallation(
   );
 }
 
-function installedSkillBundleFailure(
+function verifiedReleaseInstallation(
   request: DiagnoseManagedProjectRequest,
-): ManagedProjectFailure<"corrupt"> | null {
-  const verification = verifySkillBundleInstallation({
-    bundle: request.skillBundle,
-    installation: request.installation,
-  });
-  if (verification.ok) {
-    return null;
-  }
-  const diagnostic = verification.diagnostics[0]!;
-  return corrupt(
-    "managed_project.skill_bundle_invalid",
-    `${PROJECT_MANIFEST_PATH}#installed.skillLockDigest`,
-    diagnostic.message,
-    diagnostic.remediation,
+): VerifiedReleaseInstallation {
+  const verification = verifyTrustedCoordinatedReleaseArtifacts(
+    request.releaseArtifacts,
+    request.trustedReleaseArtifacts,
   );
+  if (!verification.ok) {
+    const diagnostic = verification.diagnostics[0]!;
+    const code =
+      diagnostic.code === "release_artifacts.skill_bundle_invalid"
+        ? "managed_project.skill_bundle_invalid"
+        : "managed_project.release_artifacts_invalid";
+    return Object.freeze({
+      ok: false,
+      failure: corrupt(
+        code,
+        `${PROJECT_MANIFEST_PATH}#installed.skillLockDigest`,
+        diagnostic.message,
+        diagnostic.remediation,
+      ),
+    });
+  }
+  return Object.freeze({
+    ok: true,
+    installation: installedProjectVersionsForReleaseArtifacts(
+      verification.releaseArtifacts,
+    ),
+  });
 }
 
 function isOwnershipManifest(value: unknown): value is OwnershipManifest {

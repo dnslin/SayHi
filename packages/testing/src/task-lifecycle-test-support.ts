@@ -30,8 +30,8 @@ import {
 export {
   TEST_SKILL_BUNDLE,
   TEST_SKILL_LOCK_DIGEST,
-  withTestSkillBundle,
-  initializeManagedProjectWithTestSkillBundle,
+  withTestReleaseArtifacts,
+  initializeManagedProjectWithTestReleaseArtifacts,
 } from "./skill-bundle-test-support.js";
 
 export interface TaskLifecycleFixture {

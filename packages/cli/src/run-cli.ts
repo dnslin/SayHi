@@ -4,7 +4,9 @@ import { resolve } from "node:path";
 
 import {
   applyManagedProjectPlan,
+  COORDINATED_RELEASE_ARTIFACTS,
   coreContract,
+  installedProjectVersionsForReleaseArtifacts,
   MANAGED_PROJECT_CONFIG_CONTENT,
   MANAGED_PROJECT_CONFIG_PATH,
   MANAGED_PROJECT_OPERATION_JOURNAL_PATH,
@@ -19,7 +21,6 @@ import {
   type DiagnoseManagedProjectResult,
   type DiagnoseDurableTasksResult,
   type InitializeManagedProjectResult,
-  type InstalledProjectVersions,
   type ManagedProjectInstalledFile,
   type ManagedProjectUpdateFile,
   type PlanManagedProjectUninstallResult,
@@ -34,7 +35,6 @@ import {
   type TaskBaselineFileSystem,
   type KnowledgeCandidateStatus,
   type KnowledgeReviewDisposition,
-  type SkillBundle,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -47,34 +47,15 @@ import {
   QuickAuditStoreError,
 } from "./quick-audit-store.js";
 
-export const CLI_SKILL_BUNDLE: SkillBundle = Object.freeze({
-  lock: Object.freeze({
-    schemaVersion: 1,
-    registry: Object.freeze({
-      repository: "https://github.com/dnslin/skills",
-      commit: "bb158aeaf770fc0a0c93bb2a28fb922404508667",
-    }),
-    skills: Object.freeze([]),
-  }),
-  files: Object.freeze([]),
-});
+export const CLI_RELEASE_ARTIFACT =
+  COORDINATED_RELEASE_ARTIFACTS.artifacts.cli;
 
-const CLI_SKILL_LOCK_DIGEST = verifiedSkillLockDigest(CLI_SKILL_BUNDLE);
+export const CLI_MANAGED_PROJECT_INSTALLATION =
+  installedProjectVersionsForReleaseArtifacts(COORDINATED_RELEASE_ARTIFACTS);
 
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const QUICK_RUNTIME_TASKS_DIRECTORY = ".sayhi/.runtime/quicks";
 const QUICK_TASKS_DIRECTORY = ".sayhi/tasks";
-
-
-export const CLI_MANAGED_PROJECT_INSTALLATION: InstalledProjectVersions =
-  Object.freeze({
-    core: "0.0.0",
-    cli: "0.0.0",
-    ompPlugin: "0.0.0",
-    projectSchema: 1,
-    templates: "0.1.0",
-    skillLockDigest: CLI_SKILL_LOCK_DIGEST,
-  });
 
 const CLI_MANAGED_PROJECT_UPDATE_FILES = Object.freeze([
   Object.freeze({
@@ -422,15 +403,13 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
         fileSystem,
         projectId: randomUUID(),
         timestamp,
-        installation: CLI_MANAGED_PROJECT_INSTALLATION,
-        skillBundle: CLI_SKILL_BUNDLE,
+        releaseArtifacts: COORDINATED_RELEASE_ARTIFACTS,
       });
       break;
     case "doctor": {
       const projectDiagnosis = await coreContract.diagnoseManagedProject({
         fileSystem,
-        installation: CLI_MANAGED_PROJECT_INSTALLATION,
-        skillBundle: CLI_SKILL_BUNDLE,
+        releaseArtifacts: COORDINATED_RELEASE_ARTIFACTS,
       });
       result = projectDiagnosis.ok
         ? await coreContract.diagnoseDurableTasks({ fileSystem })
@@ -545,8 +524,7 @@ async function runKnowledgeCli(
   const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
   const projectDiagnosis = await coreContract.diagnoseManagedProject({
     fileSystem,
-    installation: CLI_MANAGED_PROJECT_INSTALLATION,
-    skillBundle: CLI_SKILL_BUNDLE,
+    releaseArtifacts: COORDINATED_RELEASE_ARTIFACTS,
   });
   if (!projectDiagnosis.ok) {
     return cliProjectDiagnosisFailure(
@@ -1953,8 +1931,7 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
   const fileSystem = new NodeManagedProjectFileSystem(repositoryRoot);
   const projectDiagnosis = await coreContract.diagnoseManagedProject({
     fileSystem,
-    installation: CLI_MANAGED_PROJECT_INSTALLATION,
-    skillBundle: CLI_SKILL_BUNDLE,
+    releaseArtifacts: COORDINATED_RELEASE_ARTIFACTS,
   });
   if (!projectDiagnosis.ok) {
     return cliProjectDiagnosisFailure(
@@ -3748,15 +3725,6 @@ function cliJsonVersion(): CliJsonVersion {
   });
 }
 
-function verifiedSkillLockDigest(bundle: SkillBundle): ContractIdentity {
-  const verified = coreContract.verifySkillBundle(bundle);
-  if (!verified.ok) {
-    throw new Error(
-      "CLI release Skill Bundle does not satisfy the durable Skill Lock contract.",
-    );
-  }
-  return verified.lockIdentity;
-}
 
 function cliSuccess(
   operation: string,
