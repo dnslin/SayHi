@@ -21,6 +21,7 @@ import {
   planManagedProjectUninstall,
   planManagedProjectUpdate,
   withDurableTaskWriter,
+  type ApplyManagedProjectPlanResult,
   type ContractIdentity,
   type WorkflowLifecycle,
   type WorkflowPhase,
@@ -695,23 +696,8 @@ test("packaged CLI recovers a failed Project Store update", async (t) => {
     plan: updatePlan.plan,
     timestamp: "2026-07-20T12:01:00Z",
   });
-  assert.equal(failedUpdate.ok, false);
-  if (!failedUpdate.ok) {
-    assert.equal(failedUpdate.diagnostics[0]?.code, "managed_project.io_failed");
-    assert.match(failedUpdate.diagnostics[0]?.remediation ?? "", /recover/u);
-  }
-  await readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8");
-  const recoveredUpdate = await executeCliResult(
-    "update",
-    "--apply",
-    "--cwd",
-    repository,
-    "--json",
-  );
-  assert.equal(recoveredUpdate.exitCode, 0);
-  await assert.rejects(
-    readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8"),
-  );
+  assertManagedProjectOperationFailsRecoverably(failedUpdate);
+  await recoverManagedProjectOperationWithCli(repository, "update");
   assert.equal(await readFile(join(repository, ".sayhi", "config.yaml"), "utf8"), userConfig);
 });
 
@@ -750,23 +736,8 @@ test("packaged CLI recovers a failed Project Store uninstall without removing Us
     plan: uninstallPlan.plan,
     timestamp: "2026-07-20T12:02:00Z",
   });
-  assert.equal(failedUninstall.ok, false);
-  if (!failedUninstall.ok) {
-    assert.equal(failedUninstall.diagnostics[0]?.code, "managed_project.io_failed");
-    assert.match(failedUninstall.diagnostics[0]?.remediation ?? "", /recover/u);
-  }
-  await readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8");
-  const recoveredUninstall = await executeCliResult(
-    "uninstall",
-    "--apply",
-    "--cwd",
-    repository,
-    "--json",
-  );
-  assert.equal(recoveredUninstall.exitCode, 0);
-  await assert.rejects(
-    readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8"),
-  );
+  assertManagedProjectOperationFailsRecoverably(failedUninstall);
+  await recoverManagedProjectOperationWithCli(repository, "uninstall");
   assert.equal(await readFile(join(repository, ".sayhi", "config.yaml"), "utf8"), userConfig);
   assert.equal(await readFile(join(repository, ".omp", "AGENTS.md"), "utf8"), ompAgents);
   assert.equal(await readFile(join(repository, ".omp", "RULES.md"), "utf8"), ompRules);
@@ -2747,6 +2718,35 @@ async function executeCliResultFor(
     }
     throw error;
   }
+}
+
+function assertManagedProjectOperationFailsRecoverably(
+  result: ApplyManagedProjectPlanResult,
+): void {
+  assert.equal(result.ok, false);
+  if (result.ok) {
+    return;
+  }
+  assert.equal(result.diagnostics[0]?.code, "managed_project.io_failed");
+  assert.match(result.diagnostics[0]?.remediation ?? "", /recover/u);
+}
+
+async function recoverManagedProjectOperationWithCli(
+  repository: string,
+  operation: "update" | "uninstall",
+): Promise<void> {
+  await readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8");
+  const recovered = await executeCliResult(
+    operation,
+    "--apply",
+    "--cwd",
+    repository,
+    "--json",
+  );
+  assert.equal(recovered.exitCode, 0);
+  await assert.rejects(
+    readFile(join(repository, MANAGED_PROJECT_OPERATION_JOURNAL_PATH), "utf8"),
+  );
 }
 
 
