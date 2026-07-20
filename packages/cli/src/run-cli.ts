@@ -34,6 +34,7 @@ import {
   type TaskBaselineFileSystem,
   type KnowledgeCandidateStatus,
   type KnowledgeReviewDisposition,
+  type SkillBundle,
 } from "@dnslin/sayhi-core";
 
 import {
@@ -46,9 +47,19 @@ import {
   QuickAuditStoreError,
 } from "./quick-audit-store.js";
 
-const EMPTY_SKILL_LOCK_DIGEST = `sha256:${createHash("sha256")
-  .update('{"skills":[]}')
-  .digest("hex")}` as ContractIdentity;
+export const CLI_SKILL_BUNDLE: SkillBundle = Object.freeze({
+  lock: Object.freeze({
+    schemaVersion: 1,
+    registry: Object.freeze({
+      repository: "https://github.com/dnslin/skills",
+      commit: "bb158aeaf770fc0a0c93bb2a28fb922404508667",
+    }),
+    skills: Object.freeze([]),
+  }),
+  files: Object.freeze([]),
+});
+
+const CLI_SKILL_LOCK_DIGEST = verifiedSkillLockDigest(CLI_SKILL_BUNDLE);
 
 const LEGACY_RUNTIME_IGNORE_CONTENT = "/.runtime/\n";
 const QUICK_RUNTIME_TASKS_DIRECTORY = ".sayhi/.runtime/quicks";
@@ -62,7 +73,7 @@ export const CLI_MANAGED_PROJECT_INSTALLATION: InstalledProjectVersions =
     ompPlugin: "0.0.0",
     projectSchema: 1,
     templates: "0.1.0",
-    skillLockDigest: EMPTY_SKILL_LOCK_DIGEST,
+    skillLockDigest: CLI_SKILL_LOCK_DIGEST,
   });
 
 const CLI_MANAGED_PROJECT_UPDATE_FILES = Object.freeze([
@@ -412,12 +423,14 @@ export async function runCli(args: readonly string[]): Promise<CliRunResult> {
         projectId: randomUUID(),
         timestamp,
         installation: CLI_MANAGED_PROJECT_INSTALLATION,
+        skillBundle: CLI_SKILL_BUNDLE,
       });
       break;
     case "doctor": {
       const projectDiagnosis = await coreContract.diagnoseManagedProject({
         fileSystem,
         installation: CLI_MANAGED_PROJECT_INSTALLATION,
+        skillBundle: CLI_SKILL_BUNDLE,
       });
       result = projectDiagnosis.ok
         ? await coreContract.diagnoseDurableTasks({ fileSystem })
@@ -533,6 +546,7 @@ async function runKnowledgeCli(
   const projectDiagnosis = await coreContract.diagnoseManagedProject({
     fileSystem,
     installation: CLI_MANAGED_PROJECT_INSTALLATION,
+    skillBundle: CLI_SKILL_BUNDLE,
   });
   if (!projectDiagnosis.ok) {
     return cliProjectDiagnosisFailure(
@@ -1940,6 +1954,7 @@ async function runTaskCli(parsed: ParsedTaskArguments): Promise<CliRunResult> {
   const projectDiagnosis = await coreContract.diagnoseManagedProject({
     fileSystem,
     installation: CLI_MANAGED_PROJECT_INSTALLATION,
+    skillBundle: CLI_SKILL_BUNDLE,
   });
   if (!projectDiagnosis.ok) {
     return cliProjectDiagnosisFailure(
@@ -3731,6 +3746,16 @@ function cliJsonVersion(): CliJsonVersion {
     core: CLI_MANAGED_PROJECT_INSTALLATION.core,
     schema: CLI_MANAGED_PROJECT_INSTALLATION.projectSchema,
   });
+}
+
+function verifiedSkillLockDigest(bundle: SkillBundle): ContractIdentity {
+  const verified = coreContract.verifySkillBundle(bundle);
+  if (!verified.ok) {
+    throw new Error(
+      "CLI release Skill Bundle does not satisfy the durable Skill Lock contract.",
+    );
+  }
+  return verified.lockIdentity;
 }
 
 function cliSuccess(

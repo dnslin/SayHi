@@ -10,6 +10,10 @@ import {
   validateContractRecord,
 } from "./record-contracts.js";
 import {
+  verifySkillBundle,
+  verifySkillBundleInstallation,
+} from "./skill-bundle.js";
+import {
   diagnoseManagedProject,
   initializeManagedProject,
 } from "./managed-project.js";
@@ -130,6 +134,21 @@ export type {
   SkillLockRecord,
   SkillUpstreamIdentity,
 } from "./record-contracts.js";
+export {
+  SKILL_BUNDLE_CONTRACT_VERSION,
+  verifySkillBundle,
+  verifySkillBundleInstallation,
+} from "./skill-bundle.js";
+export type {
+  SkillBundle,
+  SkillBundleDiagnostic,
+  SkillBundleDiagnosticCode,
+  SkillBundleFile,
+  VerifiedSkillBundleSkill,
+  VerifySkillBundleInstallationRequest,
+  VerifySkillBundleInstallationResult,
+  VerifySkillBundleResult,
+} from "./skill-bundle.js";
 export { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
 export type { KnowledgeCandidateContent } from "./knowledge-candidate.js";
 export {
@@ -636,6 +655,8 @@ export interface CoreContract {
   readonly validateDependencyGraph: typeof validateDependencyGraph;
   readonly deriveInitiativeReadiness: typeof deriveInitiativeReadiness;
   readonly validateContractRecord: typeof validateContractRecord;
+  readonly verifySkillBundle: typeof verifySkillBundle;
+  readonly verifySkillBundleInstallation: typeof verifySkillBundleInstallation;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
   readonly initializeManagedProject: typeof initializeManagedProject;
   readonly createSpec: typeof createSpec;
@@ -714,6 +735,8 @@ export const coreContract: CoreContract = Object.freeze({
   validateDependencyGraph,
   deriveInitiativeReadiness,
   validateContractRecord,
+  verifySkillBundle,
+  verifySkillBundleInstallation,
   diagnoseManagedProject,
   initializeManagedProject,
   createSpec,

@@ -33,12 +33,14 @@ import {
   IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
   recordTestPhaseResult,
+  TEST_SKILL_BUNDLE,
   taskLifecycleEventMetadata,
   taskLifecycleExploreTransition,
   taskLifecycleStartRequest,
   taskLifecycleTransition,
   type TaskLifecycleFixture,
 } from "./task-lifecycle-test-support.js";
+import { isRecord } from "./json-test-support.js";
 
 const TASK_ID = "TASK-10-BUILD";
 const TASK_FIXTURE = Object.freeze({
@@ -59,6 +61,32 @@ function resumeBlockEvent(suffix: string, occurredAt: string) {
   );
 }
 const TASK_DIRECTORY = `.sayhi/tasks/${TASK_ID}`;
+
+
+function withPhaseSkillBundle(
+  request: unknown,
+  key: "execution" | "materials",
+): unknown {
+  if (!isRecord(request) || !isRecord(request[key])) {
+    return request;
+  }
+  return {
+    ...request,
+    [key]: { skillBundle: TEST_SKILL_BUNDLE, ...request[key] },
+  };
+}
+
+function dispatchPhaseExecution(request: unknown) {
+  return coreContract["dispatchDurablePhaseExecution"](
+    withPhaseSkillBundle(request, "execution") as never,
+  );
+}
+
+function resumePhaseExecution(request: unknown) {
+  return coreContract["resumeDurablePhaseExecution"](
+    withPhaseSkillBundle(request, "materials") as never,
+  );
+}
 const EVENTS_PATH = `${TASK_DIRECTORY}/events.jsonl`;
 const PROJECTION_PATH = `${TASK_DIRECTORY}/task.json`;
 
@@ -1431,7 +1459,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
   const fileSystem = new MemoryTaskLifecycleFileSystem();
   const prepared = await dispatchApprovedBuildPhase(fileSystem, "DISPATCH-20-RESULT");
 
-  const resumed = await coreContract.resumeDurablePhaseExecution({
+  const resumed = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
@@ -1499,7 +1527,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
   );
   await fileSystem.acquireSharedCheckoutReaderLease(prepared.readerLease);
 
-  const completed = await coreContract.resumeDurablePhaseExecution({
+  const completed = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
@@ -1518,7 +1546,7 @@ test("Build resume returns an accepted Agent result without dispatching it again
     /missing/u,
   );
 
-  const drifted = await coreContract.resumeDurablePhaseExecution({
+  const drifted = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: {
@@ -1555,7 +1583,7 @@ test("Build resume rejects modified approved Plan evidence", async () => {
   const planPath = `${TASK_DIRECTORY}/plans/${prepared.planIdentity.slice("sha256:".length)}.json`;
   fileSystem.files.set(planPath, "{}\n");
 
-  const resumed = await coreContract.resumeDurablePhaseExecution({
+  const resumed = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
@@ -1615,7 +1643,7 @@ test("Build dispatch rejects a mismatched Plan Manifest outside Implement", asyn
     promptBaseIdentity: `sha256:${"b".repeat(64)}`,
     overridePolicy: "prompt-body-only",
   } as const;
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  const dispatched = await dispatchPhaseExecution({
     fileSystem,
     planIdentity: prepared.planIdentity,
     execution: {
@@ -1691,7 +1719,7 @@ test("Build dispatch rejects an Agent for a different active Phase", async () =>
     return;
   }
 
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  const dispatched = await dispatchPhaseExecution({
     fileSystem,
     planIdentity: prepared.planIdentity,
     execution: {
@@ -1826,7 +1854,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     return;
   }
 
-  const resumed = await coreContract.resumeDurablePhaseExecution({
+  const resumed = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
@@ -1854,7 +1882,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
     assert.equal(stale.diagnostics[0]?.code, "phase_execution.result.invalid");
   }
 
-  const fresh = await coreContract.dispatchDurablePhaseExecution({
+  const fresh = await dispatchPhaseExecution({
     fileSystem,
     planIdentity: prepared.planIdentity,
     execution: {
@@ -1875,7 +1903,7 @@ test("Build requires a fresh dispatch after returning to an earlier Phase", asyn
   if (!fresh.ok) {
     return;
   }
-  const restarted = await coreContract.resumeDurablePhaseExecution({
+  const restarted = await resumePhaseExecution({
     fileSystem,
     taskId: TASK_ID,
     materials: prepared.materials,
@@ -1928,7 +1956,7 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
       fileSystem,
       `DISPATCH-20-${driftCase.name.replaceAll(" ", "-")}`,
     );
-    const resumed = await coreContract.resumeDurablePhaseExecution({
+    const resumed = await resumePhaseExecution({
       fileSystem,
       taskId: TASK_ID,
       materials: driftCase.mutate(prepared.materials),
@@ -1947,6 +1975,93 @@ test("Build resume blocks Context, Capability, and Skill identity drift", async 
         assert.deepEqual(resumed.readerLease, prepared.readerLease);
         await fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease);
       }
+    }
+  }
+});
+
+test("Build resume blocks missing, modified, and substituted locked Skill bundle files", async () => {
+  const reLockedBundle = {
+    ...TEST_SKILL_BUNDLE,
+    lock: {
+      ...TEST_SKILL_BUNDLE.lock,
+      registry: { ...TEST_SKILL_BUNDLE.lock.registry, commit: "f".repeat(40) },
+    },
+  } as const;
+  const cases = [
+    {
+      name: "missing",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        skillBundle: {
+          ...materials.skillBundle,
+          files: materials.skillBundle.files.slice(1),
+        },
+      }),
+    },
+    {
+      name: "modified",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        skillBundle: {
+          ...materials.skillBundle,
+          files: materials.skillBundle.files.map((file, index) =>
+            index === 0 ? { ...file, content: "modified skill\n" } : file,
+          ),
+        },
+      }),
+    },
+    {
+      name: "substituted",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        skillBundle: {
+          ...materials.skillBundle,
+          files: materials.skillBundle.files.map((file, index) =>
+            index === 0 ? { ...file, path: "substituted/SKILL.md" } : file,
+          ),
+        },
+      }),
+    },
+    {
+      name: "relocked",
+      mutate: (materials: PhaseExecutionMaterials) => ({
+        ...materials,
+        skillBundle: reLockedBundle,
+      }),
+    },
+  ] as const;
+
+  for (const bundleCase of cases) {
+    const fileSystem = new MemoryTaskLifecycleFileSystem();
+    const prepared = await dispatchApprovedBuildPhase(
+      fileSystem,
+      `DISPATCH-35-${bundleCase.name}`,
+    );
+    const resumed = await resumePhaseExecution({
+      fileSystem,
+      taskId: TASK_ID,
+      materials: bundleCase.mutate(prepared.materials),
+      readerLease: prepared.readerLease,
+      blockEvent: resumeBlockEvent(
+        `SKILL-BUNDLE-${bundleCase.name}`,
+        "2026-07-20T10:00:00Z",
+      ),
+    });
+
+    assert.equal(resumed.ok, true, bundleCase.name);
+    if (!resumed.ok) {
+      continue;
+    }
+    assert.equal(resumed.status, "blocked", bundleCase.name);
+    assert.equal(
+      resumed.diagnostics[0]?.code,
+      "execution.skill_invalid",
+      bundleCase.name,
+    );
+    assert.equal(resumed.reviewRequired, true, bundleCase.name);
+    if (resumed.status === "blocked") {
+      assert.deepEqual(resumed.readerLease, prepared.readerLease, bundleCase.name);
+      await fileSystem.assertSharedCheckoutReaderLease(prepared.readerLease);
     }
   }
 });
@@ -2213,7 +2328,7 @@ test("Build Review dispatch requires the Implementation final fingerprint", asyn
     return;
   }
   const reviewAgent = REVIEW_AGENTS[0];
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  const dispatched = await dispatchPhaseExecution({
     fileSystem,
     planIdentity: prepared.planIdentity,
     execution: {
@@ -2703,8 +2818,9 @@ async function dispatchApprovedBuildPhase(
     ],
     agentContract: IMPLEMENTATION_AGENT.contract,
     skills: IMPLEMENTATION_AGENT.skills,
+    skillBundle: TEST_SKILL_BUNDLE,
   } as const;
-  const dispatched = await coreContract.dispatchDurablePhaseExecution({
+  const dispatched = await dispatchPhaseExecution({
     fileSystem,
     planIdentity: recorded.plan.identity,
     execution,
@@ -2725,6 +2841,7 @@ async function dispatchApprovedBuildPhase(
       currentContext: execution.currentContext,
       agentContract: execution.agentContract,
       skills: execution.skills,
+      skillBundle: execution.skillBundle,
     },
     state: dispatched.state,
     readerLease: dispatched.readerLease,

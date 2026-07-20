@@ -3,15 +3,20 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  coreContract,
   applyManagedProjectPlan,
-  diagnoseManagedProject,
-  initializeManagedProject,
   MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
   recoverManagedProjectOperation,
   planManagedProjectUninstall,
   planManagedProjectUpdate,
   type ManagedProjectMutationFileSystem,
 } from "@dnslin/sayhi-core";
+import {
+  initializeManagedProjectWithTestSkillBundle,
+  TEST_SKILL_BUNDLE,
+  TEST_SKILL_LOCK_DIGEST,
+  withTestSkillBundle,
+} from "./skill-bundle-test-support.js";
 
 const INSTALLATION = {
   core: "0.0.0",
@@ -19,7 +24,7 @@ const INSTALLATION = {
   ompPlugin: "0.0.0",
   projectSchema: 1,
   templates: "0.0.0",
-  skillLockDigest: `sha256:${"a".repeat(64)}`,
+  skillLockDigest: TEST_SKILL_LOCK_DIGEST,
 } as const;
 
 const NEXT_INSTALLATION = {
@@ -42,7 +47,13 @@ const REQUIRED_DIRECTORIES = [
   ".sayhi/workflow",
   ".sayhi/overrides",
   ".sayhi/.runtime",
+
 ] as const;
+
+
+function diagnoseProject(request: Record<string, unknown>) {
+  return coreContract.diagnoseManagedProject(withTestSkillBundle(request) as never);
+}
 
 class MemoryManagedProjectFileSystem implements ManagedProjectMutationFileSystem {
   readonly directories = new Set<string>();
@@ -135,7 +146,7 @@ function addManagedCustomizableFile(
 test("Core initializes the repository-owned Project Store and doctor reports it healthy", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
 
-  const initialization = await initializeManagedProject({
+  const initialization = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-8",
     timestamp: "2026-07-14T08:00:00Z",
@@ -156,7 +167,7 @@ test("Core initializes the repository-owned Project Store and doctor reports it 
     ".sayhi/manifest.json",
   ]);
 
-  const diagnosis = await diagnoseManagedProject({
+  const diagnosis = await diagnoseProject({
     fileSystem,
     installation: INSTALLATION,
   });
@@ -169,11 +180,73 @@ test("Core initializes the repository-owned Project Store and doctor reports it 
   });
 });
 
+test("Core rejects missing, modified, and substituted Skill bundles during initialization and diagnosis", async () => {
+  const invalidBundles = [
+    { name: "missing", files: TEST_SKILL_BUNDLE.files.slice(1) },
+    {
+      name: "modified",
+      files: TEST_SKILL_BUNDLE.files.map((file, index) =>
+        index === 0 ? { ...file, content: "modified skill\n" } : file,
+      ),
+    },
+    {
+      name: "substituted",
+      files: TEST_SKILL_BUNDLE.files.map((file, index) =>
+        index === 0 ? { ...file, path: "substituted/SKILL.md" } : file,
+      ),
+    },
+  ] as const;
+
+  for (const invalidBundle of invalidBundles) {
+    const initializationFileSystem = new MemoryManagedProjectFileSystem();
+    const initialization = await initializeManagedProjectWithTestSkillBundle({
+      fileSystem: initializationFileSystem,
+      projectId: "PROJECT-35-INIT",
+      timestamp: "2026-07-20T10:00:00Z",
+      installation: INSTALLATION,
+      skillBundle: { ...TEST_SKILL_BUNDLE, files: invalidBundle.files },
+    } as never);
+    assert.equal(initialization.ok, false, invalidBundle.name);
+    if (!initialization.ok) {
+      assert.equal(
+        initialization.diagnostics[0]?.code,
+        "managed_project.skill_bundle_invalid",
+        invalidBundle.name,
+      );
+    }
+    assert.deepEqual(initializationFileSystem.directories, new Set(), invalidBundle.name);
+    assert.deepEqual(initializationFileSystem.files, new Map(), invalidBundle.name);
+
+    const diagnosisFileSystem = new MemoryManagedProjectFileSystem();
+    const initialized = await initializeManagedProjectWithTestSkillBundle({
+      fileSystem: diagnosisFileSystem,
+      projectId: "PROJECT-35-DOCTOR",
+      timestamp: "2026-07-20T10:00:00Z",
+      installation: INSTALLATION,
+      skillBundle: TEST_SKILL_BUNDLE,
+    } as never);
+    assert.equal(initialized.ok, true, invalidBundle.name);
+    const diagnosis = await diagnoseProject({
+      fileSystem: diagnosisFileSystem,
+      installation: INSTALLATION,
+      skillBundle: { ...TEST_SKILL_BUNDLE, files: invalidBundle.files },
+    } as never);
+    assert.equal(diagnosis.ok, false, invalidBundle.name);
+    if (!diagnosis.ok) {
+      assert.equal(
+        diagnosis.diagnostics[0]?.code,
+        "managed_project.skill_bundle_invalid",
+        invalidBundle.name,
+      );
+    }
+  }
+});
+
 test("Core initialization is byte-stable and never changes user-owned source content", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
   fileSystem.files.set("README.md", "user bytes\r\nremain unchanged\r\n");
 
-  const first = await initializeManagedProject({
+  const first = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-8",
     timestamp: "2026-07-14T08:00:00Z",
@@ -183,7 +256,7 @@ test("Core initialization is byte-stable and never changes user-owned source con
   const installedFiles = new Map(fileSystem.files);
   fileSystem.writes.length = 0;
 
-  const repeated = await initializeManagedProject({
+  const repeated = await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "DIFFERENT-PROJECT-ID",
     timestamp: "2026-07-14T09:00:00Z",
@@ -208,7 +281,7 @@ test("Core initialization is byte-stable and never changes user-owned source con
 
 test("Core updates unchanged Engine-owned files and retains User-owned bytes", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-UPDATE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -283,7 +356,7 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
 
 test("Core preserves all update variants when an Engine-owned file diverges", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-CONFLICT",
     timestamp: "2026-07-14T08:00:00Z",
@@ -360,7 +433,7 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
 
 test("Core uninstalls matching Engine-owned files and retains User-owned content", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-UNINSTALL",
     timestamp: "2026-07-14T08:00:00Z",
@@ -402,7 +475,7 @@ test("Core uninstalls matching Engine-owned files and retains User-owned content
   assert.equal(fileSystem.files.get(".sayhi/config.yaml"), userContent);
   assert.equal(fileSystem.files.has(".sayhi/managed-files.json"), false);
   assert.equal(fileSystem.files.has(".sayhi/manifest.json"), false);
-  const diagnosis = await diagnoseManagedProject({
+  const diagnosis = await diagnoseProject({
     fileSystem,
     installation: INSTALLATION,
   });
@@ -411,7 +484,7 @@ test("Core uninstalls matching Engine-owned files and retains User-owned content
 
 test("Core updates and uninstalls Managed Blocks without changing surrounding user bytes", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-BLOCKS",
     timestamp: "2026-07-14T08:00:00Z",
@@ -492,7 +565,7 @@ test("Core updates and uninstalls Managed Blocks without changing surrounding us
 
 test("Core recovers a partially applied mixed-ownership update from its journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-RECOVERY",
     timestamp: "2026-07-14T08:00:00Z",
@@ -578,7 +651,7 @@ test("Core recovers a partially applied mixed-ownership update from its journal"
     fileSystem.files.has(".sayhi/.runtime/managed-operation.json"),
     false,
   );
-  const diagnosis = await diagnoseManagedProject({
+  const diagnosis = await diagnoseProject({
     fileSystem,
     installation: NEXT_INSTALLATION,
   });
@@ -601,7 +674,7 @@ test("Core conflicts on modified or ambiguous Managed Blocks", async () => {
 
   for (const localContent of localCases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    await initializeManagedProject({
+    await initializeManagedProjectWithTestSkillBundle({
       fileSystem,
       projectId: "PROJECT-9-BLOCK-CONFLICT",
       timestamp: "2026-07-14T08:00:00Z",
@@ -654,7 +727,7 @@ test("Core conflicts on modified or ambiguous Managed Blocks", async () => {
 
 test("Core preserves a divergent Engine-owned file during uninstall", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-UNINSTALL-CONFLICT",
     timestamp: "2026-07-14T08:00:00Z",
@@ -697,7 +770,7 @@ test("Core preserves a divergent Engine-owned file during uninstall", async () =
 
 test("Core rejects stale plans before creating an operation journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-STALE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -738,7 +811,7 @@ test("Core rejects stale plans before creating an operation journal", async () =
 
 test("Core rejects an invalid apply timestamp before writing files or a journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-INVALID-TIME",
     timestamp: "2026-07-14T08:00:00Z",
@@ -776,7 +849,7 @@ test("Core rejects an invalid apply timestamp before writing files or a journal"
 
 test("Core retains a deleted User-owned path while mixed lifecycle actions continue", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProject({
+  await initializeManagedProjectWithTestSkillBundle({
     fileSystem,
     projectId: "PROJECT-9-DELETED-USER-FILE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -860,7 +933,7 @@ test("Core retains a deleted User-owned path while mixed lifecycle actions conti
 test("Core doctor reports missing Project Store state without writing", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
 
-  const diagnosis = await diagnoseManagedProject({
+  const diagnosis = await diagnoseProject({
     fileSystem,
     installation: INSTALLATION,
   });
@@ -885,7 +958,7 @@ test("Core doctor reports incompatible schema and component versions without wri
 
   for (const mutate of cases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProject({
+    const initialized = await initializeManagedProjectWithTestSkillBundle({
       fileSystem,
       projectId: "PROJECT-8",
       timestamp: "2026-07-14T08:00:00Z",
@@ -902,7 +975,7 @@ test("Core doctor reports incompatible schema and component versions without wri
     );
     fileSystem.writes.length = 0;
 
-    const diagnosis = await diagnoseManagedProject({
+    const diagnosis = await diagnoseProject({
       fileSystem,
       installation: INSTALLATION,
     });
@@ -951,7 +1024,7 @@ test("Core doctor reports malformed and hash-diverged Project Stores as corrupt"
 
   for (const { mutate, code } of cases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProject({
+    const initialized = await initializeManagedProjectWithTestSkillBundle({
       fileSystem,
       projectId: "PROJECT-8",
       timestamp: "2026-07-14T08:00:00Z",
@@ -961,7 +1034,7 @@ test("Core doctor reports malformed and hash-diverged Project Stores as corrupt"
     mutate(fileSystem);
     fileSystem.writes.length = 0;
 
-    const diagnosis = await diagnoseManagedProject({
+    const diagnosis = await diagnoseProject({
       fileSystem,
       installation: INSTALLATION,
     });

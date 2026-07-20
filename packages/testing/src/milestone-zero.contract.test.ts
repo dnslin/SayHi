@@ -6,7 +6,11 @@ import {
   validateCliDependencyGraph,
   validateCliDomainValue,
 } from "@dnslin/sayhi-cli";
-import { coreContract, hashKnowledgeCandidateContent } from "@dnslin/sayhi-core";
+import {
+  coreContract,
+  hashKnowledgeCandidateContent,
+  type SkillBundle,
+} from "@dnslin/sayhi-core";
 import {
   validateOmpContractRecord,
   validateOmpDependencyGraph,
@@ -130,6 +134,31 @@ const skills = [
     content: "research skill\n",
   },
 ] as const;
+
+const researchSkillBundle = {
+  lock: {
+    schemaVersion: 1,
+    registry: {
+      repository: "https://github.com/dnslin/skills",
+      commit: "4".repeat(40),
+    },
+    skills: [
+      {
+        name: "research",
+        path: "research",
+        files: [{ path: "SKILL.md", sha256: skills[0].identity }],
+        upstream: {
+          repository: "https://github.com/mattpocock/skills",
+          commit: "5".repeat(40),
+          path: "skills/engineering/research",
+          license: "MIT",
+        },
+        sidecarIdentity: `sha256:${"d".repeat(64)}`,
+      },
+    ],
+  },
+  files: [{ path: "research/SKILL.md", content: skills[0].content }],
+} as const satisfies SkillBundle;
 
 const dispatch = {
   schemaVersion: 1,
@@ -371,6 +400,7 @@ test("AC-0001: one Task crosses every versioned Milestone 0 contract family", ()
     currentContext,
     agentContract,
     skills,
+    skillBundle: researchSkillBundle,
   });
   if (!binding.ok) {
     assert.fail(binding.diagnostics[0]?.message ?? "Phase binding failed");

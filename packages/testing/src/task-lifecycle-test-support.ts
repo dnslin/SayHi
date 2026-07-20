@@ -22,6 +22,17 @@ import {
   type WorkflowPhase,
   type WorkflowState,
 } from "@dnslin/sayhi-core";
+import {
+  IMPLEMENTATION_SKILL_MATERIALS,
+  TEST_SKILL_BUNDLE,
+} from "./skill-bundle-test-support.js";
+
+export {
+  TEST_SKILL_BUNDLE,
+  TEST_SKILL_LOCK_DIGEST,
+  withTestSkillBundle,
+  initializeManagedProjectWithTestSkillBundle,
+} from "./skill-bundle-test-support.js";
 
 export interface TaskLifecycleFixture {
   readonly taskId: string;
@@ -58,25 +69,9 @@ export const IMPLEMENTATION_AGENT = {
     promptBaseIdentity: `sha256:${"a".repeat(64)}`,
     overridePolicy: "prompt-body-only",
   },
-  skills: [
-    {
-      name: "implement",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "918901d60ffbd690430096b5aa9e9b1c68ad82e8f5287e58dea1924002cf8543",
-      },
-      content: "implement skill\n",
-    },
-    {
-      name: "tdd",
-      identity: {
-        algorithm: "sha256-lf-v1",
-        digest: "ddf8a3f4287831a447c0b4e2c506026a849b77036f67c659275025d130f5040d",
-      },
-      content: "tdd skill\n",
-    },
-  ],
+  skills: IMPLEMENTATION_SKILL_MATERIALS,
 } as const satisfies TestPhaseAgent;
+
 export const REVIEW_AGENTS = [
   {
     role: "standards-review",
@@ -287,6 +282,7 @@ export async function recordTestPhaseResult(
       currentContext: request.materials.currentContext,
       agentContract: request.agent.contract,
       skills: request.agent.skills ?? [],
+      skillBundle: TEST_SKILL_BUNDLE,
     },
     event: taskLifecycleEventMetadata(
       request.fixture,
