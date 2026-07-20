@@ -1,5 +1,6 @@
 import {
   coreContract,
+  createCoordinatedReleaseArtifacts,
   type SkillBundle,
   type SkillMaterial,
 } from "@dnslin/sayhi-core";
@@ -56,10 +57,24 @@ if (!verifiedTestSkillBundle.ok) {
 
 export const TEST_SKILL_LOCK_DIGEST = verifiedTestSkillBundle.lockIdentity;
 
+export const TEST_RELEASE_ARTIFACTS = testReleaseArtifactsFor({
+  core: "0.0.0",
+  cli: "0.0.0",
+  ompPlugin: "0.0.0",
+  projectSchema: 1,
+  templates: "0.0.0",
+});
+
 export function withTestSkillBundle<Request extends Record<string, unknown>>(
   request: Request,
-): Request & Readonly<{ skillBundle: SkillBundle }> {
-  return { skillBundle: TEST_SKILL_BUNDLE, ...request };
+): Request & Readonly<{ releaseArtifacts: unknown }> {
+  const releaseArtifacts =
+    request.releaseArtifacts ??
+    Object.freeze({
+      ...testReleaseArtifactsFor(request.installation),
+      skillBundle: request.skillBundle ?? TEST_SKILL_BUNDLE,
+    });
+  return { ...request, releaseArtifacts };
 }
 
 export function initializeManagedProjectWithTestSkillBundle(
@@ -67,3 +82,45 @@ export function initializeManagedProjectWithTestSkillBundle(
 ) {
   return coreContract.initializeManagedProject(withTestSkillBundle(request) as never);
 }
+
+function testReleaseArtifactsFor(installation: unknown) {
+  const versions = isRecord(installation) ? installation : {};
+  const testReleaseArtifacts = createCoordinatedReleaseArtifacts({
+    provenance: {
+      repository: "https://github.com/dnslin/SayHi",
+      revision: "0.0.0-test",
+    },
+    versions: {
+      core: stringValue(versions.core, "0.0.0"),
+      cli: stringValue(versions.cli, "0.0.0"),
+      omp: stringValue(versions.ompPlugin, "0.0.0"),
+    },
+    compatibility: {
+      recordContract: 1,
+      managedProjectContract: 1,
+      projectSchema: positiveIntegerValue(versions.projectSchema, 1),
+      templates: stringValue(versions.templates, "0.0.0"),
+      skillBundleContract: 1,
+    },
+    skillBundle: TEST_SKILL_BUNDLE,
+  });
+  if (!testReleaseArtifacts.ok) {
+    throw new Error("Test release artifacts cannot be constructed.");
+  }
+  return testReleaseArtifacts.releaseArtifacts;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringValue(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.length > 0 ? value : fallback;
+}
+
+function positiveIntegerValue(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? value
+    : fallback;
+}
+

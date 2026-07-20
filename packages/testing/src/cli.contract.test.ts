@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  CLI_RELEASE_ARTIFACT,
   readCliBootstrapContract,
   validateCliContractRecord,
   validateCliDomainValue,
   validateCliDependencyGraph,
 } from "@dnslin/sayhi-cli";
-import { coreContract } from "@dnslin/sayhi-core";
+import {
+  COORDINATED_RELEASE_ARTIFACTS,
+  coreContract,
+} from "@dnslin/sayhi-core";
+import { readInstalledPackageJson } from "./package-test-support.js";
 
 test("CLI reads the bootstrap contract from shared Core", () => {
   assert.strictEqual(
@@ -90,3 +95,27 @@ test("CLI exposes the same Dependency Graph validation result as Core", () => {
     coreContract.validateDependencyGraph(invalidRequest),
   );
 });
+
+test("CLI exposes coordinated artifact metadata aligned with Core and package versions", async () => {
+  assert.strictEqual(
+    CLI_RELEASE_ARTIFACT,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.cli,
+  );
+  assert.deepEqual(
+    CLI_RELEASE_ARTIFACT.provenance,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.core.provenance,
+  );
+  assert.deepEqual(
+    CLI_RELEASE_ARTIFACT.compatibility,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.omp.compatibility,
+  );
+  assert.match(CLI_RELEASE_ARTIFACT.integrity, /^sha256:/u);
+
+  const [corePackage, cliPackage] = await Promise.all([
+    readInstalledPackageJson("@dnslin/sayhi-core"),
+    readInstalledPackageJson("@dnslin/sayhi-cli"),
+  ]);
+  assert.equal(corePackage.version, COORDINATED_RELEASE_ARTIFACTS.artifacts.core.version);
+  assert.equal(cliPackage.version, CLI_RELEASE_ARTIFACT.version);
+});
+

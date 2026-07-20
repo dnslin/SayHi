@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  createCoordinatedReleaseArtifacts,
   coreContract,
   applyManagedProjectPlan,
   MANAGED_PROJECT_RUNTIME_IGNORE_CONTENT,
@@ -15,6 +16,7 @@ import {
   initializeManagedProjectWithTestSkillBundle,
   TEST_SKILL_BUNDLE,
   TEST_SKILL_LOCK_DIGEST,
+  TEST_RELEASE_ARTIFACTS,
   withTestSkillBundle,
 } from "./skill-bundle-test-support.js";
 
@@ -239,6 +241,200 @@ test("Core rejects missing, modified, and substituted Skill bundles during initi
         invalidBundle.name,
       );
     }
+  }
+});
+
+test("Core canonicalizes coordinated release artifacts and detects integrity tampering", () => {
+  const created = createCoordinatedReleaseArtifacts({
+    skillBundle: TEST_SKILL_BUNDLE,
+    compatibility: {
+      templates: "0.0.0",
+      skillBundleContract: 1,
+      projectSchema: 1,
+      managedProjectContract: 1,
+      recordContract: 1,
+    },
+    versions: { omp: "0.0.0", cli: "0.0.0", core: "0.0.0" },
+    provenance: {
+      revision: "0.0.0-test",
+      repository: "https://github.com/dnslin/SayHi",
+    },
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  assert.deepEqual(created.releaseArtifacts, TEST_RELEASE_ARTIFACTS);
+
+  const verified = coreContract.verifyCoordinatedReleaseArtifacts(
+    TEST_RELEASE_ARTIFACTS,
+  );
+  assert.equal(verified.ok, true);
+  if (verified.ok) {
+    assert.deepEqual(verified.releaseArtifacts, TEST_RELEASE_ARTIFACTS);
+  }
+
+  const mismatches = [
+    Object.freeze({
+      ...TEST_RELEASE_ARTIFACTS,
+      artifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS.artifacts,
+        core: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts.core,
+          integrity: tamperedIntegrity(TEST_RELEASE_ARTIFACTS.artifacts.core.integrity),
+        }),
+      }),
+    }),
+    Object.freeze({
+      ...TEST_RELEASE_ARTIFACTS,
+      integrity: tamperedIntegrity(TEST_RELEASE_ARTIFACTS.integrity),
+    }),
+  ] as const;
+  for (const mismatch of mismatches) {
+    const result = coreContract.verifyCoordinatedReleaseArtifacts(mismatch);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+      assert.equal(result.diagnostics[0]?.code, "release_artifacts.mismatch");
+    }
+  }
+});
+
+function tamperedIntegrity(identity: string): string {
+  return `${identity.slice(0, -1)}${identity.endsWith("0") ? "1" : "0"}`;
+}
+
+test("Core rejects incompatible coordinated release artifacts before installation writes", async () => {
+  const incompatibleArtifacts = [
+    {
+      name: "Core",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        artifacts: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts,
+          core: Object.freeze({
+            ...TEST_RELEASE_ARTIFACTS.artifacts.core,
+            version: "9.0.0",
+          }),
+        }),
+      }),
+    },
+    {
+      name: "Source provenance",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        artifacts: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts,
+          core: Object.freeze({
+            ...TEST_RELEASE_ARTIFACTS.artifacts.core,
+            provenance: Object.freeze({
+              ...TEST_RELEASE_ARTIFACTS.artifacts.core.provenance,
+              revision: "other-source",
+            }),
+          }),
+        }),
+      }),
+    },
+    {
+      name: "Contract version",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        artifacts: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts,
+          core: Object.freeze({
+            ...TEST_RELEASE_ARTIFACTS.artifacts.core,
+            compatibility: Object.freeze({
+              ...TEST_RELEASE_ARTIFACTS.artifacts.core.compatibility,
+              managedProjectContract: 2,
+            }),
+          }),
+        }),
+      }),
+    },
+    {
+      name: "CLI",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        artifacts: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts,
+          cli: Object.freeze({
+            ...TEST_RELEASE_ARTIFACTS.artifacts.cli,
+            version: "9.0.0",
+          }),
+        }),
+      }),
+    },
+    {
+      name: "OMP",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        artifacts: Object.freeze({
+          ...TEST_RELEASE_ARTIFACTS.artifacts,
+          omp: Object.freeze({
+            ...TEST_RELEASE_ARTIFACTS.artifacts.omp,
+            version: "9.0.0",
+          }),
+        }),
+      }),
+    },
+    {
+      name: "Skill bundle",
+      releaseArtifacts: Object.freeze({
+        ...TEST_RELEASE_ARTIFACTS,
+        skillBundle: Object.freeze({
+          ...TEST_SKILL_BUNDLE,
+          lock: Object.freeze({
+            ...TEST_SKILL_BUNDLE.lock,
+            registry: Object.freeze({
+              ...TEST_SKILL_BUNDLE.lock.registry,
+              commit: "2".repeat(40),
+            }),
+          }),
+        }),
+      }),
+    },
+  ] as const;
+
+  for (const incompatible of incompatibleArtifacts) {
+    const initializationFileSystem = new MemoryManagedProjectFileSystem();
+    const initialization = await coreContract.initializeManagedProject({
+      fileSystem: initializationFileSystem,
+      projectId: "PROJECT-36-INIT",
+      timestamp: "2026-07-20T10:00:00Z",
+      releaseArtifacts: incompatible.releaseArtifacts,
+    } as never);
+    assert.equal(initialization.ok, false, incompatible.name);
+    if (!initialization.ok) {
+      assert.equal(
+        initialization.diagnostics[0]?.code,
+        "managed_project.release_artifacts_invalid",
+        incompatible.name,
+      );
+    }
+    assert.deepEqual(initializationFileSystem.directories, new Set(), incompatible.name);
+    assert.deepEqual(initializationFileSystem.files, new Map(), incompatible.name);
+
+    const diagnosisFileSystem = new MemoryManagedProjectFileSystem();
+    const initialized = await initializeManagedProjectWithTestSkillBundle({
+      fileSystem: diagnosisFileSystem,
+      projectId: "PROJECT-36-DOCTOR",
+      timestamp: "2026-07-20T10:00:00Z",
+      installation: INSTALLATION,
+    });
+    assert.equal(initialized.ok, true, incompatible.name);
+    diagnosisFileSystem.writes.length = 0;
+    const diagnosis = await coreContract.diagnoseManagedProject({
+      fileSystem: diagnosisFileSystem,
+      releaseArtifacts: incompatible.releaseArtifacts,
+    } as never);
+    assert.equal(diagnosis.ok, false, incompatible.name);
+    if (!diagnosis.ok) {
+      assert.equal(
+        diagnosis.diagnostics[0]?.code,
+        "managed_project.release_artifacts_invalid",
+        incompatible.name,
+      );
+    }
+    assert.deepEqual(diagnosisFileSystem.writes, [], incompatible.name);
   }
 });
 

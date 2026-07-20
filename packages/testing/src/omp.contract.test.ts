@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coreContract } from "@dnslin/sayhi-core";
 import {
+  COORDINATED_RELEASE_ARTIFACTS,
+  coreContract,
+} from "@dnslin/sayhi-core";
+import {
+  OMP_RELEASE_ARTIFACT,
   readOmpBootstrapContract,
   validateOmpContractRecord,
   validateOmpDomainValue,
   validateOmpDependencyGraph,
 } from "@dnslin/sayhi-omp";
+import { readInstalledPackageJson } from "./package-test-support.js";
 
 test("OMP reads the bootstrap contract from shared Core", () => {
   assert.strictEqual(
@@ -101,3 +106,23 @@ test("OMP exposes the same Dependency Graph validation result as Core", () => {
     coreContract.validateDependencyGraph(invalidRequest),
   );
 });
+
+test("OMP exposes coordinated artifact metadata aligned with Core and package version", async () => {
+  assert.strictEqual(
+    OMP_RELEASE_ARTIFACT,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.omp,
+  );
+  assert.deepEqual(
+    OMP_RELEASE_ARTIFACT.provenance,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.core.provenance,
+  );
+  assert.deepEqual(
+    OMP_RELEASE_ARTIFACT.compatibility,
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.cli.compatibility,
+  );
+  assert.match(OMP_RELEASE_ARTIFACT.integrity, /^sha256:/u);
+
+  const ompPackage = await readInstalledPackageJson("@dnslin/sayhi-omp");
+  assert.equal(ompPackage.version, OMP_RELEASE_ARTIFACT.version);
+});
+
