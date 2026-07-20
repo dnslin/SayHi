@@ -35,7 +35,6 @@ const TASK_BASELINE_EXCLUDED_PREFIXES = [
   ".sayhi/.runtime",
 ] as const;
 
-const LOCK_WAIT_TIMEOUT_MS = 60_000;
 
 export class NodeManagedProjectFileSystem
   implements ManagedProjectMutationFileSystem, TaskBaselineFileSystem, TaskCommitPort
@@ -405,7 +404,7 @@ export class NodeManagedProjectFileSystem
     const directory = this.#readerLeasesDirectory();
     const marker = join(directory, readerLeaseFileName(lease.dispatchId));
     const writerLock = this.#resolveManagedPath(".sayhi/.runtime/writer.lock");
-    const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+    const deadline = Date.now() + 5_000;
     await mkdir(directory, { recursive: true });
     for (;;) {
       if (await pathExists(writerLock)) {
@@ -837,7 +836,7 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 async function waitForReaderLeases(directory: string): Promise<void> {
-  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  const deadline = Date.now() + 5_000;
   for (;;) {
     try {
       if ((await readdir(directory)).length === 0) {
@@ -861,7 +860,7 @@ async function runWithExclusiveLock<Result>(
   description: string,
   operation: () => Promise<Result>,
 ): Promise<Result> {
-  const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+  const deadline = Date.now() + 5_000;
   for (;;) {
     const owner = await tryCreateTaskLock(target);
     if (owner !== null) {

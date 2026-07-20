@@ -18,6 +18,8 @@ import {
   type WorkflowState,
 } from "@dnslin/sayhi-core";
 
+const TRACKER_ADAPTER_IDS = ["gitlab", "custom:team-tracker"] as const;
+
 const TRACKER_TASK: StartWorkflowTaskRequest = {
   contractVersion: 1,
   task: {
@@ -117,23 +119,18 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
     }
     if (this.conflictOnNextUpdate) {
       this.conflictOnNextUpdate = false;
-      this.records.set(payload.key, {
+      const authorityIdentity = changedIdentity();
+      const conflict = {
         ...resource,
         version: "concurrent-update",
-        authorityIdentity: changedIdentity(),
-      });
-      return {
-        kind: "conflict",
-        observedVersion: "concurrent-update",
-        observedAuthorityIdentity: changedIdentity(),
+        authorityIdentity,
+        projection: { ...resource.projection, authorityIdentity },
       };
+      this.records.set(payload.key, conflict);
+      return { kind: "conflict", resource: conflict };
     }
     if (resource.version !== expectedVersion) {
-      return {
-        kind: "conflict",
-        observedVersion: resource.version,
-        observedAuthorityIdentity: resource.authorityIdentity,
-      };
+      return { kind: "conflict", resource };
     }
     const updated = this.resourceFor(payload, String(Number(resource.version) + 1));
     this.records.set(payload.key, updated);
@@ -151,11 +148,7 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
       return { kind: "unsupported", operation: "archive" };
     }
     if (resource.version !== expectedVersion) {
-      return {
-        kind: "conflict",
-        observedVersion: resource.version,
-        observedAuthorityIdentity: resource.authorityIdentity,
-      };
+      return { kind: "conflict", resource };
     }
     const archived = {
       ...this.resourceFor(payload, String(Number(resource.version) + 1)),
@@ -170,10 +163,12 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
   editRemotely(key: string): void {
     const resource = this.records.get(key);
     assert.notEqual(resource, undefined);
+    const authorityIdentity = changedIdentity();
     this.records.set(key, {
       ...resource!,
       version: "remote-edit",
-      authorityIdentity: changedIdentity(),
+      authorityIdentity,
+      projection: { ...resource!.projection, phase: "review", authorityIdentity },
     });
   }
 
@@ -184,6 +179,7 @@ class MemoryTrackerProjectionAdapter implements TrackerProjectionAdapter {
       version,
       authorityIdentity: payload.authorityIdentity,
       archived: payload.archived,
+      projection: payload,
     };
   }
 }
@@ -256,7 +252,7 @@ function archiveTrackerTask(state: WorkflowState): WorkflowState {
   return archived;
 }
 
-for (const adapterId of ["gitlab", "custom:team-tracker"] as const) {
+for (const adapterId of TRACKER_ADAPTER_IDS) {
   test(`${adapterId} projection creates, updates, retries, and archives without changing local Task authority`, async () => {
     const store = new MemoryTrackerProjectionStore();
     const adapter = new MemoryTrackerProjectionAdapter(adapterId);
@@ -354,8 +350,8 @@ test("Tracker projection reconciles a matching remote edit without a pending loc
   assert.equal(adapter.updateCalls, 1);
 });
 
-for (const adapterId of ["gitlab", "custom:team-tracker"] as const) {
-  test(`${adapterId} projection reports concurrent edits and conditional-write conflicts without mutating local authority`, async () => {
+for (const adapterId of TRACKER_ADAPTER_IDS) {
+  test(`${adapterId} projection preserves both conflict versions until explicit local resolution`, async () => {
     const store = new MemoryTrackerProjectionStore();
     const adapter = new MemoryTrackerProjectionAdapter(adapterId);
     const createdState = startTrackerTask();
@@ -369,20 +365,32 @@ for (const adapterId of ["gitlab", "custom:team-tracker"] as const) {
       return;
     }
     assert.equal(concurrent.conflict.adapterId, adapterId);
-    assert.equal(concurrent.conflict.observedVersion, "remote-edit");
+    assert.equal(concurrent.conflict.incoming.phase, "implement");
+    assert.equal(concurrent.conflict.observed.projection.phase, "review");
     assert.equal(adapter.updateCalls, 0);
     assert.equal(updatedState.projection.phase, "implement");
 
-    adapter.records.set("sayhi-task:TASK-TRACKER-33", {
-      ...adapter.records.get("sayhi-task:TASK-TRACKER-33")!,
-      version: store.mapping!.observedVersion,
-      authorityIdentity: store.mapping!.authorityIdentity,
+    const resolved = await coreContract.resolveTrackerProjectionConflict({
+      store,
+      adapter,
+      state: updatedState,
+      conflict: concurrent.conflict,
+      resolution: "use-local",
     });
-    adapter.conflictOnNextUpdate = true;
-    const raced = await coreContract.projectTrackerProjection({ store, adapter, state: updatedState });
-    assert.equal(raced.disposition, "reconciliation-required");
+    assert.equal(resolved.disposition, "resolved-local");
     assert.equal(adapter.updateCalls, 1);
-    assert.equal(store.mapping?.observedVersion, "1");
+    assert.equal(updatedState.projection.phase, "implement");
+
+    const nextState = advanceTrackerTask(updatedState, "active", "review", "CONDITIONAL");
+    adapter.conflictOnNextUpdate = true;
+    const raced = await coreContract.projectTrackerProjection({ store, adapter, state: nextState });
+    assert.equal(raced.disposition, "reconciliation-required");
+    if (raced.disposition !== "reconciliation-required") {
+      return;
+    }
+    assert.equal(raced.conflict.incoming.phase, "review");
+    assert.equal(raced.conflict.observed.projection.phase, "implement");
+    assert.equal(adapter.updateCalls, 2);
   });
 }
 
@@ -421,15 +429,48 @@ test("Tracker projection reports authentication and unsupported archive outcomes
   assert.equal(unsupported.diagnostic.operation, "archive");
 });
 
-test("Tracker projection rejects a credentialed remote URI before persisting its mapping", async () => {
+for (const adapterId of TRACKER_ADAPTER_IDS) {
+  test(`${adapterId} projection rejects credentialed remote URIs without exposing credentials`, async () => {
+    const store = new MemoryTrackerProjectionStore();
+    const adapter = new MemoryTrackerProjectionAdapter(adapterId);
+    adapter.resourceUri = "https://token@example.test/TASK-TRACKER-33";
+
+    const result = await coreContract.projectTrackerProjection({
+      store,
+      adapter,
+      state: startTrackerTask(),
+    });
+
+    assert.equal(result.disposition, "recovery-required");
+    if (result.disposition !== "recovery-required") {
+      return;
+    }
+    assert.equal(result.diagnostic.code, "tracker.resource-uri-invalid");
+    assert.equal(store.mapping, null);
+    assert.doesNotMatch(JSON.stringify(result), /token/u);
+    assert.doesNotMatch(JSON.stringify(store.mapping), /token/u);
+  });
+}
+
+test("Tracker projection rejects credentialed remote resources before exposing a conflict", async () => {
   const store = new MemoryTrackerProjectionStore();
   const adapter = new MemoryTrackerProjectionAdapter("gitlab");
-  adapter.resourceUri = "https://token@example.test/TASK-TRACKER-33";
+  const createdState = startTrackerTask();
+  await coreContract.projectTrackerProjection({ store, adapter, state: createdState });
+  const resource = adapter.records.get("sayhi-task:TASK-TRACKER-33");
+  assert.notEqual(resource, undefined);
+  const authorityIdentity = changedIdentity();
+  adapter.records.set("sayhi-task:TASK-TRACKER-33", {
+    ...resource!,
+    uri: "https://token@example.test/TASK-TRACKER-33",
+    authorityIdentity,
+    projection: { ...resource!.projection, phase: "review", authorityIdentity },
+  });
 
   const result = await coreContract.projectTrackerProjection({
     store,
     adapter,
-    state: startTrackerTask(),
+    state: advanceTrackerTask(createdState, "active", "implement", "CREDENTIAL-CONFLICT"),
   });
 
   assert.equal(result.disposition, "recovery-required");
@@ -437,5 +478,6 @@ test("Tracker projection rejects a credentialed remote URI before persisting its
     return;
   }
   assert.equal(result.diagnostic.code, "tracker.resource-uri-invalid");
-  assert.equal(store.mapping, null);
+  assert.doesNotMatch(JSON.stringify(result), /token/u);
+  assert.doesNotMatch(JSON.stringify(store.mapping), /token/u);
 });
