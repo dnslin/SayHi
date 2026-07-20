@@ -39,6 +39,7 @@ export interface TrackerProjectionRemoteResource {
   readonly version: string;
   readonly authorityIdentity: ContentHash;
   readonly archived: boolean;
+  readonly projection: TrackerProjectionPayload;
 }
 
 export interface TrackerProjectionMutation {
@@ -55,11 +56,7 @@ export interface TrackerProjectionPendingMutation {
 export type TrackerProjectionAdapterOutcome =
   | Readonly<{ readonly kind: "resource"; readonly resource: TrackerProjectionRemoteResource }>
   | Readonly<{ readonly kind: "missing" }>
-  | Readonly<{
-      readonly kind: "conflict";
-      readonly observedVersion: string | null;
-      readonly observedAuthorityIdentity: ContentHash | null;
-    }>
+  | Readonly<{ readonly kind: "conflict"; readonly resource: TrackerProjectionRemoteResource }>
   | Readonly<{ readonly kind: "unsupported"; readonly operation: TrackerProjectionOperation }>
   | Readonly<{ readonly kind: "authentication-failed" }>
   | Readonly<{ readonly kind: "uncertain"; readonly operation: TrackerProjectionOperation }>;
@@ -93,10 +90,12 @@ export interface TrackerProjectionConflict {
   readonly taskId: string;
   readonly adapterId: string;
   readonly expectedVersion: string | null;
-  readonly observedVersion: string | null;
+  readonly observedVersion: string;
   readonly expectedAuthorityIdentity: ContentHash | null;
-  readonly observedAuthorityIdentity: ContentHash | null;
+  readonly observedAuthorityIdentity: ContentHash;
   readonly incomingAuthorityIdentity: ContentHash;
+  readonly observed: TrackerProjectionRemoteResource;
+  readonly incoming: TrackerProjectionPayload;
 }
 
 export interface TrackerProjectionDiagnostic {
@@ -124,6 +123,22 @@ export type ProjectTrackerProjectionResult =
   | Readonly<{
       readonly disposition: "recovery-required";
       readonly diagnostic: TrackerProjectionDiagnostic;
+    }>;
+export type TrackerProjectionConflictResolution = "use-local";
+
+export interface ResolveTrackerProjectionConflictRequest {
+  readonly store: TrackerProjectionStore;
+  readonly adapter: TrackerProjectionAdapter;
+  readonly state: WorkflowState;
+  readonly conflict: TrackerProjectionConflict;
+  readonly resolution: TrackerProjectionConflictResolution;
+}
+
+export type ResolveTrackerProjectionConflictResult =
+  | ProjectTrackerProjectionResult
+  | Readonly<{
+      readonly disposition: "resolved-local";
+      readonly mapping: TrackerProjectionMapping;
     }>;
 
 export async function projectTrackerProjection(
@@ -192,13 +207,13 @@ export async function projectTrackerProjection(
       }
       return Object.freeze({ disposition: "unchanged", mapping: observed });
     }
-    return reconciliationRequired(mapping, lookup.resource.version, lookup.resource.authorityIdentity, payload);
+    return reconciliationRequired(mapping, lookup.resource, payload);
   }
   if (
     !resourceMatchesMapping ||
     (pendingMutation !== null && !pendingMutationMatches(pendingMutation, payload, operation))
   ) {
-    return reconciliationRequired(mapping, lookup.resource.version, lookup.resource.authorityIdentity, payload);
+    return reconciliationRequired(mapping, lookup.resource, payload);
   }
   if (!request.adapter.capabilities[operation]) {
     return recoveryRequired(
@@ -250,7 +265,7 @@ export async function projectTrackerProjection(
     return outcomeResult(request.adapter.adapterId, operation, outcome, mapping, payload);
   }
   if (!sameHash(outcome.resource.authorityIdentity, payload.authorityIdentity)) {
-    return reconciliationRequired(mapping, outcome.resource.version, outcome.resource.authorityIdentity, payload);
+    return reconciliationRequired(mapping, outcome.resource, payload);
   }
   const updated = await persistResourceMapping(
     request.store,
@@ -267,6 +282,81 @@ export async function projectTrackerProjection(
     mapping: updated,
   });
 }
+export async function resolveTrackerProjectionConflict(
+  request: ResolveTrackerProjectionConflictRequest,
+): Promise<ResolveTrackerProjectionConflictResult> {
+  const payload = payloadFor(request.state);
+  const mapping = await readMapping(request.store, payload.taskId, request.adapter.adapterId);
+  if (isProjectionResult(mapping)) {
+    return mapping;
+  }
+  if (mapping !== null && mapping.adapterId !== request.adapter.adapterId) {
+    return recoveryRequired(
+      request.adapter.adapterId,
+      "lookup",
+      "tracker.adapter-mismatch",
+      "Select the adapter that owns the mapped external Tracker resource, then retry.",
+    );
+  }
+
+  const lookup = await callAdapter(
+    request.adapter,
+    "lookup",
+    () => request.adapter.lookupProjection(payload.key),
+  );
+  if (isProjectionResult(lookup)) {
+    return lookup;
+  }
+  if (lookup.kind !== "resource") {
+    return outcomeResult(request.adapter.adapterId, "lookup", lookup, mapping, payload);
+  }
+  if (
+    request.conflict.taskId !== payload.taskId ||
+    request.conflict.adapterId !== request.adapter.adapterId ||
+    !sameHash(request.conflict.incoming.authorityIdentity, payload.authorityIdentity) ||
+    request.conflict.observed.version !== lookup.resource.version ||
+    !sameHash(request.conflict.observed.authorityIdentity, lookup.resource.authorityIdentity)
+  ) {
+    return reconciliationRequired(mapping, lookup.resource, payload, request.adapter.adapterId);
+  }
+  if (!request.adapter.capabilities.update) {
+    return recoveryRequired(
+      request.adapter.adapterId,
+      "update",
+      "tracker.operation-unsupported",
+      "Configure an adapter that supports update before resolving this conflict.",
+    );
+  }
+
+  const outcome = await callAdapter(
+    request.adapter,
+    "update",
+    () =>
+      request.adapter.updateProjection(
+        Object.freeze({ resource: lookup.resource, expectedVersion: lookup.resource.version, payload }),
+      ),
+  );
+  if (isProjectionResult(outcome)) {
+    return outcome;
+  }
+  if (outcome.kind !== "resource") {
+    return outcomeResult(request.adapter.adapterId, "update", outcome, mapping, payload);
+  }
+  if (!sameHash(outcome.resource.authorityIdentity, payload.authorityIdentity)) {
+    return reconciliationRequired(mapping, outcome.resource, payload, request.adapter.adapterId);
+  }
+  const updated = await persistResourceMapping(
+    request.store,
+    request.adapter.adapterId,
+    payload.taskId,
+    outcome.resource,
+    "update",
+  );
+  if (isProjectionResult(updated)) {
+    return updated;
+  }
+  return Object.freeze({ disposition: "resolved-local", mapping: updated });
+}
 
 async function projectUnmappedTask(
   request: ProjectTrackerProjectionRequest,
@@ -275,7 +365,7 @@ async function projectUnmappedTask(
 ): Promise<ProjectTrackerProjectionResult> {
   if (lookup.kind === "resource") {
     if (!sameHash(lookup.resource.authorityIdentity, payload.authorityIdentity)) {
-      return reconciliationRequired(null, lookup.resource.version, lookup.resource.authorityIdentity, payload, request.adapter.adapterId);
+      return reconciliationRequired(null, lookup.resource, payload, request.adapter.adapterId);
     }
     const adopted = await persistResourceMapping(
       request.store,
@@ -312,7 +402,7 @@ async function projectUnmappedTask(
     return outcomeResult(request.adapter.adapterId, "create", created, null, payload);
   }
   if (!sameHash(created.resource.authorityIdentity, payload.authorityIdentity)) {
-    return reconciliationRequired(null, created.resource.version, created.resource.authorityIdentity, payload, request.adapter.adapterId);
+    return reconciliationRequired(null, created.resource, payload, request.adapter.adapterId);
   }
   const mapping = await persistResourceMapping(
     request.store,
@@ -491,13 +581,7 @@ function outcomeResult(
   payload: TrackerProjectionPayload,
 ): ProjectTrackerProjectionResult {
   if (outcome.kind === "conflict") {
-    return reconciliationRequired(
-      mapping,
-      outcome.observedVersion,
-      outcome.observedAuthorityIdentity,
-      payload,
-      adapterId,
-    );
+    return reconciliationRequired(mapping, outcome.resource, payload, adapterId);
   }
   if (outcome.kind === "authentication-failed") {
     return recoveryRequired(
@@ -525,23 +609,43 @@ function outcomeResult(
 
 function reconciliationRequired(
   mapping: TrackerProjectionMapping | null,
-  observedVersion: string | null,
-  observedAuthorityIdentity: ContentHash | null,
+  observed: TrackerProjectionRemoteResource,
   payload: TrackerProjectionPayload,
   adapterId = mapping?.adapterId ?? "",
 ): ProjectTrackerProjectionResult {
+  if (!isCredentialFreeUri(observed.uri)) {
+    return recoveryRequired(
+      adapterId,
+      "lookup",
+      "tracker.resource-uri-invalid",
+      "Configure the adapter to return an absolute URI without embedded credentials.",
+    );
+  }
   return Object.freeze({
     disposition: "reconciliation-required",
     conflict: Object.freeze({
       taskId: payload.taskId,
       adapterId,
       expectedVersion: mapping?.observedVersion ?? null,
-      observedVersion,
+      observedVersion: observed.version,
       expectedAuthorityIdentity:
         mapping === null ? null : freezeHash(mapping.authorityIdentity),
-      observedAuthorityIdentity:
-        observedAuthorityIdentity === null ? null : freezeHash(observedAuthorityIdentity),
+      observedAuthorityIdentity: freezeHash(observed.authorityIdentity),
       incomingAuthorityIdentity: freezeHash(payload.authorityIdentity),
+      observed: Object.freeze({
+        ...observed,
+        authorityIdentity: freezeHash(observed.authorityIdentity),
+        projection: Object.freeze({
+          ...observed.projection,
+          blockers: Object.freeze([...observed.projection.blockers]),
+          authorityIdentity: freezeHash(observed.projection.authorityIdentity),
+        }),
+      }),
+      incoming: Object.freeze({
+        ...payload,
+        blockers: Object.freeze([...payload.blockers]),
+        authorityIdentity: freezeHash(payload.authorityIdentity),
+      }),
     }),
   });
 }

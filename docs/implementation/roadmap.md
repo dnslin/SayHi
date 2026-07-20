@@ -158,6 +158,10 @@ Extract candidates from a completed Task, reject one, accept one into a scoped S
 
 No Agent can promote knowledge directly, provenance remains traversable, credentials do not enter durable artifacts, and local Task state stays authoritative.
 
+### Exit Gate verification
+
+**Repeatable command:** `npm run test:milestone-4` builds the workspace and runs the scoped knowledge and Tracker contract suites. Attach the resulting validation report to issue #34 before marking this Exit Gate satisfied.
+
 ### Primary risks
 
 - proposed knowledge is noisy;

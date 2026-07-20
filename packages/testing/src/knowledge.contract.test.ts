@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -502,6 +502,15 @@ test("human promotion binds exact Candidate provenance and visibly stales every 
     promoted.promotion.invalidatedContexts[0]?.manifestIdentity ?? "",
     /^sha256:[0-9a-f]{64}$/u,
   );
+  const promotionFiles = await readdir(join(repository, ".sayhi", "knowledge", "promotions"));
+  assert.equal(promotionFiles.length, 1);
+  const persistedPromotion: unknown = JSON.parse(
+    await readFile(
+      join(repository, ".sayhi", "knowledge", "promotions", promotionFiles[0]!),
+      "utf8",
+    ),
+  );
+  assert.deepEqual(persistedPromotion, promoted.promotion);
   assert.equal(
     await readFile(join(repository, ".sayhi", "spec", "conventions.md"), "utf8"),
     newContent,
