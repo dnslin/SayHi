@@ -6,6 +6,10 @@ import {
   type DependencyGraphValidationResult,
   type ContractRecordValidationResult,
 } from "@dnslin/sayhi-core";
+export {
+  OMP_MARKETPLACE_METADATA,
+  type OmpMarketplaceMetadata,
+} from "./marketplace-metadata.js";
 
 export const OMP_RELEASE_ARTIFACT =
   COORDINATED_RELEASE_ARTIFACTS.artifacts.omp;

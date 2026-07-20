@@ -3,6 +3,14 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "files": [
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "bin": {
     "sayhi": "./dist/bin.js"
   },
