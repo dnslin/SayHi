@@ -10,7 +10,9 @@ import {
   SKILL_BUNDLE_CONTRACT_VERSION,
   verifySkillBundle,
   type SkillBundle,
+  type SkillBundleFile,
 } from "./skill-bundle.js";
+import { RELEASE_SOURCE_PROVENANCE } from "./release-provenance.generated.js";
 
 export const RELEASE_ARTIFACT_CONTRACT_VERSION = 1 as const;
 export const MANAGED_PROJECT_CONTRACT_VERSION = 1 as const;
@@ -147,6 +149,12 @@ export function createCoordinatedReleaseArtifacts(
         diagnostic.remediation,
       );
     }
+    if (!isSkillBundle(request.skillBundle)) {
+      return invalidRequest(
+        "$.skillBundle",
+        "Release Skill Bundle must retain its verified lock and file collection.",
+      );
+    }
 
     const verifiedProvenance = Object.freeze({ ...provenance });
     const verifiedCompatibility = Object.freeze({
@@ -186,7 +194,7 @@ export function createCoordinatedReleaseArtifacts(
       releaseArtifacts: Object.freeze({
         contractVersion: RELEASE_ARTIFACT_CONTRACT_VERSION,
         artifacts,
-        skillBundle: request.skillBundle as SkillBundle,
+        skillBundle: snapshotSkillBundle(request.skillBundle),
         integrity,
       }),
     });
@@ -257,6 +265,29 @@ export function verifyCoordinatedReleaseArtifacts(
   }
 }
 
+export function verifyTrustedCoordinatedReleaseArtifacts(
+  request: unknown,
+  trustedReleaseArtifacts: unknown = COORDINATED_RELEASE_ARTIFACTS,
+): VerifyCoordinatedReleaseArtifactsResult {
+  const actual = verifyCoordinatedReleaseArtifacts(request);
+  if (!actual.ok) {
+    return actual;
+  }
+  const trusted = verifyCoordinatedReleaseArtifacts(trustedReleaseArtifacts);
+  if (!trusted.ok) {
+    return trusted;
+  }
+  if (!sameReleaseArtifacts(actual.releaseArtifacts, trusted.releaseArtifacts)) {
+    return failure(
+      "release_artifacts.mismatch",
+      "$.artifacts",
+      "Release artifacts do not match the trusted compiled release declaration.",
+      "Install the Core, CLI, OMP, and Skill Bundle artifacts released together.",
+    );
+  }
+  return actual;
+}
+
 export function installedProjectVersionsForReleaseArtifacts(
   releaseArtifacts: CoordinatedReleaseArtifacts,
 ): InstalledProjectVersions {
@@ -273,10 +304,7 @@ export function installedProjectVersionsForReleaseArtifacts(
 }
 
 const declaredReleaseArtifacts = createCoordinatedReleaseArtifacts({
-  provenance: {
-    repository: "https://github.com/dnslin/SayHi",
-    revision: "0.0.0-development",
-  },
+  provenance: RELEASE_SOURCE_PROVENANCE,
   versions: {
     core: "0.0.0",
     cli: "0.0.0",
@@ -307,6 +335,19 @@ if (!declaredReleaseArtifacts.ok) {
 
 export const COORDINATED_RELEASE_ARTIFACTS =
   declaredReleaseArtifacts.releaseArtifacts;
+
+function sameReleaseArtifacts(
+  actual: CoordinatedReleaseArtifacts,
+  expected: CoordinatedReleaseArtifacts,
+): boolean {
+  return (
+    actual.contractVersion === expected.contractVersion &&
+    actual.integrity === expected.integrity &&
+    sameArtifact(actual.artifacts.core, expected.artifacts.core) &&
+    sameArtifact(actual.artifacts.cli, expected.artifacts.cli) &&
+    sameArtifact(actual.artifacts.omp, expected.artifacts.omp)
+  );
+}
 
 function createArtifact(
   name: ReleaseArtifactName,
@@ -402,6 +443,51 @@ function readCompatibilityInput(
     templates: value.templates,
     skillBundleContract: value.skillBundleContract,
   };
+}
+
+function snapshotSkillBundle(bundle: SkillBundle): SkillBundle {
+  const lock = deepFreeze(structuredClone(bundle.lock));
+  const files = Object.freeze(bundle.files.map(snapshotSkillBundleFile));
+  return Object.freeze({
+    get lock(): unknown {
+      return lock;
+    },
+    get files(): readonly SkillBundleFile[] {
+      return Object.freeze(files.map(copySkillBundleFile));
+    },
+  });
+}
+
+function snapshotSkillBundleFile(file: SkillBundleFile): SkillBundleFile {
+  return Object.freeze({ path: file.path, content: copySkillBundleContent(file.content) });
+}
+
+function copySkillBundleFile(file: SkillBundleFile): SkillBundleFile {
+  return Object.freeze({ path: file.path, content: copySkillBundleContent(file.content) });
+}
+
+function copySkillBundleContent(content: string | Uint8Array): string | Uint8Array {
+  return typeof content === "string" ? content : new Uint8Array(content);
+}
+
+function deepFreeze(value: unknown): unknown {
+  if (ArrayBuffer.isView(value) || value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      deepFreeze(entry);
+    }
+  } else {
+    for (const entry of Object.values(value)) {
+      deepFreeze(entry);
+    }
+  }
+  return Object.freeze(value);
+}
+
+function isSkillBundle(value: unknown): value is SkillBundle {
+  return isRecord(value) && "lock" in value && Array.isArray(value.files);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

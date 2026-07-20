@@ -11,7 +11,7 @@ import { hasUnambiguousManagedBlocks } from "./managed-blocks.js";
 import {
   installedProjectVersionsForReleaseArtifacts,
   MANAGED_PROJECT_CONTRACT_VERSION,
-  verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
   type CoordinatedReleaseArtifacts,
 } from "./release-artifacts.js";
 
@@ -79,6 +79,8 @@ export interface ManagedProjectDiagnostic {
 export interface DiagnoseManagedProjectRequest {
   readonly fileSystem: ManagedProjectFileSystem;
   readonly releaseArtifacts: CoordinatedReleaseArtifacts;
+  /** Selected by the executable; never sourced from project input. */
+  readonly trustedReleaseArtifacts?: CoordinatedReleaseArtifacts;
 }
 
 type ManagedProjectFailure<
@@ -498,7 +500,10 @@ function sameInstallation(
 function verifiedReleaseInstallation(
   request: DiagnoseManagedProjectRequest,
 ): VerifiedReleaseInstallation {
-  const verification = verifyCoordinatedReleaseArtifacts(request.releaseArtifacts);
+  const verification = verifyTrustedCoordinatedReleaseArtifacts(
+    request.releaseArtifacts,
+    request.trustedReleaseArtifacts,
+  );
   if (!verification.ok) {
     const diagnostic = verification.diagnostics[0]!;
     const code =

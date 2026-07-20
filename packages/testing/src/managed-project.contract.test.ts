@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
+  COORDINATED_RELEASE_ARTIFACTS,
   createCoordinatedReleaseArtifacts,
   coreContract,
   applyManagedProjectPlan,
@@ -13,11 +15,11 @@ import {
   type ManagedProjectMutationFileSystem,
 } from "@dnslin/sayhi-core";
 import {
-  initializeManagedProjectWithTestSkillBundle,
+  initializeManagedProjectWithTestReleaseArtifacts,
   TEST_SKILL_BUNDLE,
   TEST_SKILL_LOCK_DIGEST,
   TEST_RELEASE_ARTIFACTS,
-  withTestSkillBundle,
+  withTestReleaseArtifacts,
 } from "./skill-bundle-test-support.js";
 
 const INSTALLATION = {
@@ -54,7 +56,7 @@ const REQUIRED_DIRECTORIES = [
 
 
 function diagnoseProject(request: Record<string, unknown>) {
-  return coreContract.diagnoseManagedProject(withTestSkillBundle(request) as never);
+  return coreContract.diagnoseManagedProject(withTestReleaseArtifacts(request) as never);
 }
 
 class MemoryManagedProjectFileSystem implements ManagedProjectMutationFileSystem {
@@ -148,7 +150,7 @@ function addManagedCustomizableFile(
 test("Core initializes the repository-owned Project Store and doctor reports it healthy", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
 
-  const initialization = await initializeManagedProjectWithTestSkillBundle({
+  const initialization = await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-8",
     timestamp: "2026-07-14T08:00:00Z",
@@ -201,7 +203,7 @@ test("Core rejects missing, modified, and substituted Skill bundles during initi
 
   for (const invalidBundle of invalidBundles) {
     const initializationFileSystem = new MemoryManagedProjectFileSystem();
-    const initialization = await initializeManagedProjectWithTestSkillBundle({
+    const initialization = await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem: initializationFileSystem,
       projectId: "PROJECT-35-INIT",
       timestamp: "2026-07-20T10:00:00Z",
@@ -220,7 +222,7 @@ test("Core rejects missing, modified, and substituted Skill bundles during initi
     assert.deepEqual(initializationFileSystem.files, new Map(), invalidBundle.name);
 
     const diagnosisFileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProjectWithTestSkillBundle({
+    const initialized = await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem: diagnosisFileSystem,
       projectId: "PROJECT-35-DOCTOR",
       timestamp: "2026-07-20T10:00:00Z",
@@ -299,8 +301,120 @@ test("Core canonicalizes coordinated release artifacts and detects integrity tam
   }
 });
 
+test("Core binds Managed Project installation to its compiled release artifacts", async () => {
+  const forged = createCoordinatedReleaseArtifacts({
+    provenance: {
+      repository: "https://example.invalid/untrusted-release",
+      revision: "forged-source-revision",
+    },
+    versions: { core: "0.0.0", cli: "0.0.0", omp: "0.0.0" },
+    compatibility: {
+      recordContract: 1,
+      managedProjectContract: 1,
+      projectSchema: 1,
+      templates: "0.1.0",
+      skillBundleContract: 1,
+    },
+    skillBundle: TEST_SKILL_BUNDLE,
+  });
+  assert.equal(forged.ok, true);
+  if (!forged.ok) {
+    return;
+  }
+
+  const fileSystem = new MemoryManagedProjectFileSystem();
+  const initialized = await coreContract.initializeManagedProject({
+    fileSystem,
+    projectId: "PROJECT-36-FORGED",
+    timestamp: "2026-07-20T10:00:00Z",
+    releaseArtifacts: forged.releaseArtifacts,
+  });
+  assert.equal(initialized.ok, false);
+  if (!initialized.ok) {
+    assert.equal(
+      initialized.diagnostics[0]?.code,
+      "managed_project.release_artifacts_invalid",
+    );
+  }
+  assert.deepEqual(fileSystem.directories, new Set());
+  assert.deepEqual(fileSystem.files, new Map());
+});
+
+test("Core snapshots Skill Bundle bytes and pins production provenance", () => {
+  const mutableSkillBundle = {
+    lock: {
+      ...TEST_SKILL_BUNDLE.lock,
+      registry: { ...TEST_SKILL_BUNDLE.lock.registry },
+    },
+    files: TEST_SKILL_BUNDLE.files.map((file, index) => ({
+      ...file,
+      content:
+        index === 0
+          ? new Uint8Array(Buffer.from(file.content, "utf8"))
+          : file.content,
+    })),
+  };
+  const created = createCoordinatedReleaseArtifacts({
+    provenance: TEST_RELEASE_ARTIFACTS.artifacts.core.provenance,
+    versions: {
+      core: TEST_RELEASE_ARTIFACTS.artifacts.core.version,
+      cli: TEST_RELEASE_ARTIFACTS.artifacts.cli.version,
+      omp: TEST_RELEASE_ARTIFACTS.artifacts.omp.version,
+    },
+    compatibility: TEST_RELEASE_ARTIFACTS.artifacts.core.compatibility,
+    skillBundle: mutableSkillBundle,
+  });
+  assert.equal(created.ok, true);
+  if (!created.ok) {
+    return;
+  }
+  assert.equal(Object.isFrozen(created.releaseArtifacts.skillBundle), true);
+  mutableSkillBundle.lock.registry.commit = "2".repeat(40);
+  assert.equal(
+    readRegistryCommit(created.releaseArtifacts.skillBundle.lock),
+    "1".repeat(40),
+  );
+  const mutableContent = mutableSkillBundle.files[0]?.content;
+  assert.ok(mutableContent instanceof Uint8Array);
+  if (!(mutableContent instanceof Uint8Array)) {
+    return;
+  }
+  mutableContent[0] = 0;
+  const releasedContent = created.releaseArtifacts.skillBundle.files[0]?.content;
+  assert.ok(releasedContent instanceof Uint8Array);
+  if (releasedContent instanceof Uint8Array) {
+    assert.equal(releasedContent[0], "implement skill\n".charCodeAt(0));
+  }
+  assert.match(
+    COORDINATED_RELEASE_ARTIFACTS.artifacts.core.provenance.revision,
+    /^git:[0-9a-f]{40}$/u,
+  );
+});
+
 function tamperedIntegrity(identity: string): string {
   return `${identity.slice(0, -1)}${identity.endsWith("0") ? "1" : "0"}`;
+}
+
+function readRegistryCommit(lock: unknown): string | undefined {
+  if (
+    lock === null ||
+    typeof lock !== "object" ||
+    Array.isArray(lock) ||
+    !("registry" in lock)
+  ) {
+    return undefined;
+  }
+  const { registry } = lock;
+  if (
+    registry === null ||
+    typeof registry !== "object" ||
+    Array.isArray(registry) ||
+    !("commit" in registry) ||
+    typeof registry.commit !== "string"
+  ) {
+    return undefined;
+  }
+  return registry.commit;
 }
 
 test("Core rejects incompatible coordinated release artifacts before installation writes", async () => {
@@ -414,7 +528,7 @@ test("Core rejects incompatible coordinated release artifacts before installatio
     assert.deepEqual(initializationFileSystem.files, new Map(), incompatible.name);
 
     const diagnosisFileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProjectWithTestSkillBundle({
+    const initialized = await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem: diagnosisFileSystem,
       projectId: "PROJECT-36-DOCTOR",
       timestamp: "2026-07-20T10:00:00Z",
@@ -442,7 +556,7 @@ test("Core initialization is byte-stable and never changes user-owned source con
   const fileSystem = new MemoryManagedProjectFileSystem();
   fileSystem.files.set("README.md", "user bytes\r\nremain unchanged\r\n");
 
-  const first = await initializeManagedProjectWithTestSkillBundle({
+  const first = await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-8",
     timestamp: "2026-07-14T08:00:00Z",
@@ -452,7 +566,7 @@ test("Core initialization is byte-stable and never changes user-owned source con
   const installedFiles = new Map(fileSystem.files);
   fileSystem.writes.length = 0;
 
-  const repeated = await initializeManagedProjectWithTestSkillBundle({
+  const repeated = await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "DIFFERENT-PROJECT-ID",
     timestamp: "2026-07-14T09:00:00Z",
@@ -477,7 +591,7 @@ test("Core initialization is byte-stable and never changes user-owned source con
 
 test("Core updates unchanged Engine-owned files and retains User-owned bytes", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-UPDATE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -552,7 +666,7 @@ test("Core updates unchanged Engine-owned files and retains User-owned bytes", a
 
 test("Core preserves all update variants when an Engine-owned file diverges", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-CONFLICT",
     timestamp: "2026-07-14T08:00:00Z",
@@ -629,7 +743,7 @@ test("Core preserves all update variants when an Engine-owned file diverges", as
 
 test("Core uninstalls matching Engine-owned files and retains User-owned content", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-UNINSTALL",
     timestamp: "2026-07-14T08:00:00Z",
@@ -680,7 +794,7 @@ test("Core uninstalls matching Engine-owned files and retains User-owned content
 
 test("Core updates and uninstalls Managed Blocks without changing surrounding user bytes", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-BLOCKS",
     timestamp: "2026-07-14T08:00:00Z",
@@ -761,7 +875,7 @@ test("Core updates and uninstalls Managed Blocks without changing surrounding us
 
 test("Core recovers a partially applied mixed-ownership update from its journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-RECOVERY",
     timestamp: "2026-07-14T08:00:00Z",
@@ -870,7 +984,7 @@ test("Core conflicts on modified or ambiguous Managed Blocks", async () => {
 
   for (const localContent of localCases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    await initializeManagedProjectWithTestSkillBundle({
+    await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem,
       projectId: "PROJECT-9-BLOCK-CONFLICT",
       timestamp: "2026-07-14T08:00:00Z",
@@ -923,7 +1037,7 @@ test("Core conflicts on modified or ambiguous Managed Blocks", async () => {
 
 test("Core preserves a divergent Engine-owned file during uninstall", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-UNINSTALL-CONFLICT",
     timestamp: "2026-07-14T08:00:00Z",
@@ -966,7 +1080,7 @@ test("Core preserves a divergent Engine-owned file during uninstall", async () =
 
 test("Core rejects stale plans before creating an operation journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-STALE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -1007,7 +1121,7 @@ test("Core rejects stale plans before creating an operation journal", async () =
 
 test("Core rejects an invalid apply timestamp before writing files or a journal", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-INVALID-TIME",
     timestamp: "2026-07-14T08:00:00Z",
@@ -1045,7 +1159,7 @@ test("Core rejects an invalid apply timestamp before writing files or a journal"
 
 test("Core retains a deleted User-owned path while mixed lifecycle actions continue", async () => {
   const fileSystem = new MemoryManagedProjectFileSystem();
-  await initializeManagedProjectWithTestSkillBundle({
+  await initializeManagedProjectWithTestReleaseArtifacts({
     fileSystem,
     projectId: "PROJECT-9-DELETED-USER-FILE",
     timestamp: "2026-07-14T08:00:00Z",
@@ -1154,7 +1268,7 @@ test("Core doctor reports incompatible schema and component versions without wri
 
   for (const mutate of cases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProjectWithTestSkillBundle({
+    const initialized = await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem,
       projectId: "PROJECT-8",
       timestamp: "2026-07-14T08:00:00Z",
@@ -1220,7 +1334,7 @@ test("Core doctor reports malformed and hash-diverged Project Stores as corrupt"
 
   for (const { mutate, code } of cases) {
     const fileSystem = new MemoryManagedProjectFileSystem();
-    const initialized = await initializeManagedProjectWithTestSkillBundle({
+    const initialized = await initializeManagedProjectWithTestReleaseArtifacts({
       fileSystem,
       projectId: "PROJECT-8",
       timestamp: "2026-07-14T08:00:00Z",

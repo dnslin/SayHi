@@ -13,7 +13,10 @@ import {
   verifySkillBundle,
   verifySkillBundleInstallation,
 } from "./skill-bundle.js";
-import { verifyCoordinatedReleaseArtifacts } from "./release-artifacts.js";
+import {
+  verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
+} from "./release-artifacts.js";
 import {
   diagnoseManagedProject,
   initializeManagedProject,
@@ -266,6 +269,7 @@ export {
   installedProjectVersionsForReleaseArtifacts,
   RELEASE_ARTIFACT_CONTRACT_VERSION,
   verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
 } from "./release-artifacts.js";
 export type {
   CoordinatedReleaseArtifacts,
@@ -680,6 +684,7 @@ export interface CoreContract {
   readonly verifySkillBundle: typeof verifySkillBundle;
   readonly verifySkillBundleInstallation: typeof verifySkillBundleInstallation;
   readonly verifyCoordinatedReleaseArtifacts: typeof verifyCoordinatedReleaseArtifacts;
+  readonly verifyTrustedCoordinatedReleaseArtifacts: typeof verifyTrustedCoordinatedReleaseArtifacts;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
   readonly initializeManagedProject: typeof initializeManagedProject;
   readonly createSpec: typeof createSpec;
@@ -761,6 +766,7 @@ export const coreContract: CoreContract = Object.freeze({
   verifySkillBundle,
   verifySkillBundleInstallation,
   verifyCoordinatedReleaseArtifacts,
+  verifyTrustedCoordinatedReleaseArtifacts,
   diagnoseManagedProject,
   initializeManagedProject,
   createSpec,

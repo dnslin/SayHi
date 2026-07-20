@@ -65,22 +65,31 @@ export const TEST_RELEASE_ARTIFACTS = testReleaseArtifactsFor({
   templates: "0.0.0",
 });
 
-export function withTestSkillBundle<Request extends Record<string, unknown>>(
+export function withTestReleaseArtifacts<Request extends Record<string, unknown>>(
   request: Request,
-): Request & Readonly<{ releaseArtifacts: unknown }> {
+): Request &
+  Readonly<{
+    releaseArtifacts: unknown;
+    trustedReleaseArtifacts: unknown;
+  }> {
+  const trustedReleaseArtifacts =
+    request.trustedReleaseArtifacts ??
+    testReleaseArtifactsFor(request.installation);
   const releaseArtifacts =
     request.releaseArtifacts ??
     Object.freeze({
-      ...testReleaseArtifactsFor(request.installation),
+      ...trustedReleaseArtifacts,
       skillBundle: request.skillBundle ?? TEST_SKILL_BUNDLE,
     });
-  return { ...request, releaseArtifacts };
+  return { ...request, releaseArtifacts, trustedReleaseArtifacts };
 }
 
-export function initializeManagedProjectWithTestSkillBundle(
+export function initializeManagedProjectWithTestReleaseArtifacts(
   request: Record<string, unknown>,
 ) {
-  return coreContract.initializeManagedProject(withTestSkillBundle(request) as never);
+  return coreContract.initializeManagedProject(
+    withTestReleaseArtifacts(request) as never,
+  );
 }
 
 function testReleaseArtifactsFor(installation: unknown) {
