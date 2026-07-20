@@ -19,7 +19,10 @@ import { gunzipSync } from "node:zlib";
 const execFileAsync = promisify(execFile);
 const scriptPath = fileURLToPath(import.meta.url);
 const repositoryRoot = resolve(dirname(scriptPath), "..");
-const npmExecutable = process.platform === "win32" ? "npm.cmd" : "npm";
+const npmExecutable = process.platform === "win32" ? process.execPath : "npm";
+const npmCliEntryPoint =
+  process.env.npm_execpath ??
+  join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
 const releasePackages = Object.freeze([
   Object.freeze({ name: "core", packageName: "@dnslin/sayhi-core" }),
   Object.freeze({ name: "cli", packageName: "@dnslin/sayhi-cli" }),
@@ -739,7 +742,11 @@ async function runGit(cwd, arguments_) {
 }
 
 async function runNpm(cwd, arguments_) {
-  return runCommand(npmExecutable, arguments_, cwd);
+  return runCommand(
+    npmExecutable,
+    process.platform === "win32" ? [npmCliEntryPoint, ...arguments_] : arguments_,
+    cwd,
+  );
 }
 
 async function runCommand(executable, arguments_, cwd = undefined, env = undefined) {
