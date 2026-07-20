@@ -29,6 +29,7 @@ import {
 } from "@dnslin/sayhi-core";
 import { readOmpBootstrapContract } from "@dnslin/sayhi-omp";
 
+import { INSTALLED_CONTRACT_FILES } from "./installed-contract-matrix.js";
 import {
   IMPLEMENTATION_AGENT,
   REVIEW_AGENTS,
@@ -2992,19 +2993,6 @@ async function installArtifactPackages(
   );
 }
 
-const INSTALLED_CONTRACT_FILES = Object.freeze([
-  "workflow.contract.test.js",
-  "task-lifecycle.contract.test.js",
-  "task-lifecycle-filesystem.contract.test.js",
-  "execution.contract.test.js",
-  "initiative-scheduler.contract.test.js",
-  "context-cli.contract.test.js",
-  "context-manifest.contract.test.js",
-  "spec-context-cli.contract.test.js",
-  "managed-project-cli.contract.test.js",
-  "managed-project-bin.contract.test.js",
-  "omp.contract.test.js",
-]);
 
 async function runInstalledContractMatrix(installation: string): Promise<void> {
   const testDirectory = join(installation, "node_modules", "@sayhi", "testing", "dist");
