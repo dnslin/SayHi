@@ -13,6 +13,7 @@ import {
   verifySkillBundle,
   verifySkillBundleInstallation,
 } from "./skill-bundle.js";
+import { proposeSkillUpgrades } from "./skill-upgrade.js";
 import {
   verifyCoordinatedReleaseArtifacts,
   verifyTrustedCoordinatedReleaseArtifacts,
@@ -153,6 +154,34 @@ export type {
   VerifySkillBundleInstallationResult,
   VerifySkillBundleResult,
 } from "./skill-bundle.js";
+export {
+  SKILL_UPGRADE_PROPOSAL_CONTRACT_VERSION,
+  proposeSkillUpgrades,
+} from "./skill-upgrade.js";
+export type {
+  ProposeSkillUpgradesRequest,
+  ProposeSkillUpgradesResult,
+  SkillUpgradeBundleIdentity,
+  SkillUpgradeCapability,
+  SkillUpgradeChange,
+  SkillUpgradeChangeKind,
+  SkillUpgradeFileChangeKind,
+  SkillUpgradeFileText,
+  SkillUpgradeLicenseNotice,
+  SkillUpgradeReleaseImpact,
+  SkillUpgradeSemanticComparison,
+  SkillUpgradeTest,
+  SkillUpgradeCompatibility,
+  SkillUpgradeCompatibilityFailure,
+  SkillUpgradeCompatibilityFailureCode,
+  SkillUpgradeFileChange,
+  SkillUpgradeFileIdentity,
+  SkillUpgradeProposal,
+  SkillUpgradeProposalDiagnostic,
+  SkillUpgradeProposalDiagnosticCode,
+  SkillUpgradeSidecarConstraint,
+  SkillUpgradeSkill,
+} from "./skill-upgrade.js";
 export { hashKnowledgeCandidateContent } from "./knowledge-candidate.js";
 export type { KnowledgeCandidateContent } from "./knowledge-candidate.js";
 export {
@@ -436,6 +465,7 @@ export type {
 
 export {
   PHASE_EXECUTION_CONTRACT_VERSION,
+  isPhaseAgentRole,
   bindPhaseExecution,
   authorizePhaseExecution,
 } from "./execution.js";
@@ -683,6 +713,7 @@ export interface CoreContract {
   readonly validateContractRecord: typeof validateContractRecord;
   readonly verifySkillBundle: typeof verifySkillBundle;
   readonly verifySkillBundleInstallation: typeof verifySkillBundleInstallation;
+  readonly proposeSkillUpgrades: typeof proposeSkillUpgrades;
   readonly verifyCoordinatedReleaseArtifacts: typeof verifyCoordinatedReleaseArtifacts;
   readonly verifyTrustedCoordinatedReleaseArtifacts: typeof verifyTrustedCoordinatedReleaseArtifacts;
   readonly diagnoseManagedProject: typeof diagnoseManagedProject;
@@ -765,6 +796,7 @@ export const coreContract: CoreContract = Object.freeze({
   validateContractRecord,
   verifySkillBundle,
   verifySkillBundleInstallation,
+  proposeSkillUpgrades,
   verifyCoordinatedReleaseArtifacts,
   verifyTrustedCoordinatedReleaseArtifacts,
   diagnoseManagedProject,

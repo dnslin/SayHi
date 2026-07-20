@@ -77,6 +77,7 @@ const phaseByAgentRole: Readonly<Record<PhaseAgentRole, WorkflowPhase>> =
   });
 
 
+
 export interface PhaseAgentContract {
   readonly schemaVersion: typeof PHASE_EXECUTION_CONTRACT_VERSION;
   readonly role: PhaseAgentRole;
@@ -997,7 +998,7 @@ function isUniqueNonEmptyStringArray(value: unknown): value is readonly string[]
   return true;
 }
 
-function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
+export function isPhaseAgentRole(value: unknown): value is PhaseAgentRole {
   return typeof value === "string" && Object.hasOwn(phaseByAgentRole, value);
 }
 
